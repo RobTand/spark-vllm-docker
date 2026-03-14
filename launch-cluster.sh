@@ -35,6 +35,8 @@ SOLO_MODE="false"
 MOUNT_CACHE_DIRS="true"
 BUILD_JOBS=""
 NON_PRIVILEGED_MODE="false"
+SERVER_MODE="false"
+RESTART_POLICY=""
 MEM_LIMIT_GB="110"
 MEM_SWAP_LIMIT_GB=""
 PIDS_LIMIT="4096"
@@ -62,6 +64,11 @@ usage() {
     echo "  --mem-swap-limit-gb Memory+swap limit in GB (default: mem-limit + 10, only with --non-privileged)"
     echo "  --pids-limit    Process limit (default: 4096, only with --non-privileged)"
     echo "  --shm-size-gb   Shared memory size in GB (default: 64, only with --non-privileged)"
+    echo "  --server        Server mode: run vLLM as the container's main process (PID 1) so Docker"
+    echo "                  restart policies apply. Implies --restart unless-stopped by default."
+    echo "                  Only compatible with --solo and --launch-script."
+    echo "  --restart <policy>  Docker restart policy (e.g. unless-stopped, always, on-failure:5)."
+    echo "                      Automatically set by --server if not specified."
     echo "  action          start | stop | status | exec (Default: start). Not compatible with --launch-script."
     echo "  command         Command to run (only for 'exec' action). Not compatible with --launch-script."
     echo ""
@@ -95,6 +102,8 @@ while [[ "$#" -gt 0 ]]; do
         --solo) SOLO_MODE="true" ;;
         --no-cache-dirs) MOUNT_CACHE_DIRS="false" ;;
         --non-privileged) NON_PRIVILEGED_MODE="true" ;;
+        --server) SERVER_MODE="true" ;;
+        --restart) RESTART_POLICY="$2"; shift ;;
         --mem-limit-gb) MEM_LIMIT_GB="$2"; shift ;;
         --mem-swap-limit-gb) MEM_SWAP_LIMIT_GB="$2"; shift ;;
         --pids-limit) PIDS_LIMIT="$2"; shift ;;
@@ -140,6 +149,18 @@ else
             exit 1
         fi
     done
+fi
+
+# Validate server mode
+if [[ "$SERVER_MODE" == "true" ]]; then
+    if [[ -z "$LAUNCH_SCRIPT_PATH" ]]; then
+        echo "Error: --server requires --launch-script"
+        exit 1
+    fi
+    # Default restart policy if not specified
+    if [[ -z "$RESTART_POLICY" ]]; then
+        RESTART_POLICY="unless-stopped"
+    fi
 fi
 
 # Append NCCL_DEBUG if set, with validation
@@ -354,11 +375,13 @@ cleanup() {
     # Stop Head
     echo "Stopping head node ($HEAD_IP)..."
     docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
-    
+    # Remove container if it exists (needed when not using --rm, e.g. server mode)
+    docker rm "$CONTAINER_NAME" >/dev/null 2>&1 || true
+
     # Stop Workers
     for worker in "${PEER_NODES[@]}"; do
         echo "Stopping worker node ($worker)..."
-        ssh "$worker" "docker stop $CONTAINER_NAME" >/dev/null 2>&1 || true
+        ssh "$worker" "docker stop $CONTAINER_NAME && docker rm $CONTAINER_NAME" >/dev/null 2>&1 || true
     done
     
     echo "Cluster stopped."
@@ -575,7 +598,10 @@ start_cluster() {
     fi
 
     local head_cmd_args=()
-    if [[ "$SOLO_MODE" == "true" ]]; then
+    if [[ "$SOLO_MODE" == "true" && "$SERVER_MODE" == "true" ]]; then
+        # Server mode: container waits for mods + launch script, then exec's vLLM as PID 1
+        head_cmd_args=(bash -c "echo 'Server mode: waiting for launch script...'; while [ ! -f /workspace/exec-script.sh ] || [ ! -f /workspace/server_ready ]; do sleep 1; done; echo 'Launching vLLM as PID 1...'; exec bash /workspace/exec-script.sh")
+    elif [[ "$SOLO_MODE" == "true" ]]; then
         if [[ ${#MOD_PATHS[@]} -gt 0 ]]; then
              head_cmd_args=(bash -c "echo Waiting for mod application...; while [ ! -f /tmp/mod_done ]; do sleep 1; done; echo Mod applied, starting container...; exec sleep infinity")
         else
@@ -590,7 +616,11 @@ start_cluster() {
     fi
 
     # Build docker run arguments based on mode
-    local docker_args_common="--gpus all -d --rm --network host --name $CONTAINER_NAME $DOCKER_ARGS $IMAGE_NAME"
+    local docker_rm_restart="--rm"
+    if [[ -n "$RESTART_POLICY" ]]; then
+        docker_rm_restart="--restart $RESTART_POLICY"
+    fi
+    local docker_args_common="--gpus all -d $docker_rm_restart --network host --name $CONTAINER_NAME $DOCKER_ARGS $IMAGE_NAME"
     local docker_caps_args=""
     local docker_resource_args=""
 
@@ -690,7 +720,13 @@ if [[ "$ACTION" == "exec" ]]; then
     start_cluster
     echo "Executing command on head node: $COMMAND_TO_RUN"
 
-    if [[ "$DAEMON_MODE" == "true" ]]; then
+    if [[ "$SERVER_MODE" == "true" ]]; then
+        # Server mode: signal the container to exec the launch script as PID 1
+        docker exec "$CONTAINER_NAME" touch /workspace/server_ready
+        echo "Server mode: vLLM will start as the container's main process (PID 1)."
+        echo "Container '$CONTAINER_NAME' has restart policy: ${RESTART_POLICY}"
+        echo "Use 'docker logs -f $CONTAINER_NAME' to follow output."
+    elif [[ "$DAEMON_MODE" == "true" ]]; then
         # Daemon mode: run command detached inside the container and exit immediately
         # Extract env vars starting from VLLM_HOST_IP to avoid interactive check in .bashrc
         # Redirect output to PID 1 stdout/stderr so it shows up in docker logs

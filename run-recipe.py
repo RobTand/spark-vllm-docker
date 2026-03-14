@@ -820,6 +820,8 @@ Examples:
     launch_group.add_argument("-t", "--container", dest="container_override", help="Override container image from recipe")
     launch_group.add_argument("--nccl-debug", choices=["VERSION", "WARN", "INFO", "TRACE"], help="NCCL debug level")
     launch_group.add_argument("-e", "--env", action="append", dest="env_vars", default=[], metavar="VAR=VALUE", help="Environment variable to pass to container (e.g. -e HF_TOKEN=xxx). Can be used multiple times.")
+    launch_group.add_argument("--server", action="store_true", help="Server mode: run vLLM as container's main process (PID 1) with Docker restart policy")
+    launch_group.add_argument("--restart", dest="restart_policy", metavar="POLICY", help="Docker restart policy (default: unless-stopped when --server is used)")
     
     # Cluster discovery options
     discover_group = parser.add_argument_group("Cluster discovery")
@@ -1122,6 +1124,10 @@ Examples:
             cmd_parts.extend(["--nccl-debug", args.nccl_debug])
         for env_var in args.env_vars:
             cmd_parts.extend(["-e", env_var])
+        if args.server:
+            cmd_parts.append("--server")
+        if args.restart_policy:
+            cmd_parts.extend(["--restart", args.restart_policy])
         cmd_parts.extend(["\\", "\n      --launch-script", "/tmp/tmpXXXXXX.sh"])
         print(" ".join(cmd_parts))
         print()
@@ -1165,7 +1171,13 @@ Examples:
         
         for env_var in args.env_vars:
             cmd.extend(["-e", env_var])
-        
+
+        if args.server:
+            cmd.append("--server")
+
+        if args.restart_policy:
+            cmd.extend(["--restart", args.restart_policy])
+
         # Add launch script
         cmd.extend(["--launch-script", temp_script])
         
