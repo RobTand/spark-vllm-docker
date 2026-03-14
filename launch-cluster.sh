@@ -375,13 +375,18 @@ cleanup() {
     # Stop Head
     echo "Stopping head node ($HEAD_IP)..."
     docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
-    # Remove container if it exists (needed when not using --rm, e.g. server mode)
-    docker rm "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    # Remove container if not using --rm (e.g. server mode with restart policy)
+    if [[ -n "$RESTART_POLICY" ]]; then
+        docker rm "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    fi
 
     # Stop Workers
     for worker in "${PEER_NODES[@]}"; do
         echo "Stopping worker node ($worker)..."
-        ssh "$worker" "docker stop $CONTAINER_NAME && docker rm $CONTAINER_NAME" >/dev/null 2>&1 || true
+        ssh "$worker" "docker stop $CONTAINER_NAME" >/dev/null 2>&1 || true
+        if [[ -n "$RESTART_POLICY" ]]; then
+            ssh "$worker" "docker rm $CONTAINER_NAME" >/dev/null 2>&1 || true
+        fi
     done
     
     echo "Cluster stopped."
