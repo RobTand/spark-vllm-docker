@@ -23,6 +23,7 @@ mods:
   - mods/fix-qwen3.5-autoround
   - mods/fix-qwen3.5-chat-template
   - mods/gpu-mem-util-gb
+  - mods/drop-caches
 
 # Default settings (can be overridden via CLI)
 defaults:
