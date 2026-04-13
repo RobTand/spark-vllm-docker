@@ -6,9 +6,17 @@ Patches:
 2. compressed_tensors/compressed_tensors.py — add dynaquant format detection + routing
 3. compressed_tensors/utils.py — add dynaquant to supported data_types
 """
+import os
 import sys
 
-CT_DIR = "/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/quantization/compressed_tensors"
+import glob as _glob
+
+# Find the compressed_tensors directory — path may vary across vLLM versions
+_candidates = _glob.glob("/usr/local/lib/python3.*/dist-packages/vllm/model_executor/layers/quantization/compressed_tensors")
+if not _candidates:
+    # Try site-packages too
+    _candidates = _glob.glob("/usr/lib/python3.*/dist-packages/vllm/model_executor/layers/quantization/compressed_tensors")
+CT_DIR = _candidates[0] if _candidates else "/usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/quantization/compressed_tensors"
 
 
 def patch_schemes_init():
@@ -18,6 +26,9 @@ def patch_schemes_init():
 
 def patch_compressed_tensors():
     path = f"{CT_DIR}/compressed_tensors.py"
+    if not os.path.exists(path):
+        print(f"compressed_tensors.py not found at {path}, skipping patch")
+        return
     with open(path) as f:
         content = f.read()
     if "DynaQuant" in content:
@@ -82,6 +93,9 @@ def patch_compressed_tensors():
 def patch_utils_data_types():
     """Add 'int' to supported data_types if it's restricted."""
     path = f"{CT_DIR}/utils.py"
+    if not os.path.exists(path):
+        print(f"utils.py not found at {path}, skipping")
+        return
     with open(path) as f:
         content = f.read()
     # The error was "Unsupported data_type: nv_fp, currently only support {'int'}"
@@ -96,7 +110,11 @@ def patch_utils_data_types():
 
 def patch_model_runner():
     """Remove the old DynaQuant injection hook if present (no longer needed)."""
-    path = "/usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_model_runner.py"
+    _runner_candidates = _glob.glob("/usr/local/lib/python3.*/dist-packages/vllm/v1/worker/gpu_model_runner.py")
+    if not _runner_candidates:
+        print("gpu_model_runner.py — not found (skip)")
+        return
+    path = _runner_candidates[0]
     with open(path) as f:
         content = f.read()
     if "dynaquant" not in content:

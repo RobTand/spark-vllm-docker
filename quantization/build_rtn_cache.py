@@ -72,13 +72,14 @@ def _nvfp4_round_rtn(weight: torch.Tensor, group_size: int = 16) -> torch.Tensor
 
 
 def stage_multimodal(model_path: str):
-    """Stage a VL (vision-language) model for text-only CausalLM loading.
+    """Stage a model for CausalLM loading.
 
-    For models like Qwen3.5 and Gemma 4 whose safetensors use prefixed names
-    (model.language_model.layers.*), we remap the safetensors index so the
-    CausalLM model can find its weights. Vision tower weights are dropped.
+    Handles:
+    - VL models (Qwen3.5, Gemma 4): strips vision config, remaps tensor names
+    - FP8 pre-quantized models (MiniMax): strips quantization_config so the
+      model loads as raw tensors without requiring a GPU quantizer
 
-    Returns (staged_path, cleanup_path).  If model is already text-only,
+    Returns (staged_path, cleanup_path).  If no staging needed,
     returns (model_path, None).
     """
     src_cfg_path = Path(model_path) / "config.json"
@@ -86,8 +87,30 @@ def stage_multimodal(model_path: str):
         return model_path, None
     with open(src_cfg_path) as f:
         cfg = json.load(f)
-    if "vision_config" not in cfg and "text_config" not in cfg:
+
+    needs_staging = (
+        "vision_config" in cfg
+        or "text_config" in cfg
+        or "quantization_config" in cfg
+    )
+    if not needs_staging:
         return model_path, None
+
+    # Strip quantization_config (e.g. fp8) so the model loads as raw tensors
+    if "quantization_config" in cfg:
+        qc = cfg.pop("quantization_config")
+        print(f"[stage] stripped quantization_config: {qc.get('quant_method', '?')}")
+
+    if "vision_config" not in cfg and "text_config" not in cfg:
+        # Just needed to strip quant config — no VL remapping
+        staged = tempfile.mkdtemp(prefix="rtn_staged_")
+        for p in Path(model_path).iterdir():
+            if p.name == "config.json":
+                continue
+            (Path(staged) / p.name).symlink_to(p.resolve())
+        with open(Path(staged) / "config.json", "w") as f:
+            json.dump(cfg, f, indent=2)
+        return staged, staged
 
     # --- Build CausalLM config from the VL config ---
     for k in ["vision_config", "image_token_id", "video_token_id",

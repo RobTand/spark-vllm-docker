@@ -18,9 +18,7 @@ from typing import Tuple
 def pack_intN(values: torch.Tensor, n_bits: int) -> torch.Tensor:
     """Pack a 1D tensor of int values (each in [0, 2^n_bits)) into bytes.
 
-    Memory-efficient: iterates over bit positions (n_bits iterations)
-    rather than expanding all values × bits simultaneously.
-    Peak memory ≈ 2× values tensor (the index arrays).
+    Uses numpy for fast CPU packing. Falls back to torch scatter for GPU.
 
     Args:
         values: 1D int tensor, each element in [0, 2^n_bits)
@@ -30,31 +28,55 @@ def pack_intN(values: torch.Tensor, n_bits: int) -> torch.Tensor:
         packed: 1D uint8 tensor of ceil(len(values) * n_bits / 8) bytes
     """
     assert values.dim() == 1
+
+    if values.device.type == "cpu":
+        return _pack_intN_numpy(values, n_bits)
+
+    # GPU path: scatter-based (original)
     device = values.device
     n_values = values.numel()
     n_bytes = (n_values * n_bits + 7) // 8
     packed = torch.zeros(n_bytes, dtype=torch.uint8, device=device)
     vals = values.to(torch.int32)
-
-    # Precompute value indices
     val_indices = torch.arange(n_values, device=device, dtype=torch.int64)
 
-    # For each bit position within the n_bits encoding
     for bit_idx in range(n_bits):
-        # Extract this bit from all values
         bit_vals = ((vals >> bit_idx) & 1).to(torch.uint8)
-
-        # Global bit position for each value's bit_idx-th bit
         global_bit_pos = val_indices * n_bits + bit_idx
         byte_pos = (global_bit_pos // 8).to(torch.int64)
         bit_in_byte = (global_bit_pos % 8).to(torch.uint8)
-
-        # OR bits into packed bytes using scatter_add_
-        # scatter_add_ is additive, which is equivalent to OR when each
-        # byte position + bit position combination is unique (guaranteed here)
         packed.scatter_add_(0, byte_pos, bit_vals << bit_in_byte)
 
     return packed
+
+
+def _pack_intN_numpy(values: torch.Tensor, n_bits: int) -> torch.Tensor:
+    """Fast CPU packing via numpy — builds a bitstream and packs to bytes."""
+    import numpy as np
+
+    vals = values.numpy().astype(np.uint16 if n_bits <= 16 else np.uint32)
+    n_values = len(vals)
+    n_total_bits = n_values * n_bits
+    n_bytes = (n_total_bits + 7) // 8
+
+    # Build a flat bit array: for each value, extract n_bits bits
+    # Shape: (n_values, n_bits) → flatten to (n_total_bits,)
+    bit_matrix = np.zeros((n_values, n_bits), dtype=np.uint8)
+    for bit_idx in range(n_bits):
+        bit_matrix[:, bit_idx] = (vals >> bit_idx) & 1
+    bits_flat = bit_matrix.ravel()
+
+    # Pad to multiple of 8
+    pad = (-len(bits_flat)) % 8
+    if pad:
+        bits_flat = np.concatenate([bits_flat, np.zeros(pad, dtype=np.uint8)])
+
+    # Pack 8 bits → 1 byte using dot product with powers of 2
+    bits_reshaped = bits_flat.reshape(-1, 8)
+    powers = np.array([1, 2, 4, 8, 16, 32, 64, 128], dtype=np.uint8)
+    packed = bits_reshaped.dot(powers).astype(np.uint8)
+
+    return torch.from_numpy(packed[:n_bytes])
 
 
 def unpack_intN(packed: torch.Tensor, n_bits: int, n_values: int) -> torch.Tensor:

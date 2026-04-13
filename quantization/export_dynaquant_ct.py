@@ -182,9 +182,25 @@ def main():
             out_shard = {}
             out_shard_size = 0
 
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import os
+    n_workers = max(1, os.cpu_count() or 1)
+
+    def _pack_one(w_float, bits_val, gs):
+        """Pack a single weight tensor — runs in a thread."""
+        out_f, in_f = w_float.shape
+        if in_f % gs != 0:
+            pad = gs - (in_f % gs)
+            w_float = torch.nn.functional.pad(w_float, (0, pad))
+        return pack_Nbit_tensor(w_float, bits_val, gs)
+
     for shard_file in sorted(set(source_index["weight_map"].values())):
         shard_path = source_dir / shard_file
         print(f"[dynaquant] processing {shard_file}", flush=True)
+
+        # Collect tensors to pack and passthrough tensors
+        to_pack = []    # (tname, tensor_float, bits)
+        to_pass = []    # (tname, tensor)
 
         with safe_open(str(shard_path), framework="pt", device="cpu") as f:
             for tname in f.keys():
@@ -192,29 +208,32 @@ def main():
                 rname = name_mapping.get(tname)
                 bits = recipe.get(rname, 16) if rname else 16
 
-                # Skip special layers that vLLM handles differently
                 is_special = any(s in tname for s in [
                     "lm_head", "embed_tokens", "mtp.",
                 ])
-
-                # Gemma 4 k_eq_v: skip v_proj for full_attention layers
-                # (the model clones k_proj as v_proj during load_weights)
                 if keqv_layers and "self_attn.v_proj" in tname:
                     import re as _re2
                     _m = _re2.search(r'layers\.(\d+)\.', tname)
                     if _m and int(_m.group(1)) in keqv_layers:
                         is_special = True
+
                 in_recipe = rname is not None and rname in recipe
                 if in_recipe and tname.endswith(".weight") and tensor.dim() == 2 and not is_special:
-                    # Pack to N-bit
-                    w = tensor.float()
-                    out_f, in_f = w.shape
-                    if in_f % group_size != 0:
-                        pad = group_size - (in_f % group_size)
-                        w = torch.nn.functional.pad(w, (0, pad))
-                        in_f += pad
+                    to_pack.append((tname, tensor.float(), bits))
+                else:
+                    to_pass.append((tname, tensor))
 
-                    packed, scales = pack_Nbit_tensor(w, bits, group_size)
+        # Pack in parallel using thread pool
+        if to_pack:
+            futures = {}
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                for tname, w, bits in to_pack:
+                    fut = pool.submit(_pack_one, w, bits, group_size)
+                    futures[fut] = (tname, bits)
+
+                for fut in as_completed(futures):
+                    tname, bits = futures[fut]
+                    packed, scales = fut.result()
 
                     prefix = tname.replace(".weight", "")
                     packed_name = f"{prefix}.weight_packed"
@@ -236,19 +255,17 @@ def main():
 
                     bits_used.add(bits)
                     n_quantized += 1
-                    del packed, scales, w
-                else:
-                    # Passthrough — track weight tensors for ignore list
-                    if tname.endswith(".weight"):
-                        ignore.append(tname.replace(".weight", ""))
-                    tensor_bytes = tensor.numel() * tensor.element_size()
-                    if out_shard_size + tensor_bytes > MAX_SHARD and out_shard:
-                        flush_shard()
-                    out_shard[tname] = tensor
-                    out_shard_size += tensor_bytes
-                    total_passthrough += tensor_bytes
 
-                del tensor
+        # Passthrough tensors
+        for tname, tensor in to_pass:
+            if tname.endswith(".weight"):
+                ignore.append(tname.replace(".weight", ""))
+            tensor_bytes = tensor.numel() * tensor.element_size()
+            if out_shard_size + tensor_bytes > MAX_SHARD and out_shard:
+                flush_shard()
+            out_shard[tname] = tensor
+            out_shard_size += tensor_bytes
+            total_passthrough += tensor_bytes
 
     flush_shard()
 

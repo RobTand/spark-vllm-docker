@@ -68,6 +68,13 @@ def main():
     parser.add_argument("--gradient-checkpointing", action="store_true",
                         help="Enable gradient checkpointing to halve activation "
                              "memory during backward. Required for 27B+.")
+    parser.add_argument("--cpu", action="store_true",
+                        help="Run entirely on CPU. Slow but works for models "
+                             "that don't fit on GPU. Uses all available cores.")
+    parser.add_argument("--offload-dir", type=str, default=None,
+                        help="Directory for disk offloading with accelerate. "
+                             "Use for models that don't fit in RAM at bf16 "
+                             "(e.g. large fp8 MoE models).")
     parser.add_argument("--cpu-fisher", action="store_true",
                         help="Keep Fisher accumulators on CPU rather than GPU. "
                              "On unified memory this is free and saves ~2× weight "
@@ -84,18 +91,36 @@ def main():
     try:
         from transformers import AutoModelForCausalLM, AutoModel, AutoTokenizer
 
-        is_vl = (cleanup is not None)  # stage_multimodal detected a VL model
+        # Check if the original model is actually VL (has vision/text configs
+        # AND has language_model prefix in tensor names)
+        with open(Path(args.model) / "config.json") as _f:
+            _orig_cfg = json.load(_f)
+        is_vl = ("vision_config" in _orig_cfg or "text_config" in _orig_cfg) and \
+                 any("language_model" in k for k in
+                     (json.load(open(Path(args.model) / "model.safetensors.index.json"))
+                      ["weight_map"] if (Path(args.model) / "model.safetensors.index.json").exists()
+                      else {}))
+        device_map = "cpu" if args.cpu else "cuda"
 
-        print(f"[hawq] loading {args.model} (VL={is_vl})", flush=True)
+        # For disk offloading (large fp8 MoE models), use accelerate auto
+        load_kwargs = dict(
+            torch_dtype=torch.bfloat16,
+            device_map=device_map,
+            trust_remote_code=True,
+        )
+        if args.offload_dir:
+            import os
+            os.makedirs(args.offload_dir, exist_ok=True)
+            load_kwargs["device_map"] = "auto"
+            load_kwargs["offload_folder"] = args.offload_dir
+            load_kwargs["offload_state_dict"] = True
+
+        print(f"[hawq] loading {args.model} (VL={is_vl}, device={device_map}, "
+              f"offload={args.offload_dir is not None})", flush=True)
 
         if is_vl:
             # VL models: load full model and extract language_model submodule.
-            # This avoids name-mapping issues (safetensors keys keep their
-            # original model.language_model.* prefix).
-            full_model = AutoModel.from_pretrained(
-                args.model, torch_dtype=torch.bfloat16, device_map="cuda",
-                trust_remote_code=True,
-            )
+            full_model = AutoModel.from_pretrained(args.model, **load_kwargs)
             # Extract language model
             if hasattr(full_model, 'language_model'):
                 model = full_model.language_model
@@ -109,19 +134,30 @@ def main():
                 for obj in (full_model, getattr(full_model, 'model', None)):
                     if obj is not None and hasattr(obj, attr):
                         delattr(obj, attr)
-            gc.collect(); torch.cuda.empty_cache()
+            gc.collect()
+            if not args.cpu and torch.cuda.is_available():
+                torch.cuda.empty_cache()
             print(f"[hawq] extracted language_model from VL model", flush=True)
         else:
             # Text-only models: load directly as CausalLM
-            model = AutoModelForCausalLM.from_pretrained(
-                staged, torch_dtype=torch.bfloat16, device_map="cuda",
-                trust_remote_code=True,
-            )
+            model = AutoModelForCausalLM.from_pretrained(staged, **load_kwargs)
 
         tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+
+        # Cast fp8 parameters to bf16 (needed for gradient computation).
+        # Models loaded without their quantization_config may have fp8 tensors.
+        n_cast = 0
+        for p in model.parameters():
+            if p.dtype in (torch.float8_e4m3fn, torch.float8_e5m2,
+                           torch.float8_e4m3fnuz, torch.float8_e5m2fnuz):
+                p.data = p.data.to(torch.bfloat16)
+                n_cast += 1
+        if n_cast:
+            print(f"[hawq] cast {n_cast} fp8 parameters to bf16", flush=True)
+
         device = next(model.parameters()).device
         n_params = sum(p.numel() for p in model.parameters())
-        print(f"[hawq]   {n_params:,} params", flush=True)
+        print(f"[hawq]   {n_params:,} params on {device}", flush=True)
 
         # Enable gradients only on quantizable tensors. This halves the
         # gradient-memory footprint vs gradients-on-all (no grads for
@@ -151,8 +187,15 @@ def main():
         print(f"[hawq] scalar h_trace accumulators (n={len(h_trace_sum)})",
               flush=True)
 
-        # Split Linears into chunks if requested (reduces peak grad memory)
+        # Split Linears into chunks to reduce peak gradient memory.
+        # On CPU with large MoE models, auto-chunk to keep gradient memory
+        # under ~30 GB (each chunk's gradients are freed before the next).
         n_chunks = max(1, args.linear_chunks)
+        if n_chunks == 1 and args.cpu and n_params > 50_000_000_000:
+            # Auto-chunk: ~50 linears per chunk for MoE, keeps grads small
+            n_chunks = max(1, len(quantizable) // 50)
+            print(f"[hawq] auto-chunking for large CPU model: {n_chunks} chunks",
+                  flush=True)
         chunk_size = (len(quantizable) + n_chunks - 1) // n_chunks
         chunks = [quantizable[i:i+chunk_size]
                   for i in range(0, len(quantizable), chunk_size)]
@@ -218,7 +261,8 @@ def main():
                     getattr(mod, attr).grad = None
                 del out, loss
                 gc.collect()
-                torch.cuda.empty_cache()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 print(f"[hawq]   pass {pass_idx}/{total_passes} "
                       f"(sample {i+1}, chunk {chunk_idx+1}/{len(chunks)}) "
                       f"({time.time()-t0:.1f}s)", flush=True)
@@ -231,19 +275,27 @@ def main():
         # directly from the parameter tensors (no Fisher needed).
         sensitivity: Dict[str, dict] = {}
         for name, mod, attr, shape, numel in quantizable:
-            w = getattr(mod, attr).data.float()
+            param = getattr(mod, attr)
+            # Handle meta/offloaded tensors — weight stats are secondary
+            # to h_trace; use defaults if tensor is on meta device.
+            if param.device.type == "meta" or not param.is_floating_point():
+                w_max = 0.0
+                w_norm = 0.0
+            else:
+                w = param.data.float()
+                w_max = w.abs().max().item()
+                w_norm = w.pow(2).sum().item()
+                del w
             sensitivity[name] = {
                 "shape": list(shape),
                 "numel": numel,
                 "h_trace": h_trace_sum[name],
-                # h_w2_sum dropped — requires per-element Fisher. Was worse
-                # than h_trace × mean(w²) anyway in our validation.
-                "w_max_abs": w.abs().max().item(),
-                "w_norm_sq": w.pow(2).sum().item(),
+                "w_max_abs": w_max,
+                "w_norm_sq": w_norm,
             }
-            del w
         gc.collect()
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # Save
         Path(args.output).parent.mkdir(parents=True, exist_ok=True)
