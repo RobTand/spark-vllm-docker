@@ -90,6 +90,50 @@ def patch_compressed_tensors():
     print("Patched compressed_tensors.py with DynaQuant scheme routing")
 
 
+def patch_moe_dispatch():
+    """Add DynaQuant routing to the compressed-tensors MoE dispatcher."""
+    moe_dir = f"{CT_DIR}/compressed_tensors_moe"
+    path = f"{moe_dir}/compressed_tensors_moe.py"
+    if not os.path.exists(path):
+        print(f"compressed_tensors_moe.py not found at {path}, skipping MoE patch")
+        return
+    with open(path) as f:
+        content = f.read()
+    if "DynaQuant" in content:
+        print("compressed_tensors_moe.py already patched")
+        return
+
+    # Insert DynaQuant check before the WNA16 check
+    # The WNA16 check is: "if quant_config._is_wNa16_group_channel"
+    wna16_check = "if quant_config._is_wNa16_group_channel(weight_quant, input_quant):"
+    if wna16_check in content:
+        dynaquant_block = (
+            "\n"
+            "        # DynaQuant MoE: arbitrary bit-width (1-16) per expert\n"
+            '        if format == "dynaquant-pack-quantized":\n'
+            "            from dynaquant.dynaquant_moe import DynaQuantFusedMoEMethod\n"
+            "            # max_bits from config controls allocation size\n"
+            "            _mb = min(16, max(weight_quant.num_bits * 2, 8))\n"
+            "            return DynaQuantFusedMoEMethod(\n"
+            "                moe=layer.moe_config,\n"
+            "                group_size=weight_quant.group_size or 16,\n"
+            "                max_bits=_mb,\n"
+            "            )\n"
+            "\n"
+            "        "
+        )
+        content = content.replace(
+            "        " + wna16_check,
+            dynaquant_block + wna16_check,
+        )
+
+        with open(path, 'w') as f:
+            f.write(content)
+        print("Patched compressed_tensors_moe.py with DynaQuant MoE routing")
+    else:
+        print("WARNING: Could not find WNA16 check in MoE dispatcher")
+
+
 def patch_utils_data_types():
     """Add 'int' to supported data_types if it's restricted."""
     path = f"{CT_DIR}/utils.py"
@@ -140,6 +184,7 @@ def patch_model_runner():
 if __name__ == "__main__":
     patch_schemes_init()
     patch_compressed_tensors()
+    patch_moe_dispatch()
     patch_utils_data_types()
     patch_model_runner()
     print("All patches applied successfully")

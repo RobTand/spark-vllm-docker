@@ -210,6 +210,9 @@ def main():
 
                 is_special = any(s in tname for s in [
                     "lm_head", "embed_tokens", "mtp.",
+                    ".gate.weight",  # MoE router — small, keep unquantized
+                    "e_score_correction_bias",
+                    "weight_scale_inv",  # fp8 artifact — not needed for DynaQuant
                 ])
                 if keqv_layers and "self_attn.v_proj" in tname:
                     import re as _re2
@@ -256,8 +259,10 @@ def main():
                     bits_used.add(bits)
                     n_quantized += 1
 
-        # Passthrough tensors
+        # Passthrough tensors (skip fp8 artifacts like weight_scale_inv)
         for tname, tensor in to_pass:
+            if "weight_scale_inv" in tname:
+                continue  # fp8 block-scale artifact, not needed
             if tname.endswith(".weight"):
                 ignore.append(tname.replace(".weight", ""))
             tensor_bytes = tensor.numel() * tensor.element_size()
