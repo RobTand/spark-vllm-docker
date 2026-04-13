@@ -143,9 +143,9 @@ def build_blocks(linears: List[dict]) -> Tuple[List[dict], Dict[str, List[str]]]
     Non-block Linears (embeddings, lm_head, etc.) each become their own
     singleton "block" so they still participate in allocation.
 
-    Per-block sensitivity = max(sensitivity) across projections in the block.
-    This is conservative: the most sensitive projection determines the block's
-    bit budget (we can't give it fewer bits than the block gets).
+    Per-block sensitivity = sum(sensitivity) across projections in the block.
+    If all members of a block must share one bit width, the block objective is
+    the sum of the member KL contributions at that shared bit width.
 
     Per-block numel = sum(numel) across projections, since all projections
     in the block will be stored at the block's assigned bit count.
@@ -176,7 +176,7 @@ def build_blocks(linears: List[dict]) -> Tuple[List[dict], Dict[str, List[str]]]
         blocks.append({
             "name": block_name,
             "numel": sum(m["numel"] for m in members),
-            "sensitivity": max(m["sensitivity"] for m in members),
+            "sensitivity": sum(m["sensitivity"] for m in members),
         })
 
     return blocks, block_members
