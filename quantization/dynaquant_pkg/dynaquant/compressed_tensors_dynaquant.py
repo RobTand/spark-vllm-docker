@@ -91,13 +91,14 @@ class CompressedTensorsDynaQuant(CompressedTensorsScheme):
         layer.register_parameter("weight_scale", weight_scale)
 
         # ── Mutable state shared between loaders ──
-        # Bits and packed data arrive in separate tensors (alphabetical order
-        # within safetensors: weight_bits before weight_packed).  We store
-        # them independently and match in process_weights_after_loading.
+        # Bits and packed data arrive in separate tensors and may arrive
+        # in DIFFERENT ORDER from the scales (alphabetical vs shard_id).
+        # We record shard_id with each load so process_weights_after_loading
+        # can reorder to match the scale layout.
         load_state = {
             "packed_offset": 0,
-            "packed_sizes": [],   # byte count per shard
-            "bits_values": [],    # bit width per shard
+            "packed_shards": [],  # [(shard_id, byte_offset, byte_count)]
+            "bits_shards": [],    # [(shard_id, bits_value)]
         }
         layer._dynaquant_load_state = load_state
 
@@ -115,7 +116,7 @@ class CompressedTensorsDynaQuant(CompressedTensorsScheme):
             n = flat.numel()
             off = load_state["packed_offset"]
             param.data[off:off + n] = flat[:n]
-            load_state["packed_sizes"].append(n)
+            load_state["packed_shards"].append((loaded_shard_id, off, n))
             load_state["packed_offset"] = off + n
 
         weight_packed = BasevLLMParameter(
@@ -133,7 +134,7 @@ class CompressedTensorsDynaQuant(CompressedTensorsScheme):
             loaded_shard_id: int | str | None = None,
         ):
             bits_val = int(loaded_weight.view(-1)[0].item())
-            load_state["bits_values"].append(bits_val)
+            load_state["bits_shards"].append((loaded_shard_id, bits_val))
 
         weight_bits = BasevLLMParameter(
             data=torch.zeros(n_partitions, dtype=torch.int8),
@@ -157,34 +158,51 @@ class CompressedTensorsDynaQuant(CompressedTensorsScheme):
         covers q+k+v sub-projections at a single bit width).
         """
         load_state = layer._dynaquant_load_state
-        packed_sizes = load_state["packed_sizes"]
-        bits_values = load_state["bits_values"]
+        packed_shards = load_state["packed_shards"]   # [(shard_id, byte_off, byte_count)]
+        bits_shards = load_state["bits_shards"]       # [(shard_id, bits)]
         in_features = layer.dynaquant_in_features
 
-        # Match bits to packed shards by index (both arrive in shard order)
+        # Build bits lookup by shard_id
+        bits_by_shard = {}
+        for sid, bval in bits_shards:
+            bits_by_shard[sid] = bval
+
+        # Map shard_ids to canonical integer order for scale alignment.
+        # Scales use GroupQuantScaleParameter with output_dim=0, which places
+        # shards in the order defined by the linear layer's shard_id mapping:
+        #   QKV: "q"=0, "k"=1, "v"=2   MLP: 0=gate, 1=up
+        # We must sort packed shards into this same order.
+        qkv_order = {"q": 0, "k": 1, "v": 2}
+
+        def shard_sort_key(entry):
+            sid = entry[0]
+            if isinstance(sid, str):
+                return qkv_order.get(sid, ord(sid))
+            if isinstance(sid, int):
+                return sid
+            return 0  # None or unknown
+
+        sorted_packed = sorted(packed_shards, key=shard_sort_key)
+
         partitions = []
-        packed_offset = 0
         scale_row_offset = 0
 
-        n_shards = len(packed_sizes)
-        for i in range(n_shards):
-            byte_count = packed_sizes[i]
-            bits = bits_values[i] if i < len(bits_values) else self.num_bits
+        for sid, byte_off, byte_count in sorted_packed:
+            bits = bits_by_shard.get(sid, self.num_bits)
             if bits <= 0:
                 bits = self.num_bits
 
-            # Infer output rows from packed byte count
             n_rows = (byte_count * 8) // (in_features * bits)
             partitions.append(
-                (bits, packed_offset, byte_count, scale_row_offset, n_rows)
+                (bits, byte_off, byte_count, scale_row_offset, n_rows)
             )
-            packed_offset += byte_count
             scale_row_offset += n_rows
 
         layer.dynaquant_partitions = partitions
 
         # Trim packed buffer to actual used size (+ 4 byte OOB guard)
-        actual = packed_offset + 4
+        total_packed = load_state["packed_offset"]
+        actual = total_packed + 4
         if actual < layer.weight_packed.data.numel():
             layer.weight_packed = torch.nn.Parameter(
                 layer.weight_packed.data[:actual].clone(),
