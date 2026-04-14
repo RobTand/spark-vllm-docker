@@ -33,6 +33,102 @@ def _get_fused_linear():
     return _fused_linear
 
 
+_moe_prewarmed: set[tuple] = set()
+
+
+def _build_expert_groups(layer: torch.nn.Module):
+    """Bucket experts by quantization signature for grouped execution."""
+    groups: dict[tuple[int, int, int, int, int], list[int]] = {}
+    for eidx in range(layer.dynaquant_num_experts):
+        g_off, g_sz, u_off, u_sz, g_bits, u_bits, out_f, in_f = \
+            layer.dynaquant_w13_table[eidx]
+        d_off, d_sz, d_bits, d_out, d_in = layer.dynaquant_w2_table[eidx]
+        key = (
+            int(g_bits),
+            int(u_bits),
+            int(d_bits),
+            int(layer.dynaquant_group_size_h),
+            int(layer.dynaquant_group_size_i),
+        )
+        groups.setdefault(key, []).append(eidx)
+
+    device = layer.w13_weight_packed.device
+    ordered = []
+    expert_to_group = torch.empty(
+        layer.dynaquant_num_experts, dtype=torch.int64, device=device
+    )
+    for group_id, (key, experts) in enumerate(sorted(groups.items())):
+        expert_tensor = torch.tensor(experts, dtype=torch.int64, device=device)
+        expert_to_group[expert_tensor] = group_id
+        ordered.append(
+            {
+                "id": group_id,
+                "key": key,
+                "experts": tuple(experts),
+                "expert_tensor": expert_tensor,
+            }
+        )
+    layer.dynaquant_expert_groups = ordered
+    layer.dynaquant_expert_to_group = expert_to_group
+    logger.debug(
+        "DynaQuant MoE: grouped %d experts into %d quantization buckets",
+        layer.dynaquant_num_experts,
+        len(ordered),
+    )
+
+
+def _prewarm_moe_kernels(layer):
+    """Prewarm Triton kernels for CUDA graph capture compatibility.
+
+    Warms unique (n_bits, group_size, out_features, in_features) configs
+    at batch sizes 1 (GEMV) and 4/8 (GEMM) so that Triton JIT compilation
+    does not occur during CUDA graph capture.
+    """
+    global _moe_prewarmed
+    fused_linear = _get_fused_linear()
+    device = layer.w13_weight_packed.device
+    if device.type != 'cuda':
+        return
+
+    w13_packed = layer.w13_weight_packed.data
+    w2_packed = layer.w2_weight_packed.data
+    w13_scale = layer.w13_weight_scale.data
+    w2_scale = layer.w2_weight_scale.data
+    gs_h = layer.dynaquant_group_size_h
+    gs_i = layer.dynaquant_group_size_i
+
+    warmed = 0
+    with torch.no_grad():
+        for eidx in range(layer.dynaquant_num_experts):
+            g_off, g_sz, u_off, u_sz, g_bits, u_bits, out_f, in_f = \
+                layer.dynaquant_w13_table[eidx]
+            d_off, d_sz, d_bits, d_out, d_in = layer.dynaquant_w2_table[eidx]
+            configs = [
+                (g_bits, out_f, in_f, gs_h,
+                 w13_packed[g_off:g_off + g_sz + 4],
+                 w13_scale[eidx, :out_f]),
+                (u_bits, out_f, in_f, gs_h,
+                 w13_packed[u_off:u_off + u_sz + 4],
+                 w13_scale[eidx, out_f:2 * out_f]),
+                (d_bits, d_out, d_in, gs_i,
+                 w2_packed[d_off:d_off + d_sz + 4],
+                 w2_scale[eidx, :d_out]),
+            ]
+            for bits, of, inf, gs, p, s in configs:
+                for bs in (1, 4, 8):
+                    sig = (device.index, bits, gs, of, inf, bs)
+                    if sig not in _moe_prewarmed:
+                        xw = torch.zeros(bs, inf, dtype=torch.float32,
+                                         device=device)
+                        _ = fused_linear(xw, p, s, bits, of, inf,
+                                         group_size=gs)
+                        _moe_prewarmed.add(sig)
+                        warmed += 1
+    if warmed:
+        torch.cuda.synchronize(device)
+        logger.debug("DynaQuant MoE: prewarmed %d kernel configs", warmed)
+
+
 class DynaQuantFusedMoEMethod(FusedMoEMethodBase):
     """FusedMoE with per-expert DynaQuant (1-16 bit) quantization."""
 
@@ -351,6 +447,161 @@ class DynaQuantFusedMoEMethod(FusedMoEMethodBase):
         logger.debug("DynaQuant MoE: compacted %d experts, %.1f MB packed",
                       num_experts, total_mb)
 
+        # Prewarm Triton kernels for CUDA graph capture
+        _prewarm_moe_kernels(layer)
+        _build_expert_groups(layer)
+
+    def _apply_capture_fallback(
+        self,
+        layer: torch.nn.Module,
+        x_f32: torch.Tensor,
+        x_dtype: torch.dtype,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        fused_linear = _get_fused_linear()
+        gs_h = layer.dynaquant_group_size_h
+        gs_i = layer.dynaquant_group_size_i
+        hidden = layer.dynaquant_hidden_size
+        num_tokens = x_f32.shape[0]
+        output = torch.zeros(num_tokens, hidden, dtype=x_dtype, device=x_f32.device)
+
+        w13_packed = layer.w13_weight_packed.data
+        w2_packed = layer.w2_weight_packed.data
+        w13_scale = layer.w13_weight_scale.data
+        w2_scale = layer.w2_weight_scale.data
+        w13_table = layer.dynaquant_w13_table
+        w2_table = layer.dynaquant_w2_table
+
+        for group in layer.dynaquant_expert_groups:
+            for eidx in group["experts"]:
+                mask = topk_ids.eq(eidx)
+                expert_weights = (topk_weights * mask.to(topk_weights.dtype)).sum(dim=1)
+                ew = expert_weights.unsqueeze(1)
+
+                g_off, g_sz, u_off, u_sz, g_bits, u_bits, out_f, in_f = w13_table[eidx]
+                gate = fused_linear(
+                    x_f32,
+                    w13_packed[g_off:g_off + g_sz + 4],
+                    w13_scale[eidx, :out_f],
+                    g_bits,
+                    out_f,
+                    in_f,
+                    group_size=gs_h,
+                )
+                up = fused_linear(
+                    x_f32,
+                    w13_packed[u_off:u_off + u_sz + 4],
+                    w13_scale[eidx, out_f:2 * out_f],
+                    u_bits,
+                    out_f,
+                    in_f,
+                    group_size=gs_h,
+                )
+                h = F.silu(gate) * up
+
+                d_off, d_sz, d_bits, d_out, d_in = w2_table[eidx]
+                down = fused_linear(
+                    h.float(),
+                    w2_packed[d_off:d_off + d_sz + 4],
+                    w2_scale[eidx, :d_out],
+                    d_bits,
+                    d_out,
+                    d_in,
+                    group_size=gs_i,
+                )
+                output += ew.to(x_dtype) * down.to(x_dtype)
+
+        return output
+
+    def _apply_grouped_eager(
+        self,
+        layer: torch.nn.Module,
+        x_f32: torch.Tensor,
+        x_dtype: torch.dtype,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        fused_linear = _get_fused_linear()
+        gs_h = layer.dynaquant_group_size_h
+        gs_i = layer.dynaquant_group_size_i
+        hidden = layer.dynaquant_hidden_size
+        num_tokens = x_f32.shape[0]
+        output = torch.zeros(num_tokens, hidden, dtype=x_dtype, device=x_f32.device)
+
+        w13_packed = layer.w13_weight_packed.data
+        w2_packed = layer.w2_weight_packed.data
+        w13_scale = layer.w13_weight_scale.data
+        w2_scale = layer.w2_weight_scale.data
+        w13_table = layer.dynaquant_w13_table
+        w2_table = layer.dynaquant_w2_table
+
+        topk = topk_ids.shape[1]
+        flat_experts = topk_ids.reshape(-1).to(torch.int64)
+        flat_weights = topk_weights.reshape(-1)
+        flat_tokens = torch.arange(
+            num_tokens, device=x_f32.device, dtype=torch.int64
+        ).repeat_interleave(topk)
+
+        sort_idx = torch.argsort(flat_experts, stable=True)
+        sorted_experts = flat_experts.index_select(0, sort_idx)
+        sorted_weights = flat_weights.index_select(0, sort_idx)
+        sorted_tokens = flat_tokens.index_select(0, sort_idx)
+        counts = torch.bincount(sorted_experts, minlength=layer.dynaquant_num_experts)
+        offsets = torch.cumsum(counts, dim=0) - counts
+
+        for group in layer.dynaquant_expert_groups:
+            group_experts = group["expert_tensor"]
+            group_counts = counts.index_select(0, group_experts)
+            active_mask = group_counts > 0
+            if not torch.any(active_mask):
+                continue
+            active_experts = group_experts[active_mask]
+
+            for expert_id in active_experts.tolist():
+                start = int(offsets[expert_id].item())
+                count = int(counts[expert_id].item())
+                end = start + count
+                active = sorted_tokens[start:end]
+                ew = sorted_weights[start:end].unsqueeze(1)
+                xa = x_f32.index_select(0, active)
+
+                g_off, g_sz, u_off, u_sz, g_bits, u_bits, out_f, in_f = w13_table[expert_id]
+                gate = fused_linear(
+                    xa,
+                    w13_packed[g_off:g_off + g_sz + 4],
+                    w13_scale[expert_id, :out_f],
+                    g_bits,
+                    out_f,
+                    in_f,
+                    group_size=gs_h,
+                )
+                up = fused_linear(
+                    xa,
+                    w13_packed[u_off:u_off + u_sz + 4],
+                    w13_scale[expert_id, out_f:2 * out_f],
+                    u_bits,
+                    out_f,
+                    in_f,
+                    group_size=gs_h,
+                )
+                h = F.silu(gate) * up
+
+                d_off, d_sz, d_bits, d_out, d_in = w2_table[expert_id]
+                down = fused_linear(
+                    h.float(),
+                    w2_packed[d_off:d_off + d_sz + 4],
+                    w2_scale[expert_id, :d_out],
+                    d_bits,
+                    d_out,
+                    d_in,
+                    group_size=gs_i,
+                )
+                output.index_add_(0, active, ew.to(x_dtype) * down.to(x_dtype))
+
+        return output
+
+    @torch.compiler.disable()
     def apply(
         self,
         layer: torch.nn.Module,
@@ -359,53 +610,21 @@ class DynaQuantFusedMoEMethod(FusedMoEMethodBase):
         topk_ids: torch.Tensor,
         shared_experts_input: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        fused_linear = _get_fused_linear()
-        gs_h = layer.dynaquant_group_size_h  # for w13 (input is hidden)
-        gs_i = layer.dynaquant_group_size_i  # for w2 (input is intermediate)
-        hidden = layer.dynaquant_hidden_size
-
-        num_tokens = x.shape[0]
-        output = torch.zeros(num_tokens, hidden, dtype=x.dtype, device=x.device)
         x_f32 = x.float()
 
-        w13_packed = layer.w13_weight_packed.data
-        w2_packed = layer.w2_weight_packed.data
-        w13_scale = layer.w13_weight_scale.data
-        w2_scale = layer.w2_weight_scale.data
-
-        w13_table = layer.dynaquant_w13_table
-        w2_table = layer.dynaquant_w2_table
-
-        # CUDA graph capture forbids data-dependent host control flow such as
-        # unique()/item()/tensor truthiness. Iterate over the fixed expert range
-        # and keep token selection in tensor space.
-        for eidx in range(layer.dynaquant_num_experts):
-            mask = topk_ids.eq(eidx)
-            expert_weights = (topk_weights * mask.to(topk_weights.dtype)).sum(dim=1)
-            active = torch.nonzero(expert_weights.ne(0), as_tuple=False).flatten()
-            xa = x_f32.index_select(0, active)
-            ew = expert_weights.index_select(0, active).unsqueeze(1)
-
-            # Gate (w1)
-            g_off, g_sz, u_off, u_sz, g_bits, u_bits, out_f, in_f = w13_table[eidx]
-            gate = fused_linear(xa, w13_packed[g_off:g_off + g_sz + 4],
-                                w13_scale[eidx, :out_f], g_bits, out_f, in_f,
-                                group_size=gs_h)
-
-            # Up (w3)
-            up = fused_linear(xa, w13_packed[u_off:u_off + u_sz + 4],
-                              w13_scale[eidx, out_f:2 * out_f], u_bits, out_f, in_f,
-                              group_size=gs_h)
-
-            # SiLU activation
-            h = F.silu(gate) * up
-
-            # Down (w2)
-            d_off, d_sz, d_bits, d_out, d_in = w2_table[eidx]
-            down = fused_linear(h.float(), w2_packed[d_off:d_off + d_sz + 4],
-                                w2_scale[eidx, :d_out], d_bits, d_out, d_in,
-                                group_size=gs_i)
-
-            output.index_add_(0, active, ew.to(x.dtype) * down.to(x.dtype))
-
-        return output
+        # @torch.compiler.disable() above forces a graph break so that in
+        # piecewise cudagraph mode this function runs eagerly — preserving
+        # MoE sparsity via dynamic token selection (the else branch).
+        #
+        # In FULL cudagraph mode the entire forward is still captured as
+        # one graph, so we fall back to a static path with fixed shapes
+        # (all experts, weighted by routing).  Use -cc.cudagraph_mode=
+        # piecewise for best DynaQuant MoE performance.
+        _capturing = torch.cuda.is_current_stream_capturing()
+        if _capturing:
+            return self._apply_capture_fallback(
+                layer, x_f32, x.dtype, topk_weights, topk_ids
+            )
+        return self._apply_grouped_eager(
+            layer, x_f32, x.dtype, topk_weights, topk_ids
+        )

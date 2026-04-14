@@ -32,5 +32,5 @@ command: |
     --trust-remote-code \
     --kv-cache-dtype fp8 \
     --attention-backend flashinfer \
-    -cc.cudagraph_mode=none \
+    -cc.cudagraph_mode=piecewise \
     -tp {tensor_parallel}
