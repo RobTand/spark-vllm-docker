@@ -33,6 +33,7 @@ from quantization.joint_knapsack_optimizer import (
     load_hawq_sensitivity,
     load_layer_tensor,
 )
+from quantization.build_rtn_cache import rtn_fp8_any_shape
 
 
 @dataclass(frozen=True)
@@ -142,9 +143,11 @@ def apply_codebook(x: torch.Tensor, codebook_name: str) -> torch.Tensor:
     if codebook_name == "bf16":
         return x.to(torch.bfloat16).float()
     if codebook_name == "fp8_e4m3":
-        return x.to(torch.float8_e4m3fn).float()
+        finfo = torch.finfo(torch.float8_e4m3fn)
+        return torch.clamp(x, min=-finfo.max, max=finfo.max).to(torch.float8_e4m3fn).float()
     if codebook_name == "fp8_e5m2":
-        return x.to(torch.float8_e5m2).float()
+        finfo = torch.finfo(torch.float8_e5m2)
+        return torch.clamp(x, min=-finfo.max, max=finfo.max).to(torch.float8_e5m2).float()
     codebook = CODEBOOKS[codebook_name].to(device=x.device)
     view = x.reshape(-1, 1)
     idx = torch.argmin(torch.abs(view - codebook.view(1, -1)), dim=1)
@@ -163,14 +166,35 @@ def bucket_memory_bytes(n_elements: int, bucket: NativeBucket) -> int:
     return weight_bytes + scale_bytes
 
 
-def measure_bucket_mse(weights: torch.Tensor, bucket: NativeBucket, chunk_groups: int = 262_144) -> float:
+def quantize_tensor_to_bucket(weights: torch.Tensor, bucket: NativeBucket, chunk_groups: int = 262_144) -> torch.Tensor:
+    """Round-trip a tensor through a native bucket approximation."""
+    if bucket.name == "fp8_e4m3":
+        return rtn_fp8_any_shape(weights.to(torch.float32)).to(dtype=weights.dtype)
+    if bucket.name == "fp8_e5m2":
+        w = weights.to(torch.float32)
+        if w.dim() == 2:
+            max_abs = w.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
+            finfo = torch.finfo(torch.float8_e5m2)
+            scale = max_abs / finfo.max
+            q = torch.clamp(w / scale, min=-finfo.max, max=finfo.max).to(torch.float8_e5m2).float()
+            return (q * scale).to(dtype=weights.dtype)
+        if w.dim() == 3:
+            e, out_f, in_f = w.shape
+            flat = w.reshape(e * out_f, in_f)
+            max_abs = flat.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
+            finfo = torch.finfo(torch.float8_e5m2)
+            scale = max_abs / finfo.max
+            q = torch.clamp(flat / scale, min=-finfo.max, max=finfo.max).to(torch.float8_e5m2).float()
+            return (q * scale).reshape_as(w).to(dtype=weights.dtype)
+        return torch.clamp(w, min=-torch.finfo(torch.float8_e5m2).max, max=torch.finfo(torch.float8_e5m2).max).to(torch.float8_e5m2).float().to(dtype=weights.dtype)
+    original_shape = tuple(weights.shape)
     flat_cpu = weights.reshape(-1).to(dtype=torch.float32, device="cpu")
     original_n = flat_cpu.numel()
     device = torch.device("cuda")
-    total_se = 0.0
-    total_groups = (original_n + bucket.group_size - 1) // bucket.group_size
+    chunks: List[torch.Tensor] = []
 
     with torch.no_grad():
+        total_groups = (original_n + bucket.group_size - 1) // bucket.group_size
         for start_group in range(0, total_groups, chunk_groups):
             start = start_group * bucket.group_size
             end = min(original_n, (start_group + chunk_groups) * bucket.group_size)
@@ -198,12 +222,19 @@ def measure_bucket_mse(weights: torch.Tensor, bucket: NativeBucket, chunk_groups
                 normalized = groups / scales_safe
                 q = apply_codebook(normalized, bucket.codebook)
                 recon = (q * scales_expanded).reshape(-1)
-            diff = chunk[:valid_n] - recon[:valid_n]
-            total_se += float(torch.sum(diff * diff).item())
-            del chunk, recon, diff, chunk_cpu
+
+            chunks.append(recon[:valid_n].to(device="cpu", dtype=weights.dtype))
+            del chunk, recon, chunk_cpu
 
     torch.cuda.empty_cache()
-    return total_se / max(original_n, 1)
+    return torch.cat(chunks, dim=0).reshape(original_shape).contiguous()
+
+
+def measure_bucket_mse(weights: torch.Tensor, bucket: NativeBucket, chunk_groups: int = 262_144) -> float:
+    recon = quantize_tensor_to_bucket(weights, bucket, chunk_groups=chunk_groups).reshape(-1).float()
+    ref = weights.reshape(-1).float().cpu()
+    diff = ref - recon.cpu()
+    return float(torch.mean(diff * diff).item()) if diff.numel() else 0.0
 
 
 def build_frontier(results: List[BucketResult]) -> List[BucketResult]:
