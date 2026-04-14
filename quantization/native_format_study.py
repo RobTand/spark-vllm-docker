@@ -66,6 +66,8 @@ BUCKETS: Dict[str, NativeBucket] = {
     "mxfp4": NativeBucket("mxfp4", group_size=32, scale_mode="e8m0_pow2", codebook="fp4_e2m1", bits_per_weight=4.25),
     "mxfp6_e2m3": NativeBucket("mxfp6_e2m3", group_size=32, scale_mode="e8m0_pow2", codebook="fp6_e2m3", bits_per_weight=6.25),
     "mxfp6_e3m2": NativeBucket("mxfp6_e3m2", group_size=32, scale_mode="e8m0_pow2", codebook="fp6_e3m2", bits_per_weight=6.25),
+    "fp8_e4m3": NativeBucket("fp8_e4m3", group_size=1, scale_mode="bf16", codebook="fp8_e4m3", bits_per_weight=8.0),
+    "fp8_e5m2": NativeBucket("fp8_e5m2", group_size=1, scale_mode="bf16", codebook="fp8_e5m2", bits_per_weight=8.0),
     "mxfp8_e4m3": NativeBucket("mxfp8_e4m3", group_size=32, scale_mode="e8m0_pow2", codebook="fp8_e4m3", bits_per_weight=8.25),
     "mxfp8_e5m2": NativeBucket("mxfp8_e5m2", group_size=32, scale_mode="e8m0_pow2", codebook="fp8_e5m2", bits_per_weight=8.25),
     "bf16": NativeBucket("bf16", group_size=1, scale_mode="bf16", codebook="bf16", bits_per_weight=16.0),
@@ -152,6 +154,8 @@ def apply_codebook(x: torch.Tensor, codebook_name: str) -> torch.Tensor:
 def bucket_memory_bytes(n_elements: int, bucket: NativeBucket) -> int:
     if bucket.name == "bf16":
         return n_elements * 2
+    if bucket.name.startswith("fp8_"):
+        return n_elements
     weight_bytes = math.ceil(n_elements * (bucket.bits_per_weight - (8.0 / bucket.group_size)) / 8.0)
     scale_bytes = math.ceil((n_elements / bucket.group_size))
     if bucket.name == "nvfp4":
@@ -360,7 +364,10 @@ def main():
     parser.add_argument("--max-layers", type=int, default=None)
     parser.add_argument("--modality-policy", default="text-only")
     parser.add_argument("--baseline", default="nvfp4")
-    parser.add_argument("--buckets", default="nvfp4,mxfp4,mxfp6_e2m3,mxfp6_e3m2,mxfp8_e4m3,mxfp8_e5m2,bf16")
+    parser.add_argument(
+        "--buckets",
+        default="nvfp4,mxfp4,mxfp6_e2m3,mxfp6_e3m2,fp8_e4m3,fp8_e5m2,mxfp8_e4m3,mxfp8_e5m2,bf16",
+    )
     args = parser.parse_args()
 
     model_path = Path(args.model)
