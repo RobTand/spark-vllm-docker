@@ -23,10 +23,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsScheme,
 )
-from vllm.model_executor.parameter import (
-    BasevLLMParameter,
-    GroupQuantScaleParameter,
-)
+from vllm.model_executor.parameter import BasevLLMParameter
 
 logger = init_logger(__name__)
 __all__ = ["CompressedTensorsDynaQuant"]
@@ -37,7 +34,7 @@ _fused_linear = None
 def _get_fused_linear():
     global _fused_linear
     if _fused_linear is None:
-        from dynaquant.kernels.fused_dequant_gemv import dynaquant_linear
+        from .kernels.fused_dequant_gemv import dynaquant_linear
         _fused_linear = dynaquant_linear
     return _fused_linear
 
@@ -71,36 +68,72 @@ class CompressedTensorsDynaQuant(CompressedTensorsScheme):
         **kwargs,
     ):
         output_size_per_partition = sum(output_partition_sizes)
-        n_groups = input_size_per_partition // self.group_size
 
         # ── Store geometry on the layer for apply_weights ──
-        layer.dynaquant_group_size = self.group_size
         layer.dynaquant_out_features = output_size_per_partition
         layer.dynaquant_in_features = input_size_per_partition
         layer.dynaquant_partition_sizes = output_partition_sizes
 
-        # ── Scales: standard vLLM parameter (2D, output_dim=0) ──
-        weight_scale = GroupQuantScaleParameter(
-            data=torch.zeros(
-                output_size_per_partition, n_groups, dtype=torch.float32,
-            ),
-            input_dim=1,
-            output_dim=0,
-            weight_loader=weight_loader,
-        )
-        layer.register_parameter("weight_scale", weight_scale)
+        def _canonical_part_ids(loaded_shard_id):
+            if loaded_shard_id is None:
+                return None
+            if isinstance(loaded_shard_id, (tuple, list)):
+                ids = list(loaded_shard_id)
+            else:
+                ids = [loaded_shard_id]
+            qkv_order = {"q": 0, "k": 1, "v": 2, "z": 3}
+            norm_ids = []
+            for sid in ids:
+                if isinstance(sid, str):
+                    sid = qkv_order.get(sid, sid)
+                if isinstance(sid, int):
+                    norm_ids.append(sid)
+            return norm_ids or None
 
-        # ── Mutable state shared between loaders ──
-        # Bits and packed data arrive in separate tensors and may arrive
-        # in DIFFERENT ORDER from the scales (alphabetical vs shard_id).
-        # We record shard_id with each load so process_weights_after_loading
-        # can reorder to match the scale layout.
+        def _scale_row_offset(loaded_shard_id):
+            norm_ids = _canonical_part_ids(loaded_shard_id)
+            if not norm_ids:
+                return 0
+            start = min(norm_ids)
+            return sum(output_partition_sizes[:start])
+
         load_state = {
             "packed_offset": 0,
             "packed_shards": [],  # [(shard_id, byte_offset, byte_count)]
             "bits_shards": [],    # [(shard_id, bits_value)]
+            "scale_shards": [],   # [(shard_id, scale_tensor, row_offset, n_rows, group_size)]
         }
         layer._dynaquant_load_state = load_state
+
+        def _scale_weight_loader(
+            param: torch.nn.Parameter,
+            loaded_weight: torch.Tensor,
+            loaded_shard_id: int | str | tuple[int, ...] | None = None,
+        ):
+            actual_n_groups = loaded_weight.shape[-1] if loaded_weight.dim() > 1 else 1
+            actual_gs = (
+                input_size_per_partition // actual_n_groups
+                if actual_n_groups > 0 and input_size_per_partition % actual_n_groups == 0
+                else self.group_size
+            )
+            offset = _scale_row_offset(loaded_shard_id)
+            actual_rows = loaded_weight.shape[0]
+            load_state["scale_shards"].append(
+                (
+                    loaded_shard_id,
+                    loaded_weight[:actual_rows].clone(),
+                    offset,
+                    actual_rows,
+                    actual_gs,
+                )
+            )
+
+        # ── Placeholder scales parameter; actual per-shard scales are captured by the custom loader ──
+        weight_scale = BasevLLMParameter(
+            data=torch.zeros(1, 1, dtype=torch.float32),
+            weight_loader=_scale_weight_loader,
+        )
+        layer.register_parameter("weight_scale", weight_scale)
 
         # ── Packed weights: sequential byte append ──
         max_packed_bytes = (
@@ -160,12 +193,17 @@ class CompressedTensorsDynaQuant(CompressedTensorsScheme):
         load_state = layer._dynaquant_load_state
         packed_shards = load_state["packed_shards"]   # [(shard_id, byte_off, byte_count)]
         bits_shards = load_state["bits_shards"]       # [(shard_id, bits)]
+        scale_shards = load_state["scale_shards"]     # [(shard_id, scale_tensor, row_off, n_rows, group_size)]
         in_features = layer.dynaquant_in_features
 
         # Build bits lookup by shard_id
         bits_by_shard = {}
         for sid, bval in bits_shards:
             bits_by_shard[sid] = bval
+
+        scales_by_shard = {}
+        for sid, scale_tensor, row_offset, n_rows, group_size in scale_shards:
+            scales_by_shard[sid] = (scale_tensor, row_offset, n_rows, group_size)
 
         # Map shard_ids to canonical integer order for scale alignment.
         # Scales use GroupQuantScaleParameter with output_dim=0, which places
@@ -185,18 +223,21 @@ class CompressedTensorsDynaQuant(CompressedTensorsScheme):
         sorted_packed = sorted(packed_shards, key=shard_sort_key)
 
         partitions = []
-        scale_row_offset = 0
-
         for sid, byte_off, byte_count in sorted_packed:
             bits = bits_by_shard.get(sid, self.num_bits)
             if bits <= 0:
                 bits = self.num_bits
 
-            n_rows = (byte_count * 8) // (in_features * bits)
-            partitions.append(
-                (bits, byte_off, byte_count, scale_row_offset, n_rows)
+            scale_tensor, _row_offset, n_rows, group_size = scales_by_shard.get(
+                sid,
+                (None, 0, (byte_count * 8) // (in_features * bits), self.group_size),
             )
-            scale_row_offset += n_rows
+            if scale_tensor is None:
+                scale_tensor = torch.ones(n_rows, max(1, in_features // group_size),
+                                          dtype=torch.float32, device=layer.weight_packed.device)
+            partitions.append(
+                (bits, byte_off, byte_count, scale_tensor, group_size, n_rows)
+            )
 
         layer.dynaquant_partitions = partitions
 
@@ -221,7 +262,6 @@ class CompressedTensorsDynaQuant(CompressedTensorsScheme):
         fused_linear = _get_fused_linear()
 
         in_f = layer.dynaquant_in_features
-        group_size = layer.dynaquant_group_size
         partitions = layer.dynaquant_partitions
 
         input_dtype = x.dtype
@@ -235,18 +275,15 @@ class CompressedTensorsDynaQuant(CompressedTensorsScheme):
         packed = layer.weight_packed
         if isinstance(packed, torch.nn.Parameter):
             packed = packed.data
-        scales = layer.weight_scale
-        if isinstance(scales, torch.nn.Parameter):
-            scales = scales.data
 
         if len(partitions) == 1:
             # ── Fast path: single shard ──
-            bits, p_off, p_size, r_off, n_rows = partitions[0]
+            bits, p_off, p_size, scale_tensor, group_size, n_rows = partitions[0]
             p_end = min(p_off + p_size + 4, packed.numel())
             y = fused_linear(
                 x_f32,
                 packed[p_off:p_end],
-                scales[r_off:r_off + n_rows],
+                scale_tensor.to(device=x_f32.device, dtype=torch.float32),
                 bits, n_rows, in_f,
                 bias=bias,
                 group_size=group_size,
@@ -254,12 +291,12 @@ class CompressedTensorsDynaQuant(CompressedTensorsScheme):
         else:
             # ── Multi-shard: heterogeneous bit widths ──
             parts = []
-            for bits, p_off, p_size, r_off, n_rows in partitions:
+            for bits, p_off, p_size, scale_tensor, group_size, n_rows in partitions:
                 p_end = min(p_off + p_size + 4, packed.numel())
                 y_part = fused_linear(
                     x_f32,
                     packed[p_off:p_end],
-                    scales[r_off:r_off + n_rows],
+                    scale_tensor.to(device=x_f32.device, dtype=torch.float32),
                     bits, n_rows, in_f,
                     bias=None,
                     group_size=group_size,

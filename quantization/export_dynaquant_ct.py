@@ -31,12 +31,35 @@ import sys
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
+import re
 
 import torch
 
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent / "kernels"))
 from pack_utils import pack_Nbit_tensor
+
+
+CONFIG_RE = re.compile(r"^w(?P<w>\d+)_s(?P<s>\d+)_g(?P<g>\d+)$")
+
+
+def parse_recipe_config(value, default_group_size: int) -> tuple[int, int, int]:
+    """Normalize recipe values from old and new optimizer outputs.
+
+    Supports:
+      - int bit width
+      - [w_bits, s_bits, g_size]
+      - "w5_s16_g32"
+    """
+    if isinstance(value, int):
+        return value, 16, default_group_size
+    if isinstance(value, (list, tuple)) and len(value) == 3:
+        return int(value[0]), int(value[1]), int(value[2])
+    if isinstance(value, str):
+        m = CONFIG_RE.match(value)
+        if m:
+            return int(m.group("w")), int(m.group("s")), int(m.group("g"))
+    raise ValueError(f"unsupported recipe config value: {value!r}")
 
 
 def resolve_name_mapping(source_names, recipe):
@@ -68,21 +91,56 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
     parser.add_argument("--pareto", required=True)
+    parser.add_argument("--curve", choices=("promotion", "pareto"), default="promotion")
     parser.add_argument("--step", default="knee")
     parser.add_argument("--output", required=True)
-    parser.add_argument("--group-size", type=int, default=16)
+    parser.add_argument("--group-size", type=int, default=128,
+                        help="Group size for non-MoE layers (default: 128)")
+    parser.add_argument("--per-row-moe-scales", action="store_true",
+                        help="Use per-row scales for MoE experts (1 scale per output row)")
+    parser.add_argument("--bf16-scales", action="store_true",
+                        help="Save scales as bf16 instead of fp32")
     args = parser.parse_args()
 
     t0 = time.time()
 
     with open(args.pareto) as f:
         pareto_data = json.load(f)
-    pareto = pareto_data["pareto"]
-    if args.step == "knee":
-        entry = min(pareto, key=lambda p: abs(p["step"] - pareto_data["knee_step"]))
+
+    # Support old allocator output and new joint optimizer output.
+    if "promotion_curve" in pareto_data or "pareto_curve" in pareto_data:
+        curve_key = "promotion_curve" if args.curve == "promotion" else "pareto_curve"
+        pareto = pareto_data[curve_key]
+        if args.step == "knee":
+            if args.curve == "promotion":
+                entry = pareto_data.get("promotion_knee")
+            else:
+                entry = pareto_data.get("knee")
+            if entry is None:
+                entry = pareto[len(pareto) // 2]
+        elif args.step == "final":
+            entry = pareto[-1]
+        else:
+            entry = min(pareto, key=lambda p: abs(p["step"] - int(args.step)))
+
+        raw_recipe = entry["recipe"]
+        recipe = {}
+        gsize_map = {}
+        for name, val in raw_recipe.items():
+            w_bits, _s_bits, g_size = parse_recipe_config(val, args.group_size)
+            recipe[name] = w_bits
+            gsize_map[name] = g_size
+        print(f"[dynaquant] optimizer recipe: {entry.get('avg_bpw', 0):.2f} bpw, "
+              f"{len(recipe)} layers")
     else:
-        entry = min(pareto, key=lambda p: abs(p["step"] - int(args.step)))
-    recipe = entry["recipe"]
+        # 1D format: recipe values are just w_bits
+        pareto = pareto_data["pareto"]
+        if args.step == "knee":
+            entry = min(pareto, key=lambda p: abs(p["step"] - pareto_data["knee_step"]))
+        else:
+            entry = min(pareto, key=lambda p: abs(p["step"] - int(args.step)))
+        recipe = entry["recipe"]
+        gsize_map = {n: args.group_size for n in recipe}
 
     hist = Counter(recipe.values())
     print(f"[dynaquant] Recipe: {dict(sorted(hist.items()))}")
@@ -186,20 +244,27 @@ def main():
     import os
     n_workers = max(1, os.cpu_count() or 1)
 
-    def _pack_one(w_float, bits_val, gs):
+    def _is_moe_expert(tname):
+        """Check if tensor is an MoE expert weight."""
+        return "block_sparse_moe.experts." in tname and ".weight" in tname
+
+    def _pack_one(w_float, bits_val, gs, use_bf16_scales=False):
         """Pack a single weight tensor — runs in a thread."""
         out_f, in_f = w_float.shape
         if in_f % gs != 0:
             pad = gs - (in_f % gs)
             w_float = torch.nn.functional.pad(w_float, (0, pad))
-        return pack_Nbit_tensor(w_float, bits_val, gs)
+        packed, scales = pack_Nbit_tensor(w_float, bits_val, gs)
+        if use_bf16_scales:
+            scales = scales.to(torch.bfloat16)
+        return packed, scales
 
     for shard_file in sorted(set(source_index["weight_map"].values())):
         shard_path = source_dir / shard_file
         print(f"[dynaquant] processing {shard_file}", flush=True)
 
         # Collect tensors to pack and passthrough tensors
-        to_pack = []    # (tname, tensor_float, bits)
+        to_pack = []    # (tname, rname, tensor_float, bits, is_3d_moe)
         to_pass = []    # (tname, tensor)
 
         with safe_open(str(shard_path), framework="pt", device="cpu") as f:
@@ -208,11 +273,13 @@ def main():
                 rname = name_mapping.get(tname)
                 bits = recipe.get(rname, 16) if rname else 16
 
+                is_moe_expert = "experts.gate_up_proj" in tname or "experts.down_proj" in tname
                 is_special = any(s in tname for s in [
                     "lm_head", "embed_tokens", "mtp.",
                     ".gate.weight",  # MoE router — small, keep unquantized
                     "e_score_correction_bias",
                     "weight_scale_inv",  # fp8 artifact — not needed for DynaQuant
+                    "shared_expert_gate",  # Router for shared expert
                 ])
                 if keqv_layers and "self_attn.v_proj" in tname:
                     import re as _re2
@@ -221,27 +288,73 @@ def main():
                         is_special = True
 
                 in_recipe = rname is not None and rname in recipe
+                # Handle 2D weights (standard Linear)
                 if in_recipe and tname.endswith(".weight") and tensor.dim() == 2 and not is_special:
-                    to_pack.append((tname, tensor.float(), bits))
+                    to_pack.append((tname, rname, tensor.float(), bits, False))  # False = not 3D MoE
+                # Handle 3D MoE expert tensors (Qwen3.5 packed format: [n_experts, out, in])
+                elif in_recipe and tensor.dim() == 3 and ("experts.gate_up_proj" in tname or "experts.down_proj" in tname):
+                    to_pack.append((tname, rname, tensor.float(), bits, True))  # True = 3D MoE
                 else:
                     to_pass.append((tname, tensor))
+
+        def _pack_3d_moe(w_3d, bits_val, gs, use_bf16_scales=False):
+            """Pack a 3D MoE expert tensor [n_experts, out_features, in_features]."""
+            n_experts, out_f, in_f = w_3d.shape
+            # Pack each expert independently
+            packed_list = []
+            scales_list = []
+            for i in range(n_experts):
+                w_2d = w_3d[i]  # [out_f, in_f]
+                if in_f % gs != 0:
+                    pad = gs - (in_f % gs)
+                    w_2d = torch.nn.functional.pad(w_2d, (0, pad))
+                packed, scales = pack_Nbit_tensor(w_2d, bits_val, gs)
+                packed_list.append(packed)
+                scales_list.append(scales)
+            # Stack: packed [n_experts, packed_size], scales [n_experts, n_groups]
+            stacked_packed = torch.stack(packed_list, dim=0)
+            stacked_scales = torch.stack(scales_list, dim=0)
+            if use_bf16_scales:
+                stacked_scales = stacked_scales.to(torch.bfloat16)
+            return stacked_packed, stacked_scales
 
         # Pack in parallel using thread pool
         if to_pack:
             futures = {}
             with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                for tname, w, bits in to_pack:
-                    fut = pool.submit(_pack_one, w, bits, group_size)
-                    futures[fut] = (tname, bits)
+                for tname, rname, w, bits, is_3d_moe in to_pack:
+                    # Use per-row scales for MoE experts if requested
+                    if args.per_row_moe_scales and _is_moe_expert(tname):
+                        gs = w.shape[-1]  # in_features = per-row (last dim for both 2D and 3D)
+                    else:
+                        # Use per-layer group_size from 3D recipe, or default
+                        gs = gsize_map.get(rname, group_size)
+                    if is_3d_moe:
+                        fut = pool.submit(_pack_3d_moe, w, bits, gs, args.bf16_scales)
+                    else:
+                        fut = pool.submit(_pack_one, w, bits, gs, args.bf16_scales)
+                    futures[fut] = (tname, bits, gs, is_3d_moe)
 
                 for fut in as_completed(futures):
-                    tname, bits = futures[fut]
+                    tname, bits, tensor_gs, is_3d_moe = futures[fut]
                     packed, scales = fut.result()
 
-                    prefix = tname.replace(".weight", "")
-                    packed_name = f"{prefix}.weight_packed"
-                    scale_name = f"{prefix}.weight_scale"
-                    bits_name = f"{prefix}.weight_bits"
+                    # For 3D MoE, map to w13/w2 naming to avoid Qwen3.5 chunking code
+                    if is_3d_moe:
+                        if "gate_up_proj" in tname:
+                            prefix = tname.replace("gate_up_proj", "w13_weight")
+                        elif "down_proj" in tname:
+                            prefix = tname.replace("down_proj", "w2_weight")
+                        else:
+                            prefix = tname
+                        packed_name = f"{prefix}_packed"
+                        scale_name = f"{prefix}_scale"
+                        bits_name = f"{prefix}_bits"
+                    else:
+                        prefix = tname.replace(".weight", "")
+                        packed_name = f"{prefix}.weight_packed"
+                        scale_name = f"{prefix}.weight_scale"
+                        bits_name = f"{prefix}.weight_bits"
 
                     packed_bytes = packed.numel()
                     scale_bytes = scales.numel() * scales.element_size()
@@ -318,6 +431,8 @@ def main():
         ]
 
     def to_vllm_name(name):
+        if name == "lm_head":
+            return "language_model.lm_head"
         for old, new in vllm_prefix_map:
             if name.startswith(old):
                 return new + name[len(old):]
@@ -372,6 +487,7 @@ def main():
         "format": "dynaquant-pack-quantized",
         "ignore": vllm_ignore,
         "quant_method": "compressed-tensors",
+        "moe_per_row_scales": args.per_row_moe_scales,
     }
 
     # Write config.json
