@@ -359,6 +359,12 @@ def dynaquant_linear(
 
     Automatically selects GEMV (batch=1) or GEMM (batch>1).
     """
+    if x.dim() == 2 and x.shape[0] == 0:
+        y = torch.empty(0, out_features, dtype=torch.float32, device=x.device)
+        if bias is not None:
+            y = y + bias
+        return y.to(x.dtype)
+
     if x.dim() == 1 or (x.dim() == 2 and x.shape[0] == 1):
         y = fused_dequant_gemv(x, packed, scales, n_bits, out_features, in_features, group_size)
     else:

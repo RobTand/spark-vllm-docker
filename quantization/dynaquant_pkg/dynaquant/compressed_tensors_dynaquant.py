@@ -29,6 +29,7 @@ logger = init_logger(__name__)
 __all__ = ["CompressedTensorsDynaQuant"]
 
 _fused_linear = None
+_prewarmed_signatures: set[tuple] = set()
 
 
 def _get_fused_linear():
@@ -37,6 +38,40 @@ def _get_fused_linear():
         from .kernels.fused_dequant_gemv import dynaquant_linear
         _fused_linear = dynaquant_linear
     return _fused_linear
+
+
+def _prewarm_partition(
+    packed: torch.Tensor,
+    bits: int,
+    scale_tensor: torch.Tensor,
+    group_size: int,
+    out_features: int,
+    in_features: int,
+) -> None:
+    if not packed.is_cuda or not scale_tensor.is_cuda:
+        return
+
+    fused_linear = _get_fused_linear()
+    device = packed.device
+    sig_base = (device.index, bits, group_size, out_features, in_features)
+    if (sig_base, 1) not in _prewarmed_signatures:
+        with torch.no_grad():
+            x1 = torch.zeros(1, in_features, dtype=torch.float32, device=device)
+            _ = fused_linear(
+                x1, packed, scale_tensor, bits, out_features, in_features,
+                bias=None, group_size=group_size,
+            )
+            torch.cuda.synchronize(device)
+        _prewarmed_signatures.add((sig_base, 1))
+    if (sig_base, 32) not in _prewarmed_signatures:
+        with torch.no_grad():
+            x32 = torch.zeros(32, in_features, dtype=torch.float32, device=device)
+            _ = fused_linear(
+                x32, packed, scale_tensor, bits, out_features, in_features,
+                bias=None, group_size=group_size,
+            )
+            torch.cuda.synchronize(device)
+        _prewarmed_signatures.add((sig_base, 32))
 
 
 class CompressedTensorsDynaQuant(CompressedTensorsScheme):
@@ -235,6 +270,12 @@ class CompressedTensorsDynaQuant(CompressedTensorsScheme):
             if scale_tensor is None:
                 scale_tensor = torch.ones(n_rows, max(1, in_features // group_size),
                                           dtype=torch.float32, device=layer.weight_packed.device)
+            else:
+                scale_tensor = scale_tensor.to(
+                    device=layer.weight_packed.device,
+                    dtype=torch.float32,
+                    non_blocking=False,
+                ).contiguous()
             partitions.append(
                 (bits, byte_off, byte_count, scale_tensor, group_size, n_rows)
             )
@@ -248,6 +289,18 @@ class CompressedTensorsDynaQuant(CompressedTensorsScheme):
             layer.weight_packed = torch.nn.Parameter(
                 layer.weight_packed.data[:actual].clone(),
                 requires_grad=False,
+            )
+
+        packed_data = layer.weight_packed.data
+        for bits, byte_off, byte_count, scale_tensor, group_size, n_rows in partitions:
+            p_end = min(byte_off + byte_count + 4, packed_data.numel())
+            _prewarm_partition(
+                packed_data[byte_off:p_end],
+                bits,
+                scale_tensor,
+                group_size,
+                n_rows,
+                in_features,
             )
 
         # Clean up
@@ -283,7 +336,7 @@ class CompressedTensorsDynaQuant(CompressedTensorsScheme):
             y = fused_linear(
                 x_f32,
                 packed[p_off:p_end],
-                scale_tensor.to(device=x_f32.device, dtype=torch.float32),
+                scale_tensor,
                 bits, n_rows, in_f,
                 bias=bias,
                 group_size=group_size,
@@ -296,7 +349,7 @@ class CompressedTensorsDynaQuant(CompressedTensorsScheme):
                 y_part = fused_linear(
                     x_f32,
                     packed[p_off:p_end],
-                    scale_tensor.to(device=x_f32.device, dtype=torch.float32),
+                    scale_tensor,
                     bits, n_rows, in_f,
                     bias=None,
                     group_size=group_size,

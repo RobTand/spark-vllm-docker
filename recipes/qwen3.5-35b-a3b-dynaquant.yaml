@@ -1,0 +1,36 @@
+recipe_version: "1"
+name: Qwen3.5-35B-A3B-DynaQuant
+description: |
+  Qwen3.5-35B-A3B exported from the full-all-experts DynaQuant promotion-knee recipe.
+  Preserves mixed 4/5/8/16-bit packed weights and runs through the repo's
+  patched vLLM + DynaQuant compressed-tensors path.
+
+model: local
+
+container: vllm-node
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.82
+  max_model_len: 32768
+  max_num_batched_tokens: 8192
+
+env:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  TRITON_CACHE_DIR: "/tmp/triton_cache"
+
+command: |
+  vllm serve /root/.cache/huggingface/local-models/Qwen3.5-35B-A3B-dynaquant-4.64bpw \
+    --host {host} \
+    --port {port} \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --enable-prefix-caching \
+    --trust-remote-code \
+    --kv-cache-dtype fp8 \
+    --attention-backend flashinfer \
+    -cc.cudagraph_mode=none \
+    -tp {tensor_parallel}
