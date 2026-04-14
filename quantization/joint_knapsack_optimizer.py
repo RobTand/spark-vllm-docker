@@ -15,7 +15,7 @@ Uses ProcessPoolExecutor for true parallelism (bypasses GIL).
 
 import torch
 import numpy as np
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Optional
 from pathlib import Path
 from safetensors import safe_open
@@ -27,6 +27,7 @@ import os
 import json
 import sys
 import re
+import math
 
 # Force unbuffered output
 sys.stdout.reconfigure(line_buffering=True)
@@ -60,6 +61,59 @@ def load_hawq_sensitivity(path: str) -> Dict[str, float]:
     return sensitivities
 
 
+def load_minimax_gate_priors(model_path: Path) -> Dict[str, float]:
+    """Derive a lightweight routing prior from MiniMax router weights.
+
+    This is not exact routing frequency. It is a checkpoint-only proxy that
+    scores each MoE layer by how concentrated its router appears to be:
+      mean(top-k(router_row_norm + correction_bias))) / mean(all experts)
+
+    We normalize the resulting multipliers to have mean 1.0 and apply them only
+    to MoE expert-family items.
+    """
+    cfg_path = model_path / "config.json"
+    if not cfg_path.exists():
+        return {}
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+    top_k = int(cfg.get("num_experts_per_tok", 8))
+
+    gate_weights: Dict[str, torch.Tensor] = {}
+    gate_biases: Dict[str, torch.Tensor] = {}
+    for st_file in sorted(model_path.glob("*.safetensors")):
+        with safe_open(str(st_file), framework="pt", device="cpu") as f:
+            for key in f.keys():
+                if key.endswith(".block_sparse_moe.gate.weight"):
+                    gate_weights[key] = f.get_tensor(key).float()
+                elif key.endswith(".block_sparse_moe.e_score_correction_bias"):
+                    gate_biases[key] = f.get_tensor(key).float()
+
+    priors: Dict[str, float] = {}
+    layer_scores: List[float] = []
+    for gate_name, gate_weight in gate_weights.items():
+        bias_name = gate_name.replace(".gate.weight", ".e_score_correction_bias")
+        bias = gate_biases.get(bias_name)
+        row_score = gate_weight.norm(dim=1)
+        if bias is not None:
+            row_score = row_score + bias
+        score = float((row_score.topk(min(top_k, row_score.numel())).values.mean() / row_score.mean()).item())
+        layer_name = gate_name[: gate_name.rfind(".block_sparse_moe.gate.weight")]
+        priors[f"{layer_name}.block_sparse_moe.experts.*.w1.weight"] = score
+        priors[f"{layer_name}.block_sparse_moe.experts.*.w2.weight"] = score
+        priors[f"{layer_name}.block_sparse_moe.experts.*.w3.weight"] = score
+        layer_scores.append(score)
+
+    if not layer_scores:
+        return priors
+
+    mean_score = float(sum(layer_scores) / len(layer_scores))
+    if mean_score <= 0:
+        return priors
+    for key in list(priors.keys()):
+        priors[key] = priors[key] / mean_score
+    return priors
+
+
 @dataclass
 class Config:
     w_bits: int
@@ -89,6 +143,7 @@ class LayerInfo:
     sensitivity: float
     pareto_configs: List[ConfigResult]
     stats: Dict[str, float]
+    members: List[str] = field(default_factory=list)
 
 
 # Default search space: wide weight search, narrow scale search, moderate groups.
@@ -786,7 +841,7 @@ def evaluate_layer_worker(args):
     Uses shape-based caching: layers with identical shapes share Pareto frontiers.
     Sensitivity is from HAWQ if provided, else falls back to RMS proxy.
     """
-    name, weights_flat, shape, n_elements, use_cache, hawq_sensitivity, all_configs, eval_backend = args
+    name, weights_flat, shape, n_elements, members, use_cache, hawq_sensitivity, all_configs, eval_backend = args
     cfg_sig = config_signature(all_configs)
 
     # Use HAWQ sensitivity if provided, else fall back to RMS proxy
@@ -802,7 +857,7 @@ def evaluate_layer_worker(args):
     if use_cache:
         cached = load_cached_frontier(shape, sample, cfg_sig)
         if cached is not None:
-            return (name, shape, n_elements, sensitivity, compute_layer_stats(weights_flat), cached, True)
+            return (name, shape, n_elements, members, sensitivity, compute_layer_stats(weights_flat), cached, True)
 
     # Evaluate all configs
     results = []
@@ -860,7 +915,7 @@ def evaluate_layer_worker(args):
     if use_cache:
         save_cached_frontier(shape, pareto, sample, cfg_sig)
 
-    return (name, shape, n_elements, sensitivity, compute_layer_stats(weights_flat), pareto, False)
+    return (name, shape, n_elements, members, sensitivity, compute_layer_stats(weights_flat), pareto, False)
 
 
 def evaluate_layer_local(layer_ref: Dict, use_cache_flag: bool, layer_sens: Optional[float],
@@ -873,6 +928,7 @@ def evaluate_layer_local(layer_ref: Dict, use_cache_flag: bool, layer_sens: Opti
             weights,
             layer_ref["shape"],
             layer_ref["n_elements"],
+            list(layer_ref.get("members", [])),
             use_cache_flag,
             layer_sens,
             all_configs,
@@ -882,6 +938,7 @@ def evaluate_layer_local(layer_ref: Dict, use_cache_flag: bool, layer_sens: Opti
     name = layer_ref["name"]
     shape = layer_ref["shape"]
     n_elements = layer_ref["n_elements"]
+    members = list(layer_ref.get("members", []))
     cfg_sig = config_signature(all_configs)
     tensor = load_layer_tensor(layer_ref)
     sample = sample_tensor_values(tensor)
@@ -894,7 +951,7 @@ def evaluate_layer_local(layer_ref: Dict, use_cache_flag: bool, layer_sens: Opti
     if use_cache_flag:
         cached = load_cached_frontier(shape, sample, cfg_sig)
         if cached is not None:
-            return (name, shape, n_elements, sensitivity, compute_layer_stats_sampled(sample), cached, True)
+            return (name, shape, n_elements, members, sensitivity, compute_layer_stats_sampled(sample), cached, True)
 
     mses = quantize_and_measure_many_torch_streaming(tensor, all_configs)
     results = []
@@ -921,7 +978,7 @@ def evaluate_layer_local(layer_ref: Dict, use_cache_flag: bool, layer_sens: Opti
     if use_cache_flag:
         save_cached_frontier(shape, pareto, sample, cfg_sig)
 
-    return (name, shape, n_elements, sensitivity, compute_layer_stats_sampled(sample), pareto, False)
+    return (name, shape, n_elements, members, sensitivity, compute_layer_stats_sampled(sample), pareto, False)
 
 
 def water_fill_pareto(layers: List[LayerInfo]) -> List[Dict]:
@@ -1123,6 +1180,9 @@ def expert_family_key(name: str) -> Optional[str]:
         return "moe_gate_up"
     if ".mlp.experts.down_proj" in name or ".mlp.experts.w2_" in name:
         return "moe_down"
+    m = re.search(r"\.block_sparse_moe\.experts\.\d+\.(w[123])\.weight$", name)
+    if m:
+        return f"moe_{m.group(1)}"
     return None
 
 
@@ -1143,6 +1203,117 @@ def recipe_cost_error(recipe: Dict[str, str], lookup: Dict[str, LayerInfo]) -> T
         total_error += layer.sensitivity * chosen.mse
     avg_bpw = total_cost * 8 / total_elems
     return total_cost, total_error, avg_bpw
+
+
+def aggregate_expert_families_for_optimization(
+    layers: List[LayerInfo],
+) -> Tuple[List[LayerInfo], Dict[str, List[str]]]:
+    """Collapse MoE expert families into shared optimization items.
+
+    This turns all expert gate_up tensors into one decision variable and all
+    expert down tensors into another. The optimizer can then trade off expert
+    precision against the rest of the model directly, instead of projecting a
+    mixed-width solution onto a shared-config constraint afterward.
+    """
+    lookup = {layer.name: layer for layer in layers}
+    family_members: Dict[str, List[str]] = {}
+    passthrough: List[LayerInfo] = []
+
+    for layer in layers:
+        fam = expert_family_key(layer.name)
+        if fam:
+            family_members.setdefault(fam, []).append(layer.name)
+        else:
+            passthrough.append(layer)
+
+    optimized_layers = list(passthrough)
+    aggregate_map: Dict[str, List[str]] = {}
+
+    for fam, names in family_members.items():
+        if len(names) <= 1:
+            optimized_layers.extend(lookup[name] for name in names)
+            continue
+
+        per_member_cfgs = []
+        config_intersection = None
+        for name in names:
+            layer = lookup[name]
+            cfg_map = {str(cfg.config): cfg for cfg in layer.pareto_configs}
+            per_member_cfgs.append((name, layer, cfg_map))
+            cfg_keys = set(cfg_map.keys())
+            config_intersection = cfg_keys if config_intersection is None else (config_intersection & cfg_keys)
+
+        if not config_intersection:
+            optimized_layers.extend(lookup[name] for name in names)
+            continue
+
+        total_elements = sum(lookup[name].n_elements for name in names)
+        mean_stats = {
+            key: float(np.mean([lookup[name].stats.get(key, 0.0) for name in names]))
+            for key in ("std", "kurtosis", "outlier_ratio", "max_abs")
+        }
+
+        aggregate_cfgs: List[ConfigResult] = []
+        for cfg_str in sorted(config_intersection, key=parse_recipe_config_str):
+            w_bits, s_bits, g_size = parse_recipe_config_str(cfg_str)
+            total_memory = 0
+            total_weighted_error = 0.0
+            for _name, layer, cfg_map in per_member_cfgs:
+                cfg = cfg_map[cfg_str]
+                total_memory += cfg.memory_bytes
+                total_weighted_error += layer.sensitivity * cfg.mse
+            aggregate_cfgs.append(
+                ConfigResult(
+                    config=Config(w_bits, s_bits, g_size),
+                    mse=total_weighted_error,
+                    memory_bytes=total_memory,
+                    bits_per_weight=total_memory * 8 / total_elements,
+                )
+            )
+
+        optimized_layers.append(
+            LayerInfo(
+                name=fam,
+                shape=(total_elements,),
+                n_elements=total_elements,
+                sensitivity=1.0,
+                pareto_configs=aggregate_cfgs,
+                stats=mean_stats,
+                members=list(names),
+            )
+        )
+        aggregate_map[fam] = list(names)
+
+    optimized_layers.sort(key=lambda layer: -layer.n_elements)
+    return optimized_layers, aggregate_map
+
+
+def expand_recipe_from_aggregates(
+    recipe: Dict[str, str],
+    aggregate_map: Dict[str, List[str]],
+) -> Dict[str, str]:
+    """Expand aggregate expert-family recipe entries back to real tensor names."""
+    expanded: Dict[str, str] = {}
+    for name, cfg_str in recipe.items():
+        members = aggregate_map.get(name)
+        if members:
+            for member in members:
+                expanded[member] = cfg_str
+        else:
+            expanded[name] = cfg_str
+    return expanded
+
+
+def expand_curve_from_aggregates(
+    curve: List[Dict],
+    aggregate_map: Dict[str, List[str]],
+) -> List[Dict]:
+    expanded_curve = []
+    for point in curve:
+        new_point = dict(point)
+        new_point["recipe"] = expand_recipe_from_aggregates(point["recipe"], aggregate_map)
+        expanded_curve.append(new_point)
+    return expanded_curve
 
 
 def apply_expert_consensus_to_recipe(
@@ -1343,8 +1514,77 @@ def find_curve_knee(curve: List[Dict], x_key: str = "cost_bytes",
     return best_i
 
 
+MINIMAX_EXPERT_RE = re.compile(
+    r"^(?P<prefix>.*\.block_sparse_moe\.experts\.)"
+    r"(?P<expert>\d+)"
+    r"(?P<suffix>\.(w[123])\.weight)$"
+)
+
+
+def _collapse_expert_refs(
+    raw_refs: List[Dict],
+    experts_per_family_sample: int,
+) -> List[Dict]:
+    """Collapse repeated MoE expert tensors into per-layer family items.
+
+    MiniMax stores each expert as its own 2D weight tensor, which explodes the
+    search space. For local runs, we collapse tensors like:
+      model.layers.7.block_sparse_moe.experts.{0..255}.w1.weight
+    into one family item keyed as:
+      model.layers.7.block_sparse_moe.experts.*.w1.weight
+
+    The family item evaluates a small set of evenly spaced expert samples while
+    charging the full family memory cost. This keeps the run local and much more
+    representative than a tiny global HAWQ sample.
+    """
+    passthrough: List[Dict] = []
+    families: Dict[str, List[Tuple[int, Dict]]] = {}
+
+    for ref in raw_refs:
+        m = MINIMAX_EXPERT_RE.match(ref["name"])
+        if not m:
+            passthrough.append(ref)
+            continue
+        family_name = f"{m.group('prefix')}*{m.group('suffix')}"
+        expert_idx = int(m.group("expert"))
+        families.setdefault(family_name, []).append((expert_idx, ref))
+
+    collapsed = list(passthrough)
+    for family_name, members in sorted(families.items()):
+        members.sort(key=lambda item: item[0])
+        all_refs = [ref for _idx, ref in members]
+        sample_count = min(max(1, experts_per_family_sample), len(all_refs))
+        if sample_count >= len(all_refs):
+            sampled_refs = all_refs
+        else:
+            sample_positions = np.linspace(0, len(all_refs) - 1, sample_count, dtype=np.int64)
+            sampled_refs = [all_refs[int(pos)] for pos in sample_positions]
+
+        representative_shape = sampled_refs[0]["shape"]
+        representative_elements = sampled_refs[0]["n_elements"]
+        collapsed.append({
+            "name": family_name,
+            "shape": representative_shape,
+            "n_elements": representative_elements * len(all_refs),
+            "st_file": sampled_refs[0]["st_file"],
+            "tensor_key": sampled_refs[0]["tensor_key"],
+            "expert_idx": None,
+            "sample_expert_indices": [ref["name"] for ref in sampled_refs],
+            "sample_tensor_refs": [
+                {"st_file": ref["st_file"], "tensor_key": ref["tensor_key"]}
+                for ref in sampled_refs
+            ],
+            "members": [ref["name"] for ref in all_refs],
+        })
+
+    collapsed.sort(key=lambda x: -x["n_elements"])
+    return collapsed
+
+
 def discover_model_layers(model_path: Path, max_layers: int = None,
-                         modality_policy: str = "text-only") -> List[Dict]:
+                         modality_policy: str = "text-only",
+                         collapse_expert_families: bool = False,
+                         experts_per_family_sample: int = 1) -> List[Dict]:
     """Discover quantizable weight tensors without loading them all into RAM."""
     if modality_policy != "text-only":
         raise NotImplementedError(
@@ -1381,6 +1621,8 @@ def discover_model_layers(model_path: Path, max_layers: int = None,
                     continue
                 if len(shape) == 1:
                     continue
+                if not key.endswith(".weight"):
+                    continue
 
                 n_elements = 1
                 for dim in shape:
@@ -1415,13 +1657,26 @@ def discover_model_layers(model_path: Path, max_layers: int = None,
         if max_layers and len(layers) >= max_layers:
             break
 
+    if collapse_expert_families:
+        layers = _collapse_expert_refs(layers, experts_per_family_sample)
+
     # Sort by size descending for better load balancing (big layers first)
     layers.sort(key=lambda x: -x["n_elements"])
+    if max_layers:
+        layers = layers[:max_layers]
     return layers
 
 
 def load_layer_array(layer_ref: Dict) -> np.ndarray:
     """Load one tensor (or expert slice) as a flattened float32 numpy array."""
+    sample_refs = layer_ref.get("sample_tensor_refs")
+    if sample_refs:
+        arrays = []
+        for ref in sample_refs:
+            with safe_open(ref["st_file"], framework="pt", device="cpu") as f:
+                tensor = f.get_tensor(ref["tensor_key"])
+            arrays.append(tensor.flatten().float().numpy())
+        return np.concatenate(arrays, axis=0)
     with safe_open(layer_ref["st_file"], framework="pt", device="cpu") as f:
         tensor = f.get_tensor(layer_ref["tensor_key"])
     if layer_ref["expert_idx"] is not None:
@@ -1431,6 +1686,14 @@ def load_layer_array(layer_ref: Dict) -> np.ndarray:
 
 def load_layer_tensor(layer_ref: Dict) -> torch.Tensor:
     """Load one tensor as a CPU torch tensor without full float32 expansion."""
+    sample_refs = layer_ref.get("sample_tensor_refs")
+    if sample_refs:
+        chunks = []
+        for ref in sample_refs:
+            with safe_open(ref["st_file"], framework="pt", device="cpu") as f:
+                tensor = f.get_tensor(ref["tensor_key"])
+            chunks.append(tensor.reshape(-1).contiguous())
+        return torch.cat(chunks, dim=0)
     with safe_open(layer_ref["st_file"], framework="pt", device="cpu") as f:
         tensor = f.get_tensor(layer_ref["tensor_key"])
     if layer_ref["expert_idx"] is not None:
@@ -1504,6 +1767,14 @@ def main():
                         help="Write a progress checkpoint to --output every N completed layers.")
     parser.add_argument("--eval-backend", choices=["cpu", "gpu"], default="cpu",
                         help="Local frontier evaluation backend. cpu is default; gpu is a fast path for smoke tests.")
+    parser.add_argument("--collapse-expert-families", action="store_true",
+                        help="Collapse repeated MoE expert tensors into one per-layer family item before frontier building.")
+    parser.add_argument("--experts-per-family-sample", type=int, default=4,
+                        help="When collapsing expert families, evaluate this many evenly spaced experts per family.")
+    parser.add_argument("--routing-prior", choices=["none", "minimax-gate"], default="none",
+                        help="Optional checkpoint-only routing prior to reweight MoE expert families.")
+    parser.add_argument("--routing-prior-strength", type=float, default=1.0,
+                        help="Exponent applied to the routing prior multiplier before sensitivity weighting.")
     args = parser.parse_args()
 
     # Handle cache
@@ -1552,11 +1823,32 @@ def main():
         print("WARNING: No --sensitivity provided, using RMS-of-weights proxy (less accurate)")
         print("         Run measure_hawq_sensitivity.py first for proper Fisher-based sensitivity")
 
+    routing_prior = {}
+    if args.routing_prior == "minimax-gate":
+        print("Loading MiniMax gate-based routing prior...")
+        routing_prior = load_minimax_gate_priors(model_path)
+        if routing_prior:
+            vals = list(routing_prior.values())
+            print(f"  Loaded priors for {len(routing_prior)} expert families "
+                  f"(min={min(vals):.3f} mean={sum(vals)/len(vals):.3f} max={max(vals):.3f})")
+        else:
+            print("  No routing priors found")
+
     # Load layers
     print("\nLoading model weights...")
     t_load = time.time()
-    raw_layers = discover_model_layers(model_path, args.max_layers, args.modality_policy)
+    raw_layers = discover_model_layers(
+        model_path,
+        args.max_layers,
+        args.modality_policy,
+        collapse_expert_families=args.collapse_expert_families,
+        experts_per_family_sample=args.experts_per_family_sample,
+    )
     print(f"Discovered {len(raw_layers)} weight tensors in {time.time() - t_load:.1f}s")
+    if args.collapse_expert_families:
+        collapsed = sum(1 for layer in raw_layers if layer.get("sample_tensor_refs"))
+        print(f"Collapsed expert families: {collapsed} items "
+              f"(samples per family: {args.experts_per_family_sample})")
 
     # Filter out large layers if requested (for fast iteration)
     if args.skip_large:
@@ -1598,11 +1890,15 @@ def main():
                 layer_sens = hawq_sens.get(candidate)
                 if layer_sens is not None:
                     break
+        if routing_prior and name in routing_prior:
+            if layer_sens is None:
+                layer_sens = 1.0
+            layer_sens *= routing_prior[name] ** args.routing_prior_strength
         layer_jobs.append((layer, use_cache, layer_sens))
 
     def record_result(result):
         nonlocal completed, cache_hits
-        name, shape, n_elements, sensitivity, stats, pareto_tuples, was_cached = result
+        name, shape, n_elements, members, sensitivity, stats, pareto_tuples, was_cached = result
         if was_cached:
             cache_hits += 1
 
@@ -1623,6 +1919,7 @@ def main():
             sensitivity=sensitivity,
             pareto_configs=pareto_configs,
             stats=stats,
+            members=members,
         ))
 
         completed += 1
@@ -1665,6 +1962,7 @@ def main():
                     weights,
                     layer_ref["shape"],
                     layer_ref["n_elements"],
+                    list(layer_ref.get("members", [])),
                     use_cache_flag,
                     layer_sens,
                     all_configs,
@@ -1691,29 +1989,52 @@ def main():
     print(f"Pareto frontiers built in {time.time() - t_pareto:.1f}s (cache hits: {cache_hits}/{len(raw_layers)})")
     print(flush=True)
 
+    optimization_layers = layers
+    aggregate_map: Dict[str, List[str]] = {}
+    if not args.no_expert_consensus:
+        optimization_layers, aggregate_map = aggregate_expert_families_for_optimization(layers)
+        if aggregate_map:
+            print("\nApplying expert-family shared-config constraint during optimization:")
+            for fam, members in sorted(aggregate_map.items()):
+                print(f"  {fam}: {len(members)} tensors")
+            print(f"Reduced optimization items: {len(layers)} -> {len(optimization_layers)}")
+            print(flush=True)
+
     # Water-fill to get full Pareto curve
     print("\nWater-filling over 3D Pareto frontiers...")
     t_wf = time.time()
-    pareto_curve = water_fill_pareto(layers)
+    pareto_curve = water_fill_pareto(optimization_layers)
+    if aggregate_map:
+        pareto_curve = expand_curve_from_aggregates(pareto_curve, aggregate_map)
     print(f"Water-fill time: {time.time() - t_wf:.2f}s")
     print(f"Pareto curve has {len(pareto_curve)} points")
     print(flush=True)
 
     print("\nBuilding promotion ladder above baseline...")
     t_promote = time.time()
-    promotion_curve = build_promotion_curve(layers, baseline_config)
+    promotion_curve = build_promotion_curve(optimization_layers, baseline_config)
+    if aggregate_map:
+        promotion_curve = expand_curve_from_aggregates(promotion_curve, aggregate_map)
     lookup = {layer.name: layer for layer in layers}
     pareto_consensus = {}
     promotion_consensus = {}
-    if not args.no_expert_consensus:
-        pareto_curve, pareto_consensus = apply_expert_consensus_to_curve(pareto_curve, lookup)
-        promotion_curve, promotion_consensus = apply_expert_consensus_to_curve(promotion_curve, lookup)
-        if promotion_consensus:
-            print("Applied expert consensus targets:")
-            for fam, cfg_str in sorted(promotion_consensus.items()):
-                print(f"  {fam}: {cfg_str}")
     promotion_knee_idx = find_curve_knee(promotion_curve)
     promotion_knee = promotion_curve[promotion_knee_idx]
+    if aggregate_map:
+        promotion_consensus = {
+            fam: promotion_knee["recipe"][members[0]]
+            for fam, members in sorted(aggregate_map.items())
+            if members and members[0] in promotion_knee["recipe"]
+        }
+        pareto_consensus = {
+            fam: pareto_curve[-1]["recipe"][members[0]]
+            for fam, members in sorted(aggregate_map.items())
+            if members and members[0] in pareto_curve[-1]["recipe"]
+        }
+        if promotion_consensus:
+            print("Applied expert-family constraint inside optimizer:")
+            for fam, cfg_str in sorted(promotion_consensus.items()):
+                print(f"  {fam}: {cfg_str}")
     print(f"Promotion ladder time: {time.time() - t_promote:.2f}s")
     print(f"Promotion ladder has {len(promotion_curve)} points")
     print(
