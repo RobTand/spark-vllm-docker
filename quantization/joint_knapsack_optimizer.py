@@ -19,13 +19,14 @@ from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
 from pathlib import Path
 from safetensors import safe_open
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed, wait, FIRST_COMPLETED
 import multiprocessing as mp
 import hashlib
 import time
 import os
 import json
 import sys
+import re
 
 # Force unbuffered output
 sys.stdout.reconfigure(line_buffering=True)
@@ -97,13 +98,16 @@ DEFAULT_G_SIZE_RANGE = [16, 32, 64, 128, 256]
 DEFAULT_BASELINE_CONFIG = (4, 8, 16)
 
 
-def get_shape_hash(shape: Tuple[int, ...], weights_sample: Optional[np.ndarray] = None) -> str:
+def get_shape_hash(shape: Tuple[int, ...], weights_sample: Optional[np.ndarray] = None,
+                   config_signature: Optional[str] = None) -> str:
     """Compute a cache key from shape plus sampled content.
 
     Shape alone is not enough: same-shape layers can have different outlier and
     scale distributions, which changes their Pareto frontiers.
     """
     h = hashlib.md5(str(shape).encode())
+    if config_signature:
+        h.update(config_signature.encode())
     if weights_sample is not None:
         flat = np.asarray(weights_sample, dtype=np.float32).reshape(-1)
         if flat.size:
@@ -115,11 +119,12 @@ def get_shape_hash(shape: Tuple[int, ...], weights_sample: Optional[np.ndarray] 
     return h.hexdigest()[:12]
 
 
-def load_cached_frontier(shape: Tuple[int, ...], weights_sample: Optional[np.ndarray] = None) -> Optional[List[Tuple]]:
+def load_cached_frontier(shape: Tuple[int, ...], weights_sample: Optional[np.ndarray] = None,
+                         config_signature: Optional[str] = None) -> Optional[List[Tuple]]:
     """Load cached Pareto frontier for a shape if available."""
     if not CACHE_DIR.exists():
         return None
-    cache_file = CACHE_DIR / f"{get_shape_hash(shape, weights_sample)}.json"
+    cache_file = CACHE_DIR / f"{get_shape_hash(shape, weights_sample, config_signature)}.json"
     if cache_file.exists():
         try:
             with open(cache_file) as f:
@@ -130,10 +135,11 @@ def load_cached_frontier(shape: Tuple[int, ...], weights_sample: Optional[np.nda
 
 
 def save_cached_frontier(shape: Tuple[int, ...], pareto: List[Tuple],
-                         weights_sample: Optional[np.ndarray] = None):
+                         weights_sample: Optional[np.ndarray] = None,
+                         config_signature: Optional[str] = None):
     """Save Pareto frontier to cache."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cache_file = CACHE_DIR / f"{get_shape_hash(shape, weights_sample)}.json"
+    cache_file = CACHE_DIR / f"{get_shape_hash(shape, weights_sample, config_signature)}.json"
     try:
         with open(cache_file, "w") as f:
             json.dump(pareto, f)
@@ -210,6 +216,10 @@ def quantize_scale_int4_symmetric(scales: np.ndarray) -> np.ndarray:
 
 def quantize_and_measure_single(weights_flat: np.ndarray, w_bits: int, s_bits: int, g_size: int) -> float:
     """Quantize weights with given config and return MSE. Optimized numpy version."""
+    n_groups_est = (len(weights_flat) + g_size - 1) // g_size
+    if n_groups_est > 1_000_000:
+        return quantize_and_measure_single_chunked(weights_flat, w_bits, s_bits, g_size)
+
     original_n = len(weights_flat)
     n = original_n
 
@@ -259,6 +269,366 @@ def quantize_and_measure_single(weights_flat: np.ndarray, w_bits: int, s_bits: i
     return float(se / original_n)
 
 
+def quantize_and_measure_single_chunked(weights_flat: np.ndarray, w_bits: int, s_bits: int,
+                                        g_size: int, chunk_groups: int = 262_144) -> float:
+    """Chunked version for very large tensors (for example MoE expert tensors)."""
+    weights_flat = np.asarray(weights_flat, dtype=np.float32).reshape(-1)
+    original_n = len(weights_flat)
+    qmax = (1 << (w_bits - 1)) - 1
+    total_se = 0.0
+    processed = 0
+
+    for start_group in range(0, (original_n + g_size - 1) // g_size, chunk_groups):
+        start = start_group * g_size
+        end = min(original_n, (start_group + chunk_groups) * g_size)
+        chunk = weights_flat[start:end]
+        n = len(chunk)
+        if n % g_size != 0:
+            pad = g_size - (n % g_size)
+            chunk = np.concatenate([chunk, np.zeros(pad, dtype=np.float32)])
+            n = len(chunk)
+
+        groups = chunk.reshape(n // g_size, g_size)
+        max_abs = np.abs(groups).max(axis=1)
+        valid = max_abs > 1e-10
+        raw_scales = np.zeros(groups.shape[0], dtype=np.float32)
+        raw_scales[valid] = max_abs[valid] / qmax
+
+        if s_bits >= 16:
+            scales = raw_scales
+        elif s_bits == 8:
+            scales = quantize_scale_fp8_e4m3(raw_scales)
+        else:
+            scales = quantize_scale_int4_symmetric(raw_scales)
+
+        scales_expanded = scales[:, np.newaxis]
+        scales_safe = np.where(scales_expanded > 1e-10, scales_expanded, 1.0)
+        codes = np.clip(np.round(groups / scales_safe), -qmax - 1, qmax)
+        recon = codes * scales_expanded
+        recon[scales < 1e-10] = 0
+
+        valid_n = min(end - start, n)
+        diff = chunk[:valid_n] - recon.reshape(-1)[:valid_n]
+        total_se += float(np.dot(diff, diff))
+        processed += valid_n
+
+    return total_se / max(processed, 1)
+
+
+def quantize_scale_fp8_e4m3_torch(scales: torch.Tensor) -> torch.Tensor:
+    result = torch.zeros_like(scales)
+    nz = scales > 0
+    if not torch.any(nz):
+        return result
+    vals = torch.clamp(scales[nz], min=2 ** -9, max=448.0)
+    exp = torch.floor(torch.log2(vals))
+    mantissa = vals / torch.pow(torch.tensor(2.0, device=vals.device, dtype=vals.dtype), exp)
+    mantissa_q = torch.round((mantissa - 1.0) * 8.0) / 8.0 + 1.0
+    result[nz] = mantissa_q * torch.pow(torch.tensor(2.0, device=vals.device, dtype=vals.dtype), exp)
+    return result
+
+
+def quantize_scale_int4_symmetric_torch(scales: torch.Tensor) -> torch.Tensor:
+    if torch.max(scales) < 1e-10:
+        return scales
+    sos = torch.max(scales) / 7.0
+    q_scales = torch.clamp(torch.round(scales / sos), 0, 7)
+    return q_scales * sos
+
+
+def quantize_and_measure_single_torch(weights_flat: torch.Tensor, w_bits: int, s_bits: int, g_size: int) -> float:
+    """Torch/GPU version of quantize_and_measure_single."""
+    n_groups_est = (weights_flat.numel() + g_size - 1) // g_size
+    if n_groups_est > 1_000_000:
+        return quantize_and_measure_single_torch_chunked(weights_flat, w_bits, s_bits, g_size)
+
+    original_n = weights_flat.numel()
+    w = weights_flat.float()
+    if original_n % g_size != 0:
+        pad = g_size - (original_n % g_size)
+        w = torch.nn.functional.pad(w, (0, pad))
+    n = w.numel()
+    groups = w.view(n // g_size, g_size)
+    qmax = (1 << (w_bits - 1)) - 1
+    max_abs = groups.abs().amax(dim=1)
+    raw_scales = torch.zeros_like(max_abs)
+    valid = max_abs > 1e-10
+    raw_scales[valid] = max_abs[valid] / qmax
+    if s_bits >= 16:
+        scales = raw_scales
+    elif s_bits == 8:
+        scales = quantize_scale_fp8_e4m3_torch(raw_scales)
+    else:
+        scales = quantize_scale_int4_symmetric_torch(raw_scales)
+    scales_expanded = scales[:, None]
+    scales_safe = torch.where(scales_expanded > 1e-10, scales_expanded, torch.ones_like(scales_expanded))
+    codes = torch.clamp(torch.round(groups / scales_safe), -qmax - 1, qmax)
+    recon = codes * scales_expanded
+    recon[scales < 1e-10] = 0
+    recon_flat = recon.reshape(-1)[:original_n]
+    se = torch.sum((weights_flat[:original_n] - recon_flat) ** 2)
+    return float(se.item() / original_n)
+
+
+def quantize_and_measure_single_torch_chunked(
+    weights_flat: torch.Tensor,
+    w_bits: int,
+    s_bits: int,
+    g_size: int,
+    chunk_groups: int = 262_144,
+) -> float:
+    """GPU chunked quantization error path for very large tensors.
+
+    Keeps only one chunk on device at a time. This is slower than the fully
+    vectorized path on small tensors, but it avoids VRAM spikes on huge fused
+    MoE tensors while still using the GPU for the heavy inner loop.
+    """
+    original_n = weights_flat.numel()
+    qmax = (1 << (w_bits - 1)) - 1
+    total_se = 0.0
+    processed = 0
+
+    device = torch.device("cuda")
+    source = weights_flat
+    if source.is_cuda:
+        source = source.detach().to(device="cpu", dtype=torch.float32)
+    else:
+        source = source.detach().to(dtype=torch.float32)
+
+    with torch.no_grad():
+        total_groups = (original_n + g_size - 1) // g_size
+        for start_group in range(0, total_groups, chunk_groups):
+            start = start_group * g_size
+            end = min(original_n, (start_group + chunk_groups) * g_size)
+            chunk_cpu = source[start:end]
+            n = chunk_cpu.numel()
+            if n % g_size != 0:
+                pad = g_size - (n % g_size)
+                chunk_cpu = torch.nn.functional.pad(chunk_cpu, (0, pad))
+                n = chunk_cpu.numel()
+
+            chunk = chunk_cpu.to(device=device, dtype=torch.float32, non_blocking=False)
+            groups = chunk.view(n // g_size, g_size)
+            max_abs = groups.abs().amax(dim=1)
+            raw_scales = torch.zeros_like(max_abs)
+            valid = max_abs > 1e-10
+            raw_scales[valid] = max_abs[valid] / qmax
+
+            if s_bits >= 16:
+                scales = raw_scales
+            elif s_bits == 8:
+                scales = quantize_scale_fp8_e4m3_torch(raw_scales)
+            else:
+                scales = quantize_scale_int4_symmetric_torch(raw_scales)
+
+            scales_expanded = scales[:, None]
+            scales_safe = torch.where(
+                scales_expanded > 1e-10, scales_expanded, torch.ones_like(scales_expanded)
+            )
+            codes = torch.clamp(torch.round(groups / scales_safe), -qmax - 1, qmax)
+            recon = codes * scales_expanded
+            recon[scales < 1e-10] = 0
+
+            valid_n = end - start
+            diff = chunk[:valid_n] - recon.reshape(-1)[:valid_n]
+            total_se += float(torch.sum(diff * diff).item())
+            processed += valid_n
+
+            del chunk, groups, max_abs, raw_scales, scales, scales_expanded, scales_safe, codes, recon, diff
+
+    torch.cuda.empty_cache()
+    return total_se / max(processed, 1)
+
+
+def quantize_and_measure_many_torch_chunked(
+    weights_flat: torch.Tensor,
+    configs: List[Tuple[int, int, int]],
+    target_chunk_elems: Optional[int] = None,
+) -> Dict[Tuple[int, int, int], float]:
+    """Evaluate many configs over one large tensor with shared chunk passes.
+
+    For huge MoE tensors, the dominant cost was repeatedly reloading the same
+    tensor for every config. This function groups configs by ``g_size`` and
+    reuses each chunk across all bit/scale variants for that group size.
+    """
+    original_n = weights_flat.numel()
+    device = torch.device("cuda")
+    source = weights_flat
+    if source.is_cuda:
+        source = source.detach().to(device="cpu", dtype=torch.float32)
+    else:
+        source = source.detach().to(dtype=torch.float32)
+
+    if target_chunk_elems is None:
+        free_bytes, _total_bytes = torch.cuda.mem_get_info(device)
+        # Chunk working set is several tensor-sized buffers at once. Using ~25%
+        # of currently free memory keeps utilization up without flirting with OOM.
+        target_chunk_elems = int(max(8_388_608, min(134_217_728, (free_bytes * 0.25) // 24)))
+
+    configs_by_g: Dict[int, List[Tuple[int, int, int]]] = {}
+    for cfg in configs:
+        configs_by_g.setdefault(cfg[2], []).append(cfg)
+
+    total_se = {cfg: 0.0 for cfg in configs}
+
+    with torch.no_grad():
+        for g_size, g_configs in configs_by_g.items():
+            chunk_groups = max(1, target_chunk_elems // g_size)
+            unique_w_bits = sorted({w for w, _, _ in g_configs})
+            for start_group in range(0, (original_n + g_size - 1) // g_size, chunk_groups):
+                start = start_group * g_size
+                end = min(original_n, (start_group + chunk_groups) * g_size)
+                chunk_cpu = source[start:end]
+                valid_n = chunk_cpu.numel()
+                if valid_n % g_size != 0:
+                    pad = g_size - (valid_n % g_size)
+                    chunk_cpu = torch.nn.functional.pad(chunk_cpu, (0, pad))
+                chunk = chunk_cpu.to(device=device, dtype=torch.float32, non_blocking=False)
+                groups = chunk.view(-1, g_size)
+                max_abs = groups.abs().amax(dim=1)
+
+                raw_scales_by_w = {}
+                for w_bits in unique_w_bits:
+                    qmax = (1 << (w_bits - 1)) - 1
+                    raw_scales = torch.zeros_like(max_abs)
+                    valid = max_abs > 1e-10
+                    raw_scales[valid] = max_abs[valid] / qmax
+                    raw_scales_by_w[w_bits] = raw_scales
+
+                for w_bits, s_bits, _ in g_configs:
+                    qmax = (1 << (w_bits - 1)) - 1
+                    raw_scales = raw_scales_by_w[w_bits]
+                    if s_bits >= 16:
+                        scales = raw_scales
+                    elif s_bits == 8:
+                        scales = quantize_scale_fp8_e4m3_torch(raw_scales)
+                    else:
+                        scales = quantize_scale_int4_symmetric_torch(raw_scales)
+
+                    scales_expanded = scales[:, None]
+                    scales_safe = torch.where(
+                        scales_expanded > 1e-10, scales_expanded, torch.ones_like(scales_expanded)
+                    )
+                    codes = torch.clamp(torch.round(groups / scales_safe), -qmax - 1, qmax)
+                    recon = codes * scales_expanded
+                    recon[scales < 1e-10] = 0
+                    diff = chunk[:valid_n] - recon.reshape(-1)[:valid_n]
+                    total_se[(w_bits, s_bits, g_size)] += float(torch.sum(diff * diff).item())
+
+                    del scales, scales_expanded, scales_safe, codes, recon, diff
+
+                del chunk, groups, max_abs, raw_scales_by_w
+
+    torch.cuda.empty_cache()
+    return {cfg: total_se[cfg] / max(original_n, 1) for cfg in configs}
+
+
+def quantize_and_measure_many_torch_streaming(
+    weights_tensor: torch.Tensor,
+    configs: List[Tuple[int, int, int]],
+    target_chunk_elems: Optional[int] = None,
+    whole_tensor_gpu_threshold_bytes: Optional[int] = None,
+) -> Dict[Tuple[int, int, int], float]:
+    """GPU-first evaluator that streams from a CPU tensor source.
+
+    Small tensors are moved to GPU once and evaluated there. Large tensors stay
+    on CPU in their source dtype and are chunk-copied to GPU, reusing each chunk
+    across all configs with the same group size.
+    """
+    flat_cpu = weights_tensor.reshape(-1).contiguous()
+    source_bytes = flat_cpu.numel() * flat_cpu.element_size()
+    free_bytes, total_bytes = torch.cuda.mem_get_info()
+
+    if whole_tensor_gpu_threshold_bytes is None:
+        # If a tensor is comfortably below ~20% of currently free memory,
+        # move it wholesale and use the simpler fast path.
+        whole_tensor_gpu_threshold_bytes = max(
+            512 * 1024 * 1024,
+            int(free_bytes * 0.20),
+        )
+
+    if target_chunk_elems is None:
+        # The streaming path was previously too conservative, leaving the GPU
+        # underutilized. Budget about 35% of free memory to the active chunk,
+        # assuming roughly 24 bytes/element of transient working set.
+        target_chunk_elems = int(max(
+            16_777_216,
+            min(268_435_456, (free_bytes * 0.35) // 24),
+        ))
+
+    if source_bytes <= whole_tensor_gpu_threshold_bytes:
+        flat_gpu = flat_cpu.to(device="cuda", dtype=torch.float32, non_blocking=False)
+        out = {}
+        for cfg in configs:
+            out[cfg] = quantize_and_measure_single_torch(flat_gpu, *cfg)
+        del flat_gpu
+        torch.cuda.empty_cache()
+        return out
+
+    original_n = flat_cpu.numel()
+    device = torch.device("cuda")
+    configs_by_g: Dict[int, List[Tuple[int, int, int]]] = {}
+    for cfg in configs:
+        configs_by_g.setdefault(cfg[2], []).append(cfg)
+
+    total_se = {cfg: 0.0 for cfg in configs}
+
+    with torch.no_grad():
+        for g_size, g_configs in configs_by_g.items():
+            chunk_groups = max(1, target_chunk_elems // g_size)
+            unique_w_bits = sorted({w for w, _, _ in g_configs})
+            total_groups = (original_n + g_size - 1) // g_size
+            for start_group in range(0, total_groups, chunk_groups):
+                start = start_group * g_size
+                end = min(original_n, (start_group + chunk_groups) * g_size)
+                chunk_cpu = flat_cpu[start:end]
+                valid_n = chunk_cpu.numel()
+                if valid_n % g_size != 0:
+                    pad = g_size - (valid_n % g_size)
+                    chunk_cpu = torch.nn.functional.pad(chunk_cpu, (0, pad))
+
+                if not chunk_cpu.is_pinned():
+                    chunk_cpu = chunk_cpu.pin_memory()
+                chunk = chunk_cpu.to(device=device, dtype=torch.float32, non_blocking=True)
+                groups = chunk.view(-1, g_size)
+                max_abs = groups.abs().amax(dim=1)
+
+                raw_scales_by_w = {}
+                valid = max_abs > 1e-10
+                for w_bits in unique_w_bits:
+                    qmax = (1 << (w_bits - 1)) - 1
+                    raw_scales = torch.zeros_like(max_abs)
+                    raw_scales[valid] = max_abs[valid] / qmax
+                    raw_scales_by_w[w_bits] = raw_scales
+
+                for w_bits, s_bits, _ in g_configs:
+                    qmax = (1 << (w_bits - 1)) - 1
+                    raw_scales = raw_scales_by_w[w_bits]
+                    if s_bits >= 16:
+                        scales = raw_scales
+                    elif s_bits == 8:
+                        scales = quantize_scale_fp8_e4m3_torch(raw_scales)
+                    else:
+                        scales = quantize_scale_int4_symmetric_torch(raw_scales)
+
+                    scales_expanded = scales[:, None]
+                    scales_safe = torch.where(
+                        scales_expanded > 1e-10, scales_expanded, torch.ones_like(scales_expanded)
+                    )
+                    codes = torch.clamp(torch.round(groups / scales_safe), -qmax - 1, qmax)
+                    recon = codes * scales_expanded
+                    recon[scales < 1e-10] = 0
+                    diff = chunk[:valid_n] - recon.reshape(-1)[:valid_n]
+                    total_se[(w_bits, s_bits, g_size)] += float(torch.sum(diff * diff).item())
+
+                    del scales, scales_expanded, scales_safe, codes, recon, diff
+
+                del chunk, groups, max_abs, raw_scales_by_w, chunk_cpu
+
+    torch.cuda.empty_cache()
+    return {cfg: total_se[cfg] / max(original_n, 1) for cfg in configs}
+
+
 def parse_int_list(spec: str) -> List[int]:
     """Parse comma-separated ints and closed ranges like 3-16."""
     values = set()
@@ -285,11 +655,52 @@ def parse_config(spec: str) -> Tuple[int, int, int]:
     return tuple(parts)  # type: ignore[return-value]
 
 
+CONFIG_RE = re.compile(r"^w(?P<w>\d+)_s(?P<s>\d+)_g(?P<g>\d+)$")
+
+
+def parse_recipe_config_str(spec: str) -> Tuple[int, int, int]:
+    m = CONFIG_RE.match(spec)
+    if not m:
+        raise ValueError(f"invalid config string: {spec}")
+    return int(m.group("w")), int(m.group("s")), int(m.group("g"))
+
+
 def build_configs(w_bits: List[int], s_bits: List[int], g_sizes: List[int]) -> List[Tuple[int, int, int]]:
     return [(w, s, g) for w in w_bits for s in s_bits for g in g_sizes]
 
 
-def compute_layer_stats(weights_flat: np.ndarray) -> Dict[str, float]:
+def config_is_allowed(w_bits: int, s_bits: int, g_size: int,
+                      enforce_nvfp4_fp4: bool) -> bool:
+    """Filter configs that violate deployment-side format constraints.
+
+    Blackwell NVFP4 is tied to 16-element micro-block scaling. When the search
+    includes 4-bit weights and we intend to materialize those as NVFP4, keep
+    FP4 on g=16 only. Other bit widths remain storage-side choices.
+    """
+    if enforce_nvfp4_fp4 and w_bits == 4 and g_size != 16:
+        return False
+    return True
+
+
+def compute_layer_stats(weights_flat) -> Dict[str, float]:
+    if isinstance(weights_flat, torch.Tensor):
+        w = weights_flat.detach().float().reshape(-1)
+        if w.numel() == 0:
+            return {"std": 0.0, "kurtosis": 0.0, "outlier_ratio": 0.0, "max_abs": 0.0}
+        mean = float(torch.mean(w).item())
+        centered = w - mean
+        var = float(torch.mean(centered ** 2).item())
+        std = float(np.sqrt(max(var, 1e-20)))
+        kurtosis = float((torch.mean(centered ** 4).item()) / max(var ** 2, 1e-20))
+        outlier_ratio = float(torch.mean((torch.abs(centered) > (3.0 * std)).float()).item())
+        max_abs = float(torch.max(torch.abs(w)).item())
+        return {
+            "std": std,
+            "kurtosis": kurtosis,
+            "outlier_ratio": outlier_ratio,
+            "max_abs": max_abs,
+        }
+
     w = np.asarray(weights_flat, dtype=np.float32).reshape(-1)
     if w.size == 0:
         return {"std": 0.0, "kurtosis": 0.0, "outlier_ratio": 0.0, "max_abs": 0.0}
@@ -308,13 +719,75 @@ def compute_layer_stats(weights_flat: np.ndarray) -> Dict[str, float]:
     }
 
 
+def config_signature(all_configs: List[Tuple[int, int, int]]) -> str:
+    return "|".join(f"{w}:{s}:{g}" for w, s, g in all_configs)
+
+
+def candidate_sensitivity_names(name: str) -> List[str]:
+    """Generate plausible aliases across checkpoint/module naming conventions."""
+    variants = [name]
+    prefixes = [
+        "model.language_model.",
+        "language_model.model.",
+        "language_model.",
+        "model.",
+    ]
+    changed = True
+    while changed:
+        changed = False
+        for cur in list(variants):
+            for prefix in prefixes:
+                if cur.startswith(prefix):
+                    alt = cur[len(prefix):]
+                    if alt not in variants:
+                        variants.append(alt)
+                        changed = True
+    for cur in list(variants):
+        if cur.endswith(".weight"):
+            alt = cur[:-7]
+            if alt not in variants:
+                variants.append(alt)
+        else:
+            alt = cur + ".weight"
+            if alt not in variants:
+                variants.append(alt)
+    return variants
+
+
+def load_layer_tensor_cpu(layer_ref: Dict) -> torch.Tensor:
+    """Load one tensor as a flattened CPU float32 torch tensor."""
+    with safe_open(layer_ref["st_file"], framework="pt", device="cpu") as f:
+        tensor = f.get_tensor(layer_ref["tensor_key"])
+    if layer_ref["expert_idx"] is not None:
+        tensor = tensor[layer_ref["expert_idx"]]
+    return tensor.flatten().float()
+
+
+def weight_sample_bytes(weights_flat, sample_n: int = 1024) -> np.ndarray:
+    """Small content sample for cache-key stability without huge transfers."""
+    if isinstance(weights_flat, torch.Tensor):
+        flat = weights_flat.detach().reshape(-1)
+        if flat.numel() == 0:
+            return np.empty((0,), dtype=np.float32)
+        if flat.numel() > sample_n:
+            idx = torch.linspace(0, flat.numel() - 1, sample_n, dtype=torch.long)
+            flat = flat[idx]
+        return flat.cpu().numpy().astype(np.float32, copy=False)
+    flat = np.asarray(weights_flat, dtype=np.float32).reshape(-1)
+    if flat.size > sample_n:
+        idx = np.linspace(0, flat.size - 1, sample_n, dtype=np.int64)
+        flat = flat[idx]
+    return flat
+
+
 def evaluate_layer_worker(args):
     """Worker function for ProcessPoolExecutor - evaluates one layer.
 
     Uses shape-based caching: layers with identical shapes share Pareto frontiers.
     Sensitivity is from HAWQ if provided, else falls back to RMS proxy.
     """
-    name, weights_flat, shape, n_elements, use_cache, hawq_sensitivity, all_configs = args
+    name, weights_flat, shape, n_elements, use_cache, hawq_sensitivity, all_configs, eval_backend = args
+    cfg_sig = config_signature(all_configs)
 
     # Use HAWQ sensitivity if provided, else fall back to RMS proxy
     if hawq_sensitivity is not None:
@@ -323,19 +796,43 @@ def evaluate_layer_worker(args):
         # Fallback: RMS of weights (weak proxy, warns user)
         sensitivity = float(np.sqrt(np.mean(weights_flat ** 2)))
 
+    sample = weight_sample_bytes(weights_flat)
+
     # Try to load cached frontier
     if use_cache:
-        cached = load_cached_frontier(shape, weights_flat)
+        cached = load_cached_frontier(shape, sample, cfg_sig)
         if cached is not None:
             return (name, shape, n_elements, sensitivity, compute_layer_stats(weights_flat), cached, True)
 
     # Evaluate all configs
     results = []
+    weights_torch = None
+    if eval_backend == "gpu":
+        if not torch.cuda.is_available():
+            raise RuntimeError("eval_backend=gpu requested but CUDA is not available")
+        min_g = min(g for _, _, g in all_configs)
+        n_groups_est = (len(weights_flat) + min_g - 1) // min_g
+        # Avoid staging giant MoE tensors fully on device. The chunked GPU path
+        # will stream them from CPU.
+        if n_groups_est <= 4_000_000:
+            weights_torch = torch.from_numpy(weights_flat).to(device="cuda", dtype=torch.float32)
+    batched_mses = None
+    if eval_backend == "gpu" and weights_torch is None:
+        batched_mses = quantize_and_measure_many_torch_chunked(torch.from_numpy(weights_flat), all_configs)
     for w_bits, s_bits, g_size in all_configs:
-        mse = quantize_and_measure_single(weights_flat, w_bits, s_bits, g_size)
+        if eval_backend == "gpu":
+            if batched_mses is not None:
+                mse = batched_mses[(w_bits, s_bits, g_size)]
+            else:
+                mse = quantize_and_measure_single_torch(weights_torch, w_bits, s_bits, g_size)
+        else:
+            mse = quantize_and_measure_single(weights_flat, w_bits, s_bits, g_size)
         memory = compute_memory(n_elements, w_bits, s_bits, g_size)
         bpw = compute_bits_per_weight(w_bits, s_bits, g_size)
         results.append((w_bits, s_bits, g_size, mse, memory, bpw))
+    if weights_torch is not None:
+        del weights_torch
+        torch.cuda.empty_cache()
 
     # Build Pareto frontier
     pareto_indices = []
@@ -361,9 +858,70 @@ def evaluate_layer_worker(args):
 
     # Cache the frontier
     if use_cache:
-        save_cached_frontier(shape, pareto, weights_flat)
+        save_cached_frontier(shape, pareto, sample, cfg_sig)
 
     return (name, shape, n_elements, sensitivity, compute_layer_stats(weights_flat), pareto, False)
+
+
+def evaluate_layer_local(layer_ref: Dict, use_cache_flag: bool, layer_sens: Optional[float],
+                         all_configs: List[Tuple[int, int, int]], eval_backend: str):
+    """Single-process evaluator used by the streaming GPU path."""
+    if eval_backend != "gpu":
+        weights = load_layer_array(layer_ref)
+        return evaluate_layer_worker((
+            layer_ref["name"],
+            weights,
+            layer_ref["shape"],
+            layer_ref["n_elements"],
+            use_cache_flag,
+            layer_sens,
+            all_configs,
+            eval_backend,
+        ))
+
+    name = layer_ref["name"]
+    shape = layer_ref["shape"]
+    n_elements = layer_ref["n_elements"]
+    cfg_sig = config_signature(all_configs)
+    tensor = load_layer_tensor(layer_ref)
+    sample = sample_tensor_values(tensor)
+
+    if layer_sens is not None:
+        sensitivity = layer_sens
+    else:
+        sensitivity = float(np.sqrt(np.mean(sample ** 2))) if sample.size else 0.0
+
+    if use_cache_flag:
+        cached = load_cached_frontier(shape, sample, cfg_sig)
+        if cached is not None:
+            return (name, shape, n_elements, sensitivity, compute_layer_stats_sampled(sample), cached, True)
+
+    mses = quantize_and_measure_many_torch_streaming(tensor, all_configs)
+    results = []
+    for w_bits, s_bits, g_size in all_configs:
+        memory = compute_memory(n_elements, w_bits, s_bits, g_size)
+        bpw = compute_bits_per_weight(w_bits, s_bits, g_size)
+        results.append((w_bits, s_bits, g_size, mses[(w_bits, s_bits, g_size)], memory, bpw))
+
+    pareto_indices = []
+    for i, (_w1, _s1, _g1, mse1, mem1, _bpw1) in enumerate(results):
+        dominated = False
+        for j, (_w2, _s2, _g2, mse2, mem2, _bpw2) in enumerate(results):
+            if i == j:
+                continue
+            if (mse2 < mse1 and mem2 < mem1) or (mse2 <= mse1 and mem2 < mem1) or (mse2 < mse1 and mem2 <= mem1):
+                dominated = True
+                break
+        if not dominated:
+            pareto_indices.append(i)
+
+    pareto = [results[i] for i in pareto_indices]
+    pareto.sort(key=lambda x: x[4])
+
+    if use_cache_flag:
+        save_cached_frontier(shape, pareto, sample, cfg_sig)
+
+    return (name, shape, n_elements, sensitivity, compute_layer_stats_sampled(sample), pareto, False)
 
 
 def water_fill_pareto(layers: List[LayerInfo]) -> List[Dict]:
@@ -560,6 +1118,123 @@ def build_promotion_curve(layers: List[LayerInfo], baseline_config: Tuple[int, i
     return curve
 
 
+def expert_family_key(name: str) -> Optional[str]:
+    if ".mlp.experts.gate_up_proj" in name or ".mlp.experts.w13_" in name:
+        return "moe_gate_up"
+    if ".mlp.experts.down_proj" in name or ".mlp.experts.w2_" in name:
+        return "moe_down"
+    return None
+
+
+def recipe_cost_error(recipe: Dict[str, str], lookup: Dict[str, LayerInfo]) -> Tuple[int, float, float]:
+    total_elems = sum(layer.n_elements for layer in lookup.values())
+    total_cost = 0
+    total_error = 0.0
+    for name, cfg_str in recipe.items():
+        layer = lookup[name]
+        chosen = None
+        for cfg in layer.pareto_configs:
+            if str(cfg.config) == cfg_str:
+                chosen = cfg
+                break
+        if chosen is None:
+            raise KeyError(f"config {cfg_str} not found for layer {name}")
+        total_cost += chosen.memory_bytes
+        total_error += layer.sensitivity * chosen.mse
+    avg_bpw = total_cost * 8 / total_elems
+    return total_cost, total_error, avg_bpw
+
+
+def apply_expert_consensus_to_recipe(
+    recipe: Dict[str, str],
+    lookup: Dict[str, LayerInfo],
+) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """Force a shared config per MoE expert family near the current recipe size.
+
+    Consensus is chosen per family (gate_up/down) by matching the current
+    average memory target as closely as possible, then preferring lower total
+    weighted error among ties.
+    """
+    families: Dict[str, List[str]] = {}
+    for name in recipe:
+        fam = expert_family_key(name)
+        if fam:
+            families.setdefault(fam, []).append(name)
+
+    if not families:
+        return dict(recipe), {}
+
+    adjusted = dict(recipe)
+    chosen_configs: Dict[str, str] = {}
+
+    for fam, names in families.items():
+        if len(names) <= 1:
+            continue
+
+        target_avg_memory = 0.0
+        per_layer_cfg_maps = []
+        config_intersection = None
+
+        for name in names:
+            layer = lookup[name]
+            cfg_map = {str(cfg.config): cfg for cfg in layer.pareto_configs}
+            per_layer_cfg_maps.append((name, layer, cfg_map))
+            config_keys = set(cfg_map.keys())
+            config_intersection = config_keys if config_intersection is None else (config_intersection & config_keys)
+            current_cfg = cfg_map[recipe[name]]
+            target_avg_memory += current_cfg.memory_bytes
+
+        if not config_intersection:
+            continue
+
+        target_avg_memory /= len(names)
+        best = None
+        for cfg_str in sorted(config_intersection):
+            avg_memory = 0.0
+            total_weighted_error = 0.0
+            for _name, layer, cfg_map in per_layer_cfg_maps:
+                cfg = cfg_map[cfg_str]
+                avg_memory += cfg.memory_bytes
+                total_weighted_error += layer.sensitivity * cfg.mse
+            avg_memory /= len(names)
+            key = (
+                abs(avg_memory - target_avg_memory),
+                total_weighted_error,
+                avg_memory,
+                parse_recipe_config_str(cfg_str),
+            )
+            if best is None or key < best[0]:
+                best = (key, cfg_str)
+
+        if best is None:
+            continue
+
+        cfg_str = best[1]
+        chosen_configs[fam] = cfg_str
+        for name in names:
+            adjusted[name] = cfg_str
+
+    return adjusted, chosen_configs
+
+
+def apply_expert_consensus_to_curve(curve: List[Dict], lookup: Dict[str, LayerInfo]) -> Tuple[List[Dict], Dict[str, str]]:
+    adjusted_curve = []
+    last_consensus: Dict[str, str] = {}
+    for point in curve:
+        recipe, consensus = apply_expert_consensus_to_recipe(point["recipe"], lookup)
+        cost_bytes, weighted_error, avg_bpw = recipe_cost_error(recipe, lookup)
+        new_point = dict(point)
+        new_point["recipe"] = recipe
+        new_point["cost_bytes"] = cost_bytes
+        new_point["weighted_error"] = weighted_error
+        new_point["avg_bpw"] = avg_bpw
+        if consensus:
+            new_point["expert_consensus"] = consensus
+            last_consensus = consensus
+        adjusted_curve.append(new_point)
+    return adjusted_curve, last_consensus
+
+
 def extract_outliers(
     layers: List[LayerInfo],
     baseline_config: Tuple[int, int, int],
@@ -643,42 +1318,97 @@ def extract_outliers(
     return rows
 
 
-def load_model_layers(model_path: Path, max_layers: int = None) -> List[Tuple[str, np.ndarray, Tuple, int]]:
-    """Load weight tensors as numpy arrays for multiprocessing.
+def find_curve_knee(curve: List[Dict], x_key: str = "cost_bytes",
+                    y_key: str = "weighted_error") -> int:
+    """Kneedle-style knee index for a monotone frontier."""
+    if len(curve) < 3:
+        return max(0, len(curve) - 1)
+    xs = [pt[x_key] for pt in curve]
+    ys = [pt[y_key] for pt in curve]
+    x0, x1 = min(xs), max(xs)
+    y0, y1 = min(ys), max(ys)
+    xr = (x1 - x0) or 1.0
+    yr = (y1 - y0) or 1.0
+    norm = [((x - x0) / xr, (y - y0) / yr) for x, y in zip(xs, ys)]
+    a = norm[0]
+    b = norm[-1]
+    denom = ((b[1] - a[1]) ** 2 + (b[0] - a[0]) ** 2) ** 0.5 or 1.0
+    best_i = 0
+    best_d = -1.0
+    for i, (x, y) in enumerate(norm):
+        d = abs((b[1] - a[1]) * x - (b[0] - a[0]) * y + b[0] * a[1] - b[1] * a[0]) / denom
+        if d > best_d:
+            best_i = i
+            best_d = d
+    return best_i
 
-    Returns layers sorted by size (largest first) for better load balancing.
-    """
+
+def discover_model_layers(model_path: Path, max_layers: int = None,
+                         modality_policy: str = "text-only") -> List[Dict]:
+    """Discover quantizable weight tensors without loading them all into RAM."""
+    if modality_policy != "text-only":
+        raise NotImplementedError(
+            f"Unsupported modality_policy={modality_policy!r}. "
+            "Only text-only is supported right now."
+        )
     layers = []
     st_files = sorted(model_path.glob("*.safetensors"))
 
     for st_file in st_files:
         with safe_open(str(st_file), framework="pt", device="cpu") as f:
             for key in f.keys():
-                if ".weight" not in key:
-                    continue
                 if "layernorm" in key.lower() or "norm" in key.lower():
                     continue
+                if not (
+                    key.startswith("model.language_model.")
+                    or key.startswith("language_model.")
+                    or key.startswith("model.layers.")
+                    or key.startswith("layers.")
+                    or key.startswith("model.embed_tokens.")
+                    or key.startswith("embed_tokens.")
+                    or key.startswith("lm_head.")
+                    or key.startswith("model.lm_head.")
+                    or key.startswith("language_model.lm_head.")
+                ):
+                    continue
 
-                tensor = f.get_tensor(key)
+                try:
+                    shape = tuple(f.get_slice(key).get_shape())
+                except Exception:
+                    shape = tuple(f.get_tensor(key).shape)
 
-                # For MoE experts, extract individual experts
-                if "experts" in key and len(tensor.shape) == 3:
-                    for exp_idx in [0, tensor.shape[0] // 2, tensor.shape[0] - 1]:
-                        if exp_idx < tensor.shape[0]:
-                            t = tensor[exp_idx]
-                            layers.append((
-                                f"{key}.expert{exp_idx}",
-                                t.flatten().float().numpy(),
-                                tuple(t.shape),
-                                t.numel()
-                            ))
+                if len(shape) not in (2, 3):
+                    continue
+                if len(shape) == 1:
+                    continue
+
+                n_elements = 1
+                for dim in shape:
+                    n_elements *= dim
+
+                # MoE expert tensors participate as full fused tensors. This is
+                # slower than proxy sampling, but it keeps the recipe faithful to
+                # the actual storage object that will be exported.
+                if "experts" in key and len(shape) == 3:
+                    layers.append({
+                        "name": key,
+                        "shape": shape,
+                        "n_elements": n_elements,
+                        "st_file": str(st_file),
+                        "tensor_key": key,
+                        "expert_idx": None,
+                        "sample_expert_indices": None,
+                    })
                 else:
-                    layers.append((
-                        key,
-                        tensor.flatten().float().numpy(),
-                        tuple(tensor.shape),
-                        tensor.numel()
-                    ))
+                    layers.append({
+                        "name": key,
+                        "shape": shape,
+                        "n_elements": n_elements,
+                        "st_file": str(st_file),
+                        "tensor_key": key,
+                        "expert_idx": None,
+                        "sample_expert_indices": None,
+                    })
 
                 if max_layers and len(layers) >= max_layers:
                     break
@@ -686,8 +1416,52 @@ def load_model_layers(model_path: Path, max_layers: int = None) -> List[Tuple[st
             break
 
     # Sort by size descending for better load balancing (big layers first)
-    layers.sort(key=lambda x: -x[3])
+    layers.sort(key=lambda x: -x["n_elements"])
     return layers
+
+
+def load_layer_array(layer_ref: Dict) -> np.ndarray:
+    """Load one tensor (or expert slice) as a flattened float32 numpy array."""
+    with safe_open(layer_ref["st_file"], framework="pt", device="cpu") as f:
+        tensor = f.get_tensor(layer_ref["tensor_key"])
+    if layer_ref["expert_idx"] is not None:
+        tensor = tensor[layer_ref["expert_idx"]]
+    return tensor.flatten().float().numpy()
+
+
+def load_layer_tensor(layer_ref: Dict) -> torch.Tensor:
+    """Load one tensor as a CPU torch tensor without full float32 expansion."""
+    with safe_open(layer_ref["st_file"], framework="pt", device="cpu") as f:
+        tensor = f.get_tensor(layer_ref["tensor_key"])
+    if layer_ref["expert_idx"] is not None:
+        tensor = tensor[layer_ref["expert_idx"]]
+    return tensor.contiguous()
+
+
+def sample_tensor_values(tensor: torch.Tensor, sample_n: int = 4096) -> np.ndarray:
+    """Cheap content sample for cache keys and approximate stats."""
+    flat = tensor.reshape(-1)
+    if flat.numel() == 0:
+        return np.empty(0, dtype=np.float32)
+    if flat.numel() <= sample_n:
+        return flat.float().cpu().numpy()
+    idx = torch.linspace(0, flat.numel() - 1, sample_n, dtype=torch.int64)
+    return flat.index_select(0, idx).float().cpu().numpy()
+
+
+def compute_layer_stats_sampled(sample: np.ndarray) -> Dict[str, float]:
+    """Approximate stats from a representative sample."""
+    return compute_layer_stats(sample)
+
+
+def maybe_write_progress(output_path: Optional[str], payload: Dict):
+    """Best-effort checkpoint write for long incremental runs."""
+    if not output_path:
+        return
+    tmp_path = f"{output_path}.tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp_path, output_path)
 
 
 def main():
@@ -714,6 +1488,22 @@ def main():
                         help="Reference config for promotion-ladder and outlier analysis")
     parser.add_argument("--rescue-min-w-bits", type=int, default=8,
                         help="Minimum weight bits considered an outlier rescue config")
+    parser.add_argument("--no-expert-consensus", action="store_true",
+                        help="Disable shared-config consensus for MoE expert families in output recipes")
+    parser.add_argument("--modality-policy", type=str, default="text-only",
+                        help="Tensor selection policy. Only text-only is supported right now.")
+    parser.add_argument("--enforce-nvfp4-fp4", action="store_true", default=True,
+                        help="Require 4-bit configs to use g=16 so FP4 remains NVFP4-aligned")
+    parser.add_argument("--allow-non-nvfp4-fp4", action="store_true",
+                        help="Disable the NVFP4 g=16 constraint for 4-bit configs")
+    parser.add_argument("--workers", type=int, default=None,
+                        help="Process workers for frontier evaluation. Default is memory-safe, not max CPU.")
+    parser.add_argument("--max-pending-jobs", type=int, default=None,
+                        help="Maximum queued layer jobs kept in memory at once. Default = 2x workers.")
+    parser.add_argument("--checkpoint-every", type=int, default=10,
+                        help="Write a progress checkpoint to --output every N completed layers.")
+    parser.add_argument("--eval-backend", choices=["cpu", "gpu"], default="cpu",
+                        help="Local frontier evaluation backend. cpu is default; gpu is a fast path for smoke tests.")
     args = parser.parse_args()
 
     # Handle cache
@@ -728,17 +1518,27 @@ def main():
     print("=" * 70)
     print("Joint 3D Water-Fill Optimizer")
     print(f"Model: {model_path}")
-    print(f"Workers: {N_WORKERS}")
     w_bits = parse_int_list(args.w_bits)
     s_bits = parse_int_list(args.s_bits)
     g_sizes = parse_int_list(args.g_sizes)
     baseline_config = parse_config(args.baseline_config)
-    all_configs = build_configs(w_bits, s_bits, g_sizes)
+    enforce_nvfp4_fp4 = args.enforce_nvfp4_fp4 and not args.allow_non_nvfp4_fp4
+    all_configs = [
+        cfg for cfg in build_configs(w_bits, s_bits, g_sizes)
+        if config_is_allowed(*cfg, enforce_nvfp4_fp4=enforce_nvfp4_fp4)
+    ]
+    worker_count = args.workers or min(N_WORKERS, 8)
+    max_pending_jobs = args.max_pending_jobs or max(1, worker_count * 2)
+    print(f"Workers: {worker_count}")
+    print(f"Max pending jobs: {max_pending_jobs}")
     print(f"Configs per layer: {len(all_configs)}")
     print(f"w_bits={w_bits}")
     print(f"s_bits={s_bits}")
     print(f"g_sizes={g_sizes}")
     print(f"baseline={baseline_config}")
+    print(f"enforce_nvfp4_fp4={enforce_nvfp4_fp4}")
+    print(f"modality_policy={args.modality_policy}")
+    print(f"eval_backend={args.eval_backend}")
     print("=" * 70)
     print(flush=True)
 
@@ -755,22 +1555,31 @@ def main():
     # Load layers
     print("\nLoading model weights...")
     t_load = time.time()
-    raw_layers = load_model_layers(model_path, args.max_layers)
-    print(f"Loaded {len(raw_layers)} weight tensors in {time.time() - t_load:.1f}s")
+    raw_layers = discover_model_layers(model_path, args.max_layers, args.modality_policy)
+    print(f"Discovered {len(raw_layers)} weight tensors in {time.time() - t_load:.1f}s")
 
     # Filter out large layers if requested (for fast iteration)
     if args.skip_large:
         threshold = args.skip_large * 1_000_000
         before = len(raw_layers)
-        raw_layers = [(n, w, s, e) for n, w, s, e in raw_layers if e < threshold]
+        raw_layers = [layer for layer in raw_layers if layer["n_elements"] < threshold]
         print(f"Skipped {before - len(raw_layers)} layers > {args.skip_large}M elements")
 
-    total_elements = sum(n for _, _, _, n in raw_layers)
+    total_elements = sum(layer["n_elements"] for layer in raw_layers)
     print(f"Total elements: {total_elements:,}")
     print(flush=True)
 
-    # Build Pareto frontiers in parallel
-    print(f"\nBuilding Pareto frontiers ({N_WORKERS} processes)...")
+    if not raw_layers or total_elements == 0:
+        raise RuntimeError(
+            f"No weight tensors were discovered under {model_path}. "
+            "Check the model path and safetensors contents."
+        )
+
+    # Build Pareto frontiers
+    if args.eval_backend == "gpu":
+        print(f"\nBuilding Pareto frontiers (single-process streaming GPU)...")
+    else:
+        print(f"\nBuilding Pareto frontiers ({worker_count} processes)...")
     t_pareto = time.time()
 
     layers = []
@@ -779,51 +1588,105 @@ def main():
 
     # Add use_cache flag and HAWQ sensitivity to each layer
     use_cache = not args.no_cache
-    raw_layers_with_cache = []
-    for name, weights, shape, n in raw_layers:
+    layer_jobs = []
+    for layer in raw_layers:
+        name = layer["name"]
         # Look up HAWQ sensitivity for this layer
         layer_sens = None
         if hawq_sens:
-            # Try exact match first, then with/without .weight suffix
-            layer_sens = hawq_sens.get(name)
-            if layer_sens is None and name.endswith(".weight"):
-                layer_sens = hawq_sens.get(name[:-7])  # strip .weight
-            if layer_sens is None and not name.endswith(".weight"):
-                layer_sens = hawq_sens.get(name + ".weight")
-        raw_layers_with_cache.append((name, weights, shape, n, use_cache, layer_sens, all_configs))
+            for candidate in candidate_sensitivity_names(name):
+                layer_sens = hawq_sens.get(candidate)
+                if layer_sens is not None:
+                    break
+        layer_jobs.append((layer, use_cache, layer_sens))
 
-    with ProcessPoolExecutor(max_workers=N_WORKERS) as executor:
-        futures = {executor.submit(evaluate_layer_worker, layer_data): layer_data[0]
-                   for layer_data in raw_layers_with_cache}
+    def record_result(result):
+        nonlocal completed, cache_hits
+        name, shape, n_elements, sensitivity, stats, pareto_tuples, was_cached = result
+        if was_cached:
+            cache_hits += 1
 
-        for future in as_completed(futures):
-            name, shape, n_elements, sensitivity, stats, pareto_tuples, was_cached = future.result()
-            if was_cached:
-                cache_hits += 1
+        pareto_configs = [
+            ConfigResult(
+                config=Config(w, s, g),
+                mse=mse,
+                memory_bytes=mem,
+                bits_per_weight=bpw
+            )
+            for w, s, g, mse, mem, bpw in pareto_tuples
+        ]
 
-            # Convert tuples back to ConfigResult
-            pareto_configs = [
-                ConfigResult(
-                    config=Config(w, s, g),
-                    mse=mse,
-                    memory_bytes=mem,
-                    bits_per_weight=bpw
+        layers.append(LayerInfo(
+            name=name,
+            shape=shape,
+            n_elements=n_elements,
+            sensitivity=sensitivity,
+            pareto_configs=pareto_configs,
+            stats=stats,
+        ))
+
+        completed += 1
+        if completed % 10 == 0 or completed == len(raw_layers):
+            print(f"  {completed}/{len(raw_layers)} layers processed", flush=True)
+        if args.output and (completed % args.checkpoint_every == 0 or completed == len(raw_layers)):
+            maybe_write_progress(args.output, {
+                "model": str(model_path),
+                "phase": "frontier_build",
+                "completed_layers": completed,
+                "total_layers": len(raw_layers),
+                "cache_hits": cache_hits,
+                "search_space": {
+                    "w_bits": w_bits,
+                    "s_bits": s_bits,
+                    "g_sizes": g_sizes,
+                },
+                "baseline_config": baseline_config,
+            })
+
+    if args.eval_backend == "gpu":
+        # One process owns the GPU. This avoids Python multiprocessing and lets
+        # us stream tensors/configs directly through one device-resident path.
+        for layer_ref, use_cache_flag, layer_sens in layer_jobs:
+            result = evaluate_layer_local(layer_ref, use_cache_flag, layer_sens, all_configs, args.eval_backend)
+            record_result(result)
+    else:
+        with ProcessPoolExecutor(max_workers=worker_count) as executor:
+            futures = {}
+            job_idx = 0
+
+            def submit_one():
+                nonlocal job_idx
+                if job_idx >= len(layer_jobs):
+                    return False
+                layer_ref, use_cache_flag, layer_sens = layer_jobs[job_idx]
+                weights = load_layer_array(layer_ref)
+                payload = (
+                    layer_ref["name"],
+                    weights,
+                    layer_ref["shape"],
+                    layer_ref["n_elements"],
+                    use_cache_flag,
+                    layer_sens,
+                    all_configs,
+                    args.eval_backend,
                 )
-                for w, s, g, mse, mem, bpw in pareto_tuples
-            ]
+                fut = executor.submit(evaluate_layer_worker, payload)
+                futures[fut] = layer_ref["name"]
+                job_idx += 1
+                return True
 
-            layers.append(LayerInfo(
-                name=name,
-                shape=shape,
-                n_elements=n_elements,
-                sensitivity=sensitivity,
-                pareto_configs=pareto_configs,
-                stats=stats,
-            ))
+            while len(futures) < max_pending_jobs and submit_one():
+                pass
 
-            completed += 1
-            if completed % 10 == 0 or completed == len(raw_layers):
-                print(f"  {completed}/{len(raw_layers)} layers processed", flush=True)
+            while futures:
+                done, _ = wait(set(futures.keys()), return_when=FIRST_COMPLETED)
+                for future in done:
+                    result = future.result()
+                    futures.pop(future, None)
+                    record_result(result)
+
+                    while len(futures) < max_pending_jobs and submit_one():
+                        pass
 
     print(f"Pareto frontiers built in {time.time() - t_pareto:.1f}s (cache hits: {cache_hits}/{len(raw_layers)})")
     print(flush=True)
@@ -839,8 +1702,26 @@ def main():
     print("\nBuilding promotion ladder above baseline...")
     t_promote = time.time()
     promotion_curve = build_promotion_curve(layers, baseline_config)
+    lookup = {layer.name: layer for layer in layers}
+    pareto_consensus = {}
+    promotion_consensus = {}
+    if not args.no_expert_consensus:
+        pareto_curve, pareto_consensus = apply_expert_consensus_to_curve(pareto_curve, lookup)
+        promotion_curve, promotion_consensus = apply_expert_consensus_to_curve(promotion_curve, lookup)
+        if promotion_consensus:
+            print("Applied expert consensus targets:")
+            for fam, cfg_str in sorted(promotion_consensus.items()):
+                print(f"  {fam}: {cfg_str}")
+    promotion_knee_idx = find_curve_knee(promotion_curve)
+    promotion_knee = promotion_curve[promotion_knee_idx]
     print(f"Promotion ladder time: {time.time() - t_promote:.2f}s")
     print(f"Promotion ladder has {len(promotion_curve)} points")
+    print(
+        f"Promotion kneedle: step {promotion_knee['step']}  "
+        f"bpw={promotion_knee['avg_bpw']:.3f}  "
+        f"memory={promotion_knee['cost_bytes']:,}  "
+        f"error={promotion_knee['weighted_error']:.3e}"
+    )
 
     print("\nExtracting outlier layers...")
     outliers = extract_outliers(
@@ -920,7 +1801,13 @@ def main():
             "baseline_config": baseline_config,
             "pareto_curve": pareto_curve,
             "promotion_curve": promotion_curve,
+            "promotion_knee": promotion_knee,
             "outliers": outliers,
+            "expert_consensus": {
+                "enabled": not args.no_expert_consensus,
+                "pareto": pareto_consensus,
+                "promotion": promotion_consensus,
+            },
             # Also save summary stats
             "min_bpw": pareto_curve[0]['avg_bpw'],
             "max_bpw": pareto_curve[-1]['avg_bpw'],
