@@ -422,6 +422,11 @@ def load_calibration(tokenizer, source: str, n_samples: int,
             if len(texts) >= n_samples * 8:
                 break
 
+    # Two-pass sampling:
+    #   1) first pass picks any sample already >= seqlen tokens
+    #   2) fallback packs multiple short samples together (separated by
+    #      EOS) to reach seqlen. This makes SFT/chat datasets with short
+    #      turns (tulu-3, glaive) usable without lowering seqlen.
     random.seed(42)
     samples = []
     for t in texts:
@@ -432,11 +437,26 @@ def load_calibration(tokenizer, source: str, n_samples: int,
         samples.append(ids[0, start:start + seqlen])
         if len(samples) >= n_samples:
             break
+
+    if len(samples) < n_samples:
+        eos = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+        # Pack short samples by concatenating with EOS separator
+        buf: list[int] = []
+        for t in texts:
+            ids = tokenizer(t, return_tensors="pt", truncation=False).input_ids[0].tolist()
+            buf.extend(ids)
+            buf.append(eos)
+            while len(buf) >= seqlen and len(samples) < n_samples:
+                samples.append(torch.tensor(buf[:seqlen], dtype=torch.long))
+                buf = buf[seqlen:]
+            if len(samples) >= n_samples:
+                break
+
     if len(samples) < n_samples:
         print(f"[probe] warning: only got {len(samples)}/{n_samples} samples "
-              f">= {seqlen} tokens. Consider shorter seqlen or wider corpus.",
+              f"(even with packing). Consider wider corpus.",
               flush=True)
-    return torch.stack(samples, dim=0)
+    return torch.stack(samples[:n_samples], dim=0)
 
 
 def per_token_ce(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -556,6 +576,30 @@ def main():
     routers = sorted({r for r, _ in expert_info.values()})
     print(f"[probe] MoE: {len(expert_info)} expert linears, "
           f"{len(routers)} routers, top_k={top_k}", flush=True)
+    if len(expert_info) == 0:
+        # Diagnostic: log what the walker saw, to help figure out why
+        # discovery failed. Prints the first couple of modules that LOOK
+        # like they should qualify (have an `experts` attribute) and why
+        # they were rejected.
+        diag_count = 0
+        for pname, pmod in model.named_modules():
+            for attr in ("experts", "block_sparse_moe_experts",
+                         "moe_experts", "expert_layer"):
+                child = getattr(pmod, attr, None)
+                if child is None or not isinstance(child, nn.Module):
+                    continue
+                kids = list(child.named_children())
+                numkids = [k for k, _ in kids if k.isdigit()]
+                print(f"[probe/diag] parent={pname!r} attr={attr!r} "
+                      f"container_cls={type(child).__name__} "
+                      f"n_children={len(kids)} n_numeric_children={len(numkids)}"
+                      f" first_children={[k for k,_ in kids[:5]]}",
+                      flush=True)
+                diag_count += 1
+                if diag_count >= 3:
+                    break
+            if diag_count >= 3:
+                break
 
     tracker = RouterTracker(model, routers, top_k) if routers else None
     cache_dir = Path(args.activation_cache_dir) if args.activation_cache_dir else None
