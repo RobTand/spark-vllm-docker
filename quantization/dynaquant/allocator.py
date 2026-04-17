@@ -348,10 +348,11 @@ def main():
                "the allocator will pick among them based on per-layer RTN "
                "noise, which is usually not what you want:\n"
                + "\n".join(f"  {k} bits: {v}" for k, v in collisions.items())
-               + "\nRecommended bundles:\n"
-               "  NVIDIA Blackwell: NVFP4,MXFP6_E3M2,MXFP8\n"
-               "  OCP MX only     : MXFP4,MXFP6_E3M2,MXFP8\n"
-               "  Hardware-agnostic: NVFP4,MXFP8")
+               + "\nRecommended bundles (vLLM serving, today):\n"
+               "  Ship-ready     : NVFP4,MXFP8       (validated)\n"
+               "  MX-pure        : MXFP4,MXFP8\n"
+               "  Experimental   : NVFP4,MXFP6_E3M2,MXFP8   "
+               "(MXFP6 hardware-supported on Blackwell, vLLM kernels not yet landed)")
         if args.enforce_family_coherence:
             raise SystemExit(f"[alloc] ERROR: {msg}")
         else:

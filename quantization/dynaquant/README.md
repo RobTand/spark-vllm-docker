@@ -128,12 +128,36 @@ noise and you end up with a serving mess (two kernel paths for 4-bit
 quant). The allocator warns on this by default and errors with
 `--enforce-family-coherence`.
 
-| Target hardware       | Recommended `--formats`         |
-|-----------------------|----------------------------------|
-| NVIDIA Blackwell      | `NVFP4,MXFP6_E3M2,MXFP8`         |
-| OCP MX–native stack   | `MXFP4,MXFP6_E3M2,MXFP8`         |
-| Hardware-agnostic     | `NVFP4,MXFP8` (binary ladder)    |
-| Legacy INT pipelines  | `INT4_W4A16_g128,INT8_W8A16`     |
+#### Hardware + serving-stack support
+
+Everything in this section assumes you're serving with vLLM. The
+microscaling formats (NVFP4, MX*) all require NVIDIA Blackwell-era
+hardware (SM100+) for native kernel support; on older Ampere/Ada you
+get Marlin emulation, which works but at a significant speed penalty.
+
+|                 | Hardware (Blackwell ISA) | vLLM serving kernels today |
+|-----------------|-------------------------:|---------------------------:|
+| NVFP4           | ✓                        | ✓ (FlashInfer CUTLASS)     |
+| MXFP4           | ✓                        | ✓ (FlashInfer CUTLASS)     |
+| MXFP6_E3M2      | ✓                        | ✗ (hardware supports it,   |
+|                 |                          |    vLLM kernel not yet     |
+|                 |                          |    integrated)             |
+| MXFP6_E2M3      | ✓                        | ✗ (same)                   |
+| MXFP8           | ✓                        | ✓ (FlashInfer CUTLASS)     |
+| INT4 / INT8     | (all NV HW)              | ✓ (Marlin)                 |
+
+Until vLLM picks up MXFP6 serving kernels, including `MXFP6_*` in a
+bundle means the allocator can pick it, the checkpoint will contain
+it, but vLLM won't know how to load it at serve time. Safe to
+experiment with on the quantization side; do not ship until the
+kernels land.
+
+| Use case                          | Recommended `--formats`           |
+|-----------------------------------|-----------------------------------|
+| Today, ship on Blackwell via vLLM | `NVFP4,MXFP8` (validated path)    |
+| Today, MX-pure on Blackwell       | `MXFP4,MXFP8`                     |
+| Experimental, Blackwell w/ MXFP6  | `NVFP4,MXFP6_E3M2,MXFP8`          |
+| Legacy INT pipelines              | `INT4_W4A16_g128,INT8_W8A16`      |
 
 ## Method notes
 
