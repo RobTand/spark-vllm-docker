@@ -98,9 +98,18 @@ def discover_moe_structure(model: nn.Module) -> dict[str, tuple[str, str]]:
         for attr in ("experts", "block_sparse_moe_experts",
                      "moe_experts", "expert_layer"):
             experts_list = getattr(parent, attr, None)
-            if experts_list is not None and isinstance(
-                    experts_list, (nn.ModuleList, nn.Sequential)):
-                candidates.append((attr, experts_list))
+            if experts_list is None:
+                continue
+            # Accept any container that has __len__ and __getitem__ where
+            # children look like nn.Module (covers nn.ModuleList,
+            # nn.Sequential, and custom containers like AutoRound's
+            # SequentialQwen3_5MoeExperts).
+            try:
+                n = len(experts_list)
+                if n > 0 and isinstance(experts_list[0], nn.Module):
+                    candidates.append((attr, experts_list))
+            except (TypeError, IndexError, AttributeError):
+                continue
         if not candidates:
             continue
         attr_name, experts_list = candidates[0]
@@ -408,6 +417,12 @@ def main():
     ap.add_argument("--importance-weighting", action="store_true", default=True)
     ap.add_argument("--no-importance-weighting", action="store_false",
                     dest="importance_weighting")
+    ap.add_argument("--unfuse-moe", action="store_true", default=True,
+                    help="Unfuse MoE expert tensors into per-expert nn.Linear "
+                         "via AutoRound. Needed for any model that uses the "
+                         "transformers 5+ fused-experts pattern (Qwen3.x MoE, "
+                         "Mixtral 5+, etc.). Requires auto-round installed.")
+    ap.add_argument("--no-unfuse-moe", action="store_false", dest="unfuse_moe")
     args = ap.parse_args()
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -424,6 +439,28 @@ def main():
         low_cpu_mem_usage=False, trust_remote_code=True,
     )
     model.eval()
+
+    # Optional: unfuse MoE experts into per-expert nn.Linear layers.
+    # Modern transformers (5.0+) pack MoE experts into single nn.Parameter
+    # tensors like (num_experts, out_dim, in_dim) and apply them via
+    # nn.functional.linear inline — there are no per-expert nn.Linear
+    # modules for us to hook.  AutoRound's prepare_model_for_moe_quantization
+    # unfuses them into a ModuleList of Linears, which is what our probe
+    # and allocator expect. Fall back gracefully (with a warning) if
+    # AutoRound isn't installed, so DynaQuant remains usable for dense
+    # models without a hard AutoRound dependency.
+    if args.unfuse_moe:
+        try:
+            from auto_round.modeling.fused_moe import prepare_model_for_moe_quantization
+            prepare_model_for_moe_quantization(model)
+            print("[probe] unfused MoE experts via AutoRound", flush=True)
+        except ImportError:
+            print("[probe] AutoRound not available; skipping MoE unfuse. "
+                  "Per-expert sensitivity will not be measured.", flush=True)
+        except Exception as e:
+            print(f"[probe] MoE unfuse failed ({e}); continuing with "
+                  "fused experts.", flush=True)
+
     for p in model.parameters():
         p.requires_grad_(False)
     if args.gradient_checkpointing:
