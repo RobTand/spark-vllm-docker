@@ -368,9 +368,59 @@ def load_calibration(tokenizer, source: str, n_samples: int,
             if len(texts) >= n_samples * 8:
                 break
     else:
-        ds = load_dataset(source, split="train")
-        key = "text" if "text" in ds.column_names else ds.column_names[0]
-        texts = [row[key] for row in ds]
+        # Generic HF dataset loader. Handles three common schemas:
+        #   1. {"text": "..."} — raw text corpora (pile, wikitext, etc.)
+        #   2. {"messages": [...]} — chat-format SFT (ultrachat, tulu-3, etc.)
+        #   3. anything else — falls back to first string column
+        # Streaming when possible so we don't download the full dataset for
+        # just 32 samples.
+        try:
+            ds = load_dataset(source, split="train", streaming=True)
+            stream = True
+        except Exception:
+            ds = load_dataset(source, split="train")
+            stream = False
+
+        # Probe one row to detect schema
+        iterator = iter(ds) if stream else ds
+        first = next(iterator) if stream else (ds[0] if len(ds) else {})
+        schema = None
+        if "messages" in first:
+            schema = "messages"
+        elif "text" in first:
+            schema = "text"
+        else:
+            # pick first string-valued column
+            for k, v in first.items():
+                if isinstance(v, str):
+                    schema = k
+                    break
+        if schema is None:
+            raise ValueError(f"Could not find text or messages field in {source}")
+        print(f"[probe] {source} schema: {schema}", flush=True)
+
+        # Re-iterate (we consumed the first row)
+        if stream:
+            ds = load_dataset(source, split="train", streaming=True)
+            iterator = iter(ds)
+        else:
+            iterator = iter(ds)
+
+        for row in iterator:
+            if schema == "messages":
+                msgs = row.get("messages") or row.get("conversations") or []
+                if not msgs:
+                    continue
+                try:
+                    texts.append(tokenizer.apply_chat_template(msgs, tokenize=False))
+                except Exception:
+                    continue
+            else:
+                v = row.get(schema)
+                if isinstance(v, str) and v.strip():
+                    texts.append(v)
+            if len(texts) >= n_samples * 8:
+                break
 
     random.seed(42)
     samples = []

@@ -159,6 +159,166 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec]
     return out
 
 
+def _moe_layer_key(name: str) -> str | None:
+    """Return the MoE-experts-group key for this Linear, or None if it
+    isn't an expert Linear.
+
+    Two leaves belong to the same group iff they live under the same
+    `<prefix>.experts.<eid>.*` ancestor. The group key is that
+    `<prefix>.experts` path — all expert Linears beneath it share one
+    serving-side fused tensor per projection.
+    """
+    m = re.search(r"^(.+\.experts)\.\d+\.", name)
+    if m:
+        return m.group(1)
+    return None
+
+
+def aggregate_moe_candidates(
+    stats: dict, costs: dict, formats: list[fr.FormatSpec],
+    candidates: dict[str, list[Candidate]],
+) -> tuple[dict, dict, dict]:
+    """Aggregate per-expert Linears into per-layer MoE super-candidates.
+
+    vLLM's FusedMoE kernel requires a single format per layer's fused
+    expert tensor. Per-expert mixing is only possible via slow unfused
+    serving paths. Statistically, per-expert Fisher is also noise-
+    dominated at typical calibration budgets, so aggregation gives
+    cleaner signal too — both correctness arguments point the same way.
+
+    This function:
+      1. Groups Linears by (expert_group_path, projection_suffix), e.g.
+         `model.layers.5.mlp.experts.*.gate_proj` becomes one group.
+      2. Builds a synthetic "super-Linear" per group in returned stats_ext
+         and costs_ext, with aggregated params/sensitivity/RTN errors.
+      3. Aggregated predicted Δloss per format = sum of per-expert
+         predicted Δloss (same as summing 0.5·h_i·mse_i,f·d_out_i).
+
+    Returns (stats_ext, costs_ext, candidates_ext) where non-expert
+    Linears are unchanged and each MoE expert-group becomes one synthetic
+    entry keyed by `<group>.__fused__.<projection>`.
+    """
+    expert_leaves: dict[tuple[str, str], list[str]] = {}
+    non_expert_names: list[str] = []
+    for name in stats:
+        grp = _moe_layer_key(name)
+        if grp is None:
+            non_expert_names.append(name)
+            continue
+        # projection suffix is everything after `.experts.<eid>.`
+        suf = name[len(grp):]
+        m = re.match(r"\.\d+\.(.+)$", suf)
+        if not m:
+            non_expert_names.append(name)
+            continue
+        projection = m.group(1)
+        expert_leaves.setdefault((grp, projection), []).append(name)
+
+    stats_ext = {n: stats[n] for n in non_expert_names}
+    costs_ext = {n: costs.get(n, {}) for n in non_expert_names}
+    candidates_ext = {n: candidates[n] for n in non_expert_names
+                      if n in candidates}
+
+    for (grp, projection), members in expert_leaves.items():
+        # Aggregate stats
+        n_params = sum(stats[m_]["n_params"] for m_ in members)
+        d_out = stats[members[0]]["out_features"]
+        # Sum Fisher per-expert (already route-normalized if tracker existed;
+        # summing is the right "super-Linear" aggregation because the total
+        # loss-contribution of the fused layer = sum of per-expert
+        # contributions).
+        sum_h = sum(stats[m_]["h_trace"] for m_ in members)
+        # Synthetic super-name
+        super_name = f"{grp}.__fused__.{projection}"
+
+        stats_ext[super_name] = {
+            "h_trace": sum_h,
+            "h_trace_raw": sum(stats[m_].get("h_trace_raw", 0.0) for m_ in members),
+            "h_w2_sum": sum(stats[m_].get("h_w2_sum", 0.0) for m_ in members),
+            "w_max_abs": max(stats[m_]["w_max_abs"] for m_ in members),
+            "w_norm_sq": sum(stats[m_]["w_norm_sq"] for m_ in members),
+            "n_params": n_params,
+            "in_features": stats[members[0]]["in_features"],
+            "out_features": d_out,
+            "n_tokens_seen": sum(stats[m_].get("n_tokens_seen", 0) for m_ in members),
+            "route_prob": None,  # aggregation washes out per-expert route prob
+            "router_path": None,
+            "expert_id": None,
+            "_fused_members": members,
+        }
+
+        # Aggregate per-format cost = mean weight_mse (weighted by params)
+        # and mean output_mse (same weighting). Predicted Δloss at format f
+        # for the fused layer = 0.5 * h_sum_over_experts * output_mse_per_expert
+        # · d_out; if we use per-expert mse directly it doesn't aggregate
+        # correctly because different experts have different sensitivities.
+        # Instead we sum predicted Δloss across members per format.
+        super_cost = {}
+        for spec in formats:
+            missing = any(spec.name not in costs.get(m_, {})
+                          or "error" in costs.get(m_, {}).get(spec.name, {})
+                          for m_ in members)
+            if missing:
+                super_cost[spec.name] = {"error": "partial"}
+                continue
+            # sum of per-expert predicted Δloss, rescaled so the allocator's
+            # formula (0.5 * h_trace * output_mse * d_out) reproduces it
+            sum_pred = 0.0
+            sum_weight_mse = 0.0
+            for m_ in members:
+                c = costs[m_][spec.name]
+                h_i = stats[m_]["h_trace"]
+                d_i = stats[m_]["out_features"]
+                sum_pred += 0.5 * h_i * c["output_mse"] * d_i
+                sum_weight_mse += c["weight_mse"] * stats[m_]["n_params"]
+            # Invert to an "effective output_mse" so the allocator's
+            # predicted_dloss = 0.5 * sum_h * effective_mse * d_out matches
+            # the true summed Δloss.
+            if sum_h > 0 and d_out > 0:
+                eff_mse = sum_pred / (0.5 * sum_h * d_out)
+            else:
+                eff_mse = 0.0
+            super_cost[spec.name] = {
+                "weight_mse": sum_weight_mse / max(n_params, 1),
+                "output_mse": eff_mse,
+                "rel_output_mse": eff_mse,  # not used by allocator
+            }
+        costs_ext[super_name] = super_cost
+
+        # Build candidates for the super-Linear
+        cands = []
+        for spec in formats:
+            entry = super_cost.get(spec.name)
+            if entry is None or "error" in entry:
+                continue
+            predicted = 0.5 * sum_h * entry["output_mse"] * d_out
+            cands.append(Candidate(
+                fmt=spec.name,
+                bits_per_param=spec.effective_bits,
+                predicted_dloss=max(predicted, 0.0),
+            ))
+        if cands:
+            candidates_ext[super_name] = cands
+
+    return stats_ext, costs_ext, candidates_ext
+
+
+def expand_moe_assignment(assignment: dict[str, str],
+                          stats_ext: dict) -> dict[str, str]:
+    """Replace `.__fused__.` super-Linear assignments with the per-expert
+    assignments needed by AutoRound's layer_config (one entry per
+    individual expert Linear, all sharing the super-Linear's format)."""
+    out = {}
+    for name, fmt in assignment.items():
+        if ".__fused__." in name:
+            members = stats_ext[name].get("_fused_members", [])
+            for m_ in members:
+                out[m_] = fmt
+        else:
+            out[name] = fmt
+    return out
+
+
 def solve_allocation(stats: dict, candidates: dict[str, list[Candidate]],
                      target_bits: float, bit_precision: float = 0.001
                      ) -> dict[str, str] | None:
@@ -306,6 +466,15 @@ def main():
                          "(smaller = slower; default 0.001 → ~5000 bins)")
     ap.add_argument("--threads", type=int, default=0,
                     help="OMP/numpy threads for DP (0 = default)")
+    ap.add_argument("--expert-granularity", choices=["layer", "expert"],
+                    default="layer",
+                    help="MoE experts allocation granularity. 'layer' (default) "
+                         "assigns one format to all experts in a layer's fused "
+                         "tensor — required for full-speed fused-MoE serving "
+                         "on every major stack (vLLM FlashInfer/Marlin, SGLang, "
+                         "TensorRT-LLM). 'expert' allows per-expert mixing but "
+                         "forces slower sequential serving and is noise-floor "
+                         "limited at typical calibration budgets.")
     args = ap.parse_args()
 
     if args.threads > 0:
@@ -364,6 +533,12 @@ def main():
 
     candidates = build_candidates(stats, costs, specs_sorted)
     print(f"[alloc] candidates built for {len(candidates)} Linears")
+
+    if args.expert_granularity == "layer":
+        stats, costs, candidates = aggregate_moe_candidates(
+            stats, costs, specs_sorted, candidates)
+        moe_groups = sum(1 for n in candidates if ".__fused__." in n)
+        print(f"[alloc] MoE aggregation: {moe_groups} fused-expert super-Linears")
 
     # Pareto sweep
     targets = [float(x) for x in args.pareto_targets.split(",")]
@@ -435,10 +610,18 @@ def main():
             "Consider raising the target or widening the format set.")
     if not args.no_fused_promote:
         assignment = promote_fused(assignment, format_rank)
+
+    # Expand MoE super-Linears back to per-expert entries before writing
+    # the AutoRound layer_config (which expects one entry per individual
+    # nn.Linear module name).
+    if args.expert_granularity == "layer":
+        assignment_expanded = expand_moe_assignment(assignment, stats)
+    else:
+        assignment_expanded = assignment
     achieved, _ = compute_achieved(stats, assignment, format_specs)
 
     layer_cfg = {}
-    for name, fmt in assignment.items():
+    for name, fmt in assignment_expanded.items():
         layer_cfg[name] = format_specs[fmt].autoround_config()
 
     out = Path(args.layer_config)
