@@ -100,26 +100,35 @@ def _rtn_uniform_int(w: torch.Tensor, bits: int, group_size: int,
 def _rtn_fp_codebook(w: torch.Tensor, codebook: torch.Tensor,
                      group_size: int) -> torch.Tensor:
     """Round to nearest value in a small FP codebook, with per-group scaling.
-    Used as a high-fidelity reference for NVFP4/MXFP4/MXFP6/MXFP8 element casts.
+
+    Vectorized via torch.bucketize on the sorted codebook. For each scaled
+    weight value x, we binary-search the codebook to find the two bracketing
+    entries and pick the closer one. O(N log K) instead of the O(N * K)
+    pairwise-distance approach, with 0 extra-dim allocations.
     """
     orig_shape = w.shape
-    out_f, in_f = w.shape[-2], w.shape[-1]
+    in_f = w.shape[-1]
     w2 = w.reshape(-1, in_f).float()
     if group_size > 0 and group_size < in_f:
         w2 = w2.reshape(-1, in_f // group_size, group_size)
     else:
         w2 = w2.unsqueeze(1)
-    # Per-group scale: map max |w| to the largest codebook value
-    cmax = codebook.abs().max()
+
+    cb = codebook.to(device=w2.device, dtype=torch.float32).contiguous()
+    cmax = float(cb.abs().max().item())
     max_abs = w2.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
     scale = max_abs / cmax
-    # Quantize: find nearest codebook entry for each element
-    cb = codebook.to(w2.device)
-    # Broadcasted: (..., group_size, 1) - (codebook_size,) = distances
-    expanded = (w2 / scale).unsqueeze(-1)       # (..., group_size, 1)
-    dist = (expanded - cb.view(1, 1, 1, -1)).abs()
-    idx = dist.argmin(dim=-1)
-    q = cb[idx]
+    x = w2 / scale                                    # shape (..., group)
+
+    # Bucketize returns the insertion index: cb[idx-1] <= x < cb[idx].
+    idx = torch.bucketize(x.contiguous(), cb)
+    idx_lo = (idx - 1).clamp_min(0)
+    idx_hi = idx.clamp_max(cb.numel() - 1)
+    lo = cb[idx_lo]
+    hi = cb[idx_hi]
+    choose_hi = (hi - x).abs() < (x - lo).abs()
+    q = torch.where(choose_hi, hi, lo)
+
     w_rec = q * scale
     return w_rec.reshape(orig_shape).to(w.dtype)
 
