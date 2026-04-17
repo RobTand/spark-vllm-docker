@@ -97,30 +97,41 @@ def discover_moe_structure(model: nn.Module) -> dict[str, tuple[str, str]]:
         candidates = []
         for attr in ("experts", "block_sparse_moe_experts",
                      "moe_experts", "expert_layer"):
-            experts_list = getattr(parent, attr, None)
-            if experts_list is None:
+            experts_container = getattr(parent, attr, None)
+            if experts_container is None or not isinstance(experts_container, nn.Module):
                 continue
-            # Accept any container that has __len__ and __getitem__ where
-            # children look like nn.Module (covers nn.ModuleList,
-            # nn.Sequential, and custom containers like AutoRound's
-            # SequentialQwen3_5MoeExperts).
-            try:
-                n = len(experts_list)
-                if n > 0 and isinstance(experts_list[0], nn.Module):
-                    candidates.append((attr, experts_list))
-            except (TypeError, IndexError, AttributeError):
+            # Two possible layouts:
+            #   A) experts_container IS the list (nn.ModuleList / nn.Sequential /
+            #      AutoRound's SequentialQwen3_5MoeExperts which subclasses ModuleList)
+            #   B) experts_container is a plain nn.Module with numbered children
+            #      (e.g. Qwen3_5MoeExperts after in-place unfuse: children are
+            #      named "0", "1", ..., each holding per-expert Linears).
+            #
+            # Both layouts are detected by looking at child names that are
+            # consecutive integer strings starting from 0.
+            child_dict = dict(experts_container.named_children())
+            numeric_keys = sorted(
+                [k for k in child_dict if k.isdigit()],
+                key=int,
+            )
+            if not numeric_keys:
                 continue
+            # Require the numeric children to be 0..N-1 (no gaps)
+            if [int(k) for k in numeric_keys] != list(range(len(numeric_keys))):
+                continue
+            if not all(isinstance(child_dict[k], nn.Module) for k in numeric_keys):
+                continue
+            candidates.append((attr, experts_container, numeric_keys))
         if not candidates:
             continue
-        attr_name, experts_list = candidates[0]
-        num_experts = len(experts_list)
-        if num_experts == 0:
-            continue
+        attr_name, experts_container, numeric_keys = candidates[0]
+        num_experts = len(numeric_keys)
 
-        # Find sibling Linear with out_features == num_experts
+        # Find sibling Linear (or any module whose output feature dim
+        # equals num_experts) that acts as the router.
         router_qname = None
         for child_name, child in parent.named_children():
-            if child is experts_list:
+            if child is experts_container:
                 continue
             if isinstance(child, nn.Linear) and child.out_features == num_experts:
                 router_qname = (f"{parent_qname}.{child_name}"
@@ -131,12 +142,13 @@ def discover_moe_structure(model: nn.Module) -> dict[str, tuple[str, str]]:
 
         experts_root = (f"{parent_qname}.{attr_name}"
                         if parent_qname else attr_name)
-        for eid, expert_mod in enumerate(experts_list):
+        for eid_str in numeric_keys:
+            expert_mod = child_dict[eid_str]
             for sub_name, sub_mod in expert_mod.named_modules():
                 if not isinstance(sub_mod, nn.Linear) or sub_name == "":
                     continue
-                leaf = f"{experts_root}.{eid}.{sub_name}"
-                expert_info[leaf] = (router_qname, str(eid))
+                leaf = f"{experts_root}.{eid_str}.{sub_name}"
+                expert_info[leaf] = (router_qname, eid_str)
 
     return expert_info
 
@@ -453,7 +465,21 @@ def main():
         try:
             from auto_round.modeling.fused_moe import prepare_model_for_moe_quantization
             prepare_model_for_moe_quantization(model)
-            print("[probe] unfused MoE experts via AutoRound", flush=True)
+            # The unfuser creates new nn.Linear modules on CPU by default,
+            # leaving the rest of the model on its original device. Move
+            # the new modules back to the correct device.
+            target_dev = None
+            for p in model.parameters():
+                target_dev = p.device
+                if p.device.type != "cpu":
+                    break
+            if target_dev is not None and target_dev.type != "cpu":
+                for name, sub in model.named_modules():
+                    if isinstance(sub, nn.Linear):
+                        if sub.weight.device != target_dev:
+                            sub.to(target_dev)
+            print(f"[probe] unfused MoE experts via AutoRound "
+                  f"(all on {target_dev})", flush=True)
         except ImportError:
             print("[probe] AutoRound not available; skipping MoE unfuse. "
                   "Per-expert sensitivity will not be measured.", flush=True)
