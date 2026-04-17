@@ -274,12 +274,28 @@ register_format(FormatSpec(
     quantize_dequantize=_make_rtn("fp6_e2m3", 32),
 ))
 register_format(FormatSpec(
-    name="MXFP8",
+    name="MXFP8",  # alias for MXFP8_E4M3 (OCP MX canonical default)
     weight_bits=8, group_size=32, scale_bits=8, scale_dtype_name="uint8_e8m0",
     weight_element_dtype="fp8_e4m3", act_bits=8, act_dtype_name="fp8_e4m3",
     act_group_size=32, family="mx", min_capability_sm=100,
     autoround_config=lambda: _mx_autoround(8, 32, 8, "fp8_e4m3"),
     quantize_dequantize=_make_rtn("fp8_e4m3", 32),
+))
+register_format(FormatSpec(
+    name="MXFP8_E4M3",  # explicit name for the canonical variant
+    weight_bits=8, group_size=32, scale_bits=8, scale_dtype_name="uint8_e8m0",
+    weight_element_dtype="fp8_e4m3", act_bits=8, act_dtype_name="fp8_e4m3",
+    act_group_size=32, family="mx", min_capability_sm=100,
+    autoround_config=lambda: _mx_autoround(8, 32, 8, "fp8_e4m3"),
+    quantize_dequantize=_make_rtn("fp8_e4m3", 32),
+))
+register_format(FormatSpec(
+    name="MXFP8_E5M2",  # wider dynamic range, less mantissa precision
+    weight_bits=8, group_size=32, scale_bits=8, scale_dtype_name="uint8_e8m0",
+    weight_element_dtype="fp8_e5m2", act_bits=8, act_dtype_name="fp8_e5m2",
+    act_group_size=32, family="mx", min_capability_sm=100,
+    autoround_config=lambda: _mx_autoround(8, 32, 8, "fp8_e5m2"),
+    quantize_dequantize=_make_rtn("fp8_e5m2", 32),
 ))
 register_format(FormatSpec(
     name="MXFP8A16",
