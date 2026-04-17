@@ -119,6 +119,22 @@ Built-in formats:
 - **INT8_W8A16**, **INT4_W4A16_g128** — classic uniform-integer
 - **BF16** — passthrough for must-preserve layers
 
+### Recommended format bundles
+
+**NVFP4 and MXFP4 are alternatives for the same 4-bit tier, not separate
+precision levels.** Include at most one format per bit tier — otherwise
+the allocator picks between them based on per-layer RTN measurement
+noise and you end up with a serving mess (two kernel paths for 4-bit
+quant). The allocator warns on this by default and errors with
+`--enforce-family-coherence`.
+
+| Target hardware       | Recommended `--formats`         |
+|-----------------------|----------------------------------|
+| NVIDIA Blackwell      | `NVFP4,MXFP6_E3M2,MXFP8`         |
+| OCP MX–native stack   | `MXFP4,MXFP6_E3M2,MXFP8`         |
+| Hardware-agnostic     | `NVFP4,MXFP8` (binary ladder)    |
+| Legacy INT pipelines  | `INT4_W4A16_g128,INT8_W8A16`     |
+
 ## Method notes
 
 ### Is this gradient descent?

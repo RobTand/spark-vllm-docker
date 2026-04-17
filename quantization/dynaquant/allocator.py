@@ -297,6 +297,10 @@ def main():
     ap.add_argument("--pareto-csv", required=True, help="Output Pareto CSV")
     ap.add_argument("--no-fused-promote", action="store_true",
                     help="Skip fused-projection sibling promotion")
+    ap.add_argument("--enforce-family-coherence", action="store_true",
+                    help="Error (instead of warn) if the format set contains "
+                         "multiple candidates for the same bit tier (e.g. "
+                         "NVFP4 and MXFP4 both at 4 bits)")
     ap.add_argument("--bit-precision", type=float, default=0.001,
                     help="Knapsack bit-bin granularity in avg-bits/param "
                          "(smaller = slower; default 0.001 → ~5000 bins)")
@@ -323,6 +327,35 @@ def main():
         fmt_names = cost_data["formats"]
     specs = [fr.get_format(n) for n in fmt_names]
     specs_sorted = sorted(specs, key=lambda s: s.effective_bits)
+
+    # --- Format-family coherence check -----------------------------------
+    # A sensible format ladder has at most ONE format per bit tier. Having
+    # both NVFP4 and MXFP4 (or MXFP6_E3M2 and MXFP6_E2M3) means the allocator
+    # picks between them based on tiny measurement noise per-layer, which
+    # produces a serving mess: two separate kernel paths for the same tier.
+    #
+    # We bucket formats by effective_bits rounded to 0.25 and warn when a
+    # bucket has more than one member. If --enforce-family-coherence is
+    # set we error instead.
+    from collections import Counter as _Counter
+    buckets: dict[float, list[str]] = {}
+    for s in specs_sorted:
+        key = round(s.effective_bits * 4) / 4
+        buckets.setdefault(key, []).append(s.name)
+    collisions = {k: v for k, v in buckets.items() if len(v) > 1}
+    if collisions:
+        msg = ("format set has multiple candidates at the same bit tier; "
+               "the allocator will pick among them based on per-layer RTN "
+               "noise, which is usually not what you want:\n"
+               + "\n".join(f"  {k} bits: {v}" for k, v in collisions.items())
+               + "\nRecommended bundles:\n"
+               "  NVIDIA Blackwell: NVFP4,MXFP6_E3M2,MXFP8\n"
+               "  OCP MX only     : MXFP4,MXFP6_E3M2,MXFP8\n"
+               "  Hardware-agnostic: NVFP4,MXFP8")
+        if args.enforce_family_coherence:
+            raise SystemExit(f"[alloc] ERROR: {msg}")
+        else:
+            print(f"[alloc] WARNING: {msg}", flush=True)
     format_rank = {s.name: i for i, s in enumerate(specs_sorted)}
     format_specs = {s.name: s for s in specs}
     print(f"[alloc] formats (low→high bits): "
