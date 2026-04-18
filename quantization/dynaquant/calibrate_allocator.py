@@ -105,8 +105,15 @@ def build_module_param_map(model):
     out = {}
     for full_name, mod, attr in iter_quantizable_tensors(model):
         out[full_name] = (mod, attr)
+        bare_name = full_name[:-7] if full_name.endswith(".weight") else full_name
+        out[bare_name] = (mod, attr)
         if full_name.startswith("model."):
             out[f"model.language_model.{full_name[len('model.') :]}"] = (mod, attr)
+            out[
+                f"model.language_model.{bare_name[len('model.') :]}"
+                if bare_name.startswith("model.")
+                else f"model.language_model.{bare_name}"
+            ] = (mod, attr)
     return out
 
 
