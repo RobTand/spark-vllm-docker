@@ -201,6 +201,7 @@ def main():
         "layers_refined": sorted(upgraded),
     }
     cost_blob["meta"] = meta
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     with open(args.output, "wb") as f:
         pickle.dump(cost_blob, f)
     print(f"[reconstruct] wrote {args.output}", flush=True)

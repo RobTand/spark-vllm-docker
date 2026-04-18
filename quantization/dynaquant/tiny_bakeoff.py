@@ -79,6 +79,7 @@ def build_bakeoff_commands(args) -> tuple[dict[str, Path], list[list[str]]]:
     base_out_dir = Path(args.output_dir)
     for target_bits in _target_list(args):
         out_dir = _variant_dir(base_out_dir, target_bits)
+        out_dir.mkdir(parents=True, exist_ok=True)
         paths = _paths(out_dir)
         paths_by_target[f"{target_bits:.4f}"] = paths
         commands.append([
