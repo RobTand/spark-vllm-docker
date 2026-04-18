@@ -97,6 +97,8 @@ def build_bakeoff_commands(args) -> tuple[dict[str, Path], list[list[str]]]:
             "--device", args.device,
             "--dtype", "bf16",
             "--refine-rounds", str(args.refine_rounds),
+            "--rowwise-topk", str(args.rowwise_topk),
+            "--rowwise-rounds", str(args.rowwise_rounds),
             "--output", str(paths["costs_refined"]),
         ])
         commands.append([
@@ -183,6 +185,8 @@ def main():
     ap.add_argument("--unit-scope", choices=["sibling", "block", "hybrid"], default="sibling")
     ap.add_argument("--neighbor-radius", type=int, default=1)
     ap.add_argument("--refine-rounds", type=int, default=2)
+    ap.add_argument("--rowwise-topk", type=int, default=8)
+    ap.add_argument("--rowwise-rounds", type=int, default=1)
     ap.add_argument("--n-calib-samples", type=int, default=2)
     ap.add_argument("--calib-seqlen", type=int, default=64)
     ap.add_argument("--device", default="cuda")

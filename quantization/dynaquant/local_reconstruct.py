@@ -26,11 +26,17 @@ from .interaction_refine import build_refinement_units, select_critical_units
 from .measure_quant_cost import ActivationIndex, _load_live_model
 
 
-def _sym_clip(x: torch.Tensor, factor: float) -> torch.Tensor:
-    if factor >= 0.999999:
-        return x
+def _sym_clip(x: torch.Tensor, factor) -> torch.Tensor:
+    if isinstance(factor, torch.Tensor):
+        f = factor.to(device=x.device, dtype=x.dtype)
+        if bool(torch.all(f >= 0.999999)):
+            return x
+    else:
+        f = float(factor)
+        if f >= 0.999999:
+            return x
     max_abs = x.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
-    limit = max_abs * factor
+    limit = max_abs * f
     return x.clamp(-limit, limit)
 
 
@@ -42,7 +48,8 @@ def _measure_entry(W: torch.Tensor, X: torch.Tensor, spec: fr.FormatSpec, w_clip
     y_ref = X @ W.T
     y_q = X_hat @ W_hat.T
     weight_mse = float((W - W_hat).float().pow(2).mean().item())
-    output_mse = float((y_ref - y_q).float().pow(2).mean().item())
+    out_err = (y_ref - y_q).float().pow(2)
+    output_mse = float(out_err.mean().item())
     ref_energy = float(y_ref.float().pow(2).mean().item())
     return {
         "weight_mse": weight_mse,
@@ -50,6 +57,7 @@ def _measure_entry(W: torch.Tensor, X: torch.Tensor, spec: fr.FormatSpec, w_clip
         "rel_output_mse": output_mse / max(ref_energy, 1e-12),
         "weight_clip": w_clip,
         "act_clip": a_clip,
+        "per_output_mse": out_err.mean(dim=0).detach().cpu(),
     }
 
 
@@ -63,6 +71,70 @@ def _candidate_clip_values(best: float, step: float) -> list[float]:
     return sorted(vals, reverse=True)
 
 
+def _entry_score(entry: dict) -> float:
+    return float(entry["output_mse"])
+
+
+def _summarize_weight_clip(weight_clip):
+    if isinstance(weight_clip, torch.Tensor):
+        flat = [float(x) for x in weight_clip.detach().cpu().view(-1).tolist()]
+        return {
+            "mode": "rowwise",
+            "default": flat[0] if flat else 1.0,
+            "min": min(flat) if flat else 1.0,
+            "max": max(flat) if flat else 1.0,
+            "values": flat,
+        }
+    clip = float(weight_clip)
+    return {
+        "mode": "scalar",
+        "default": clip,
+        "min": clip,
+        "max": clip,
+    }
+
+
+def _rowwise_refine_weight_clip(
+    W: torch.Tensor,
+    X: torch.Tensor,
+    spec: fr.FormatSpec,
+    best: dict,
+    rowwise_topk: int,
+    rowwise_rounds: int,
+):
+    if rowwise_topk <= 0 or rowwise_rounds <= 0:
+        return best
+    per_output = best.get("per_output_mse")
+    if per_output is None or per_output.numel() <= 1:
+        return best
+    topk = min(int(rowwise_topk), int(per_output.numel()))
+    top_rows = torch.topk(per_output, k=topk).indices.tolist()
+    row_clips = torch.full((W.shape[0], 1), float(best["weight_clip"]), device=W.device, dtype=W.dtype)
+    best_entry = dict(best)
+    best_entry["weight_clip"] = row_clips.clone()
+    step = 0.02
+    for _ in range(max(rowwise_rounds, 0)):
+        improved = False
+        for row in top_rows:
+            current = float(row_clips[row, 0].item())
+            for candidate in _candidate_clip_values(current, step):
+                trial = row_clips.clone()
+                trial[row, 0] = candidate
+                try:
+                    entry = _measure_entry(W, X, spec, trial, float(best_entry["act_clip"]))
+                except Exception:
+                    continue
+                if _entry_score(entry) + 1e-12 < _entry_score(best_entry):
+                    row_clips = trial
+                    best_entry = entry
+                    best_entry["weight_clip"] = row_clips.clone()
+                    improved = True
+        step *= 0.5
+        if not improved:
+            continue
+    return best_entry
+
+
 def _refine_measurement(
     W: torch.Tensor,
     X: torch.Tensor,
@@ -70,6 +142,8 @@ def _refine_measurement(
     w_grid: list[float],
     a_grid: list[float],
     rounds: int,
+    rowwise_topk: int,
+    rowwise_rounds: int,
 ):
     best = None
     for w_clip in w_grid:
@@ -80,7 +154,7 @@ def _refine_measurement(
                 entry = {"error": str(exc), "weight_clip": w_clip, "act_clip": a_clip}
             if "error" in entry:
                 continue
-            if best is None or entry["output_mse"] < best["output_mse"]:
+            if best is None or _entry_score(entry) < _entry_score(best):
                 best = entry
     if best is None:
         return None
@@ -94,13 +168,20 @@ def _refine_measurement(
                     entry = _measure_entry(W, X, spec, w_clip, a_clip)
                 except Exception:
                     continue
-                if entry["output_mse"] + 1e-12 < best["output_mse"]:
+                if _entry_score(entry) + 1e-12 < _entry_score(best):
                     best = entry
                     improved = True
         step *= 0.5
         if not improved:
             continue
-    return best
+    return _rowwise_refine_weight_clip(
+        W,
+        X,
+        spec,
+        best,
+        rowwise_topk=rowwise_topk,
+        rowwise_rounds=rowwise_rounds,
+    )
 
 
 def expand_live_target_layers(critical_units, stats_alloc: dict) -> set[str]:
@@ -128,6 +209,8 @@ def main():
     ap.add_argument("--w-clip-grid", default="1.0,0.995,0.99,0.98,0.95,0.9")
     ap.add_argument("--a-clip-grid", default="1.0,0.995,0.99,0.98,0.95,0.9")
     ap.add_argument("--refine-rounds", type=int, default=2)
+    ap.add_argument("--rowwise-topk", type=int, default=8)
+    ap.add_argument("--rowwise-rounds", type=int, default=1)
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     ap.add_argument("--expert-granularity", choices=["layer", "expert"], default="layer")
@@ -174,17 +257,35 @@ def main():
         for spec in specs_sorted:
             if spec.name not in raw_costs.get(layer_name, {}):
                 continue
-            best = _refine_measurement(W, X, spec, w_grid, a_grid, args.refine_rounds)
+            best = _refine_measurement(
+                W,
+                X,
+                spec,
+                w_grid,
+                a_grid,
+                args.refine_rounds,
+                rowwise_topk=args.rowwise_topk,
+                rowwise_rounds=args.rowwise_rounds,
+            )
             if best is not None:
                 best["source"] = "local_reconstruct"
+                best["weight_clip_summary"] = _summarize_weight_clip(best["weight_clip"])
+                if "per_output_mse" in best:
+                    best["per_output_mse"] = best["per_output_mse"].tolist()
                 per_fmt[spec.name] = best
         if per_fmt:
             upgraded[layer_name] = per_fmt
             for fmt, entry in per_fmt.items():
                 raw_costs.setdefault(layer_name, {})[fmt] = entry
+                clip_summary = entry["weight_clip_summary"]
                 print(
                     f"[reconstruct] {layer_name} {fmt} output_mse={entry['output_mse']:.4e} "
-                    f"w_clip={entry['weight_clip']:.3f} a_clip={entry['act_clip']:.3f}",
+                    f"w_clip={clip_summary['default']:.3f}"
+                    + (
+                        f"[{clip_summary['min']:.3f},{clip_summary['max']:.3f}]"
+                        if clip_summary["mode"] == "rowwise" else ""
+                    )
+                    + f" a_clip={entry['act_clip']:.3f}",
                     flush=True,
                 )
 
@@ -198,6 +299,8 @@ def main():
         "w_clip_grid": w_grid,
         "a_clip_grid": a_grid,
         "refine_rounds": args.refine_rounds,
+        "rowwise_topk": args.rowwise_topk,
+        "rowwise_rounds": args.rowwise_rounds,
         "layers_refined": sorted(upgraded),
     }
     cost_blob["meta"] = meta
