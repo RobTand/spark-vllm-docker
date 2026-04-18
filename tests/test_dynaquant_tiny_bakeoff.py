@@ -15,8 +15,12 @@ class TestTinyBakeoff(unittest.TestCase):
             activation_cache_dir="/tmp/act",
             formats="NVFP4,MXFP8,BF16",
             target_bits=4.8,
+            target_band=0.1,
+            target_grid="",
             top_units=6,
+            unit_scope="block",
             neighbor_radius=1,
+            refine_rounds=2,
             n_calib_samples=2,
             calib_seqlen=64,
             device="cuda",
@@ -27,19 +31,25 @@ class TestTinyBakeoff(unittest.TestCase):
         )
 
     def test_build_bakeoff_commands_with_oracle(self):
-        paths, cmds = build_bakeoff_commands(self._args(skip_oracle=False))
-        self.assertEqual(len(cmds), 6)
+        paths_by_target, cmds = build_bakeoff_commands(self._args(skip_oracle=False))
+        self.assertEqual(len(paths_by_target), 3)
+        self.assertEqual(len(cmds), 18)
+        first_target = sorted(paths_by_target)[0]
+        first_paths = paths_by_target[first_target]
         self.assertIn("quantization.dynaquant.calibrate_allocator", cmds[2])
         self.assertIn("quantization.dynaquant.quadratic_refine_allocator", cmds[3])
         self.assertIn("--calibration", cmds[3])
-        self.assertIn(str(paths["calibration"]), cmds[3])
+        self.assertIn(str(first_paths["calibration"]), cmds[3])
+        self.assertIn("--unit-scope", cmds[0])
+        self.assertIn("block", cmds[0])
+        self.assertIn("--refine-rounds", cmds[0])
         self.assertIn("quantization.dynaquant.oracle_search", cmds[4])
         self.assertIn("--oracle", cmds[-1])
-        self.assertTrue(str(paths["oracle"]).endswith("oracle.json"))
+        self.assertTrue(str(first_paths["oracle"]).endswith("oracle.json"))
 
     def test_build_bakeoff_commands_without_oracle(self):
         _paths, cmds = build_bakeoff_commands(self._args(skip_oracle=True))
-        self.assertEqual(len(cmds), 5)
+        self.assertEqual(len(cmds), 15)
         self.assertNotIn("quantization.dynaquant.oracle_search", " ".join(" ".join(c) for c in cmds))
         self.assertNotIn("--oracle", cmds[-1])
 

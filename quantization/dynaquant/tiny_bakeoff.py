@@ -56,90 +56,114 @@ def _paths(out_dir: Path):
     }
 
 
+def _target_list(args) -> list[float]:
+    if getattr(args, "target_grid", None):
+        return [float(x) for x in args.target_grid.split(",") if x.strip()]
+    half = max(float(getattr(args, "target_band", 0.0)), 0.0)
+    if half <= 0:
+        return [float(args.target_bits)]
+    return [
+        round(float(args.target_bits) - half, 4),
+        round(float(args.target_bits), 4),
+        round(float(args.target_bits) + half, 4),
+    ]
+
+
+def _variant_dir(base: Path, target_bits: float) -> Path:
+    return base / f"target_{target_bits:.4f}".replace(".", "p")
+
+
 def build_bakeoff_commands(args) -> tuple[dict[str, Path], list[list[str]]]:
-    out_dir = Path(args.output_dir)
-    paths = _paths(out_dir)
     commands = []
-    commands.append([
-        sys.executable,
-        "-m",
-        "quantization.dynaquant.local_reconstruct",
-        "--model", args.model,
-        "--probe", args.probe,
-        "--costs", args.costs,
-        "--activation-cache-dir", args.activation_cache_dir,
-        "--formats", args.formats,
-        "--target-bits", str(args.target_bits),
-        "--top-units", str(args.top_units),
-        "--device", args.device,
-        "--dtype", "bf16",
-        "--output", str(paths["costs_refined"]),
-    ])
-    commands.append([
-        sys.executable,
-        "-m",
-        "quantization.dynaquant.measure_interactions",
-        "--model", args.model,
-        "--probe", args.probe,
-        "--costs", str(paths["costs_refined"]),
-        "--formats", args.formats,
-        "--target-bits", str(args.target_bits),
-        "--top-units", str(args.top_units),
-        "--neighbor-radius", str(args.neighbor_radius),
-        "--n-calib-samples", str(args.n_calib_samples),
-        "--calib-seqlen", str(args.calib_seqlen),
-        "--device", args.device,
-        "--output", str(paths["interactions"]),
-    ])
-    commands.append([
-        sys.executable,
-        "-m",
-        "quantization.dynaquant.calibrate_allocator",
-        "--model", args.model,
-        "--probe", args.probe,
-        "--costs", str(paths["costs_refined"]),
-        "--formats", args.formats,
-        "--pareto-targets", f"4.5,{args.target_bits},16.0",
-        "--selection", "baseline,knee,high",
-        "--n-calib-samples", str(args.n_calib_samples),
-        "--calib-seqlen", str(args.calib_seqlen),
-        "--device", args.device,
-        "--output", str(paths["calibration"]),
-    ])
-    commands.append([
-        sys.executable,
-        "-m",
-        "quantization.dynaquant.quadratic_refine_allocator",
-        "--interactions", str(paths["interactions"]),
-        "--calibration", str(paths["calibration"]),
-        "--output", str(paths["refined"]),
-    ])
-    if not args.skip_oracle:
+    paths_by_target = {}
+    base_out_dir = Path(args.output_dir)
+    for target_bits in _target_list(args):
+        out_dir = _variant_dir(base_out_dir, target_bits)
+        paths = _paths(out_dir)
+        paths_by_target[f"{target_bits:.4f}"] = paths
         commands.append([
             sys.executable,
             "-m",
-            "quantization.dynaquant.oracle_search",
-            "--interactions", str(paths["interactions"]),
+            "quantization.dynaquant.local_reconstruct",
             "--model", args.model,
+            "--probe", args.probe,
+            "--costs", args.costs,
+            "--activation-cache-dir", args.activation_cache_dir,
+            "--formats", args.formats,
+            "--target-bits", str(target_bits),
+            "--top-units", str(args.top_units),
+            "--unit-scope", args.unit_scope,
+            "--device", args.device,
+            "--dtype", "bf16",
+            "--refine-rounds", str(args.refine_rounds),
+            "--output", str(paths["costs_refined"]),
+        ])
+        commands.append([
+            sys.executable,
+            "-m",
+            "quantization.dynaquant.measure_interactions",
+            "--model", args.model,
+            "--probe", args.probe,
+            "--costs", str(paths["costs_refined"]),
+            "--formats", args.formats,
+            "--target-bits", str(target_bits),
+            "--top-units", str(args.top_units),
+            "--unit-scope", args.unit_scope,
+            "--neighbor-radius", str(args.neighbor_radius),
             "--n-calib-samples", str(args.n_calib_samples),
             "--calib-seqlen", str(args.calib_seqlen),
             "--device", args.device,
-            "--max-combos", str(args.oracle_max_combos),
-            "--output", str(paths["oracle"]),
+            "--output", str(paths["interactions"]),
         ])
-    bakeoff_cmd = [
-        sys.executable,
-        "-m",
-        "quantization.dynaquant.bakeoff",
-        "--calibration", str(paths["calibration"]),
-        "--candidate", "refined",
-        "--refined", str(paths["refined"]),
-        "--output", str(paths["decision"]),
-    ]
-    if not args.skip_oracle:
-        bakeoff_cmd.extend(["--oracle", str(paths["oracle"])])
-    commands.append(bakeoff_cmd)
-    return paths, commands
+        commands.append([
+            sys.executable,
+            "-m",
+            "quantization.dynaquant.calibrate_allocator",
+            "--model", args.model,
+            "--probe", args.probe,
+            "--costs", str(paths["costs_refined"]),
+            "--formats", args.formats,
+            "--pareto-targets", f"4.5,{target_bits},16.0",
+            "--selection", "baseline,knee,high",
+            "--n-calib-samples", str(args.n_calib_samples),
+            "--calib-seqlen", str(args.calib_seqlen),
+            "--device", args.device,
+            "--output", str(paths["calibration"]),
+        ])
+        commands.append([
+            sys.executable,
+            "-m",
+            "quantization.dynaquant.quadratic_refine_allocator",
+            "--interactions", str(paths["interactions"]),
+            "--calibration", str(paths["calibration"]),
+            "--output", str(paths["refined"]),
+        ])
+        if not args.skip_oracle:
+            commands.append([
+                sys.executable,
+                "-m",
+                "quantization.dynaquant.oracle_search",
+                "--interactions", str(paths["interactions"]),
+                "--model", args.model,
+                "--n-calib-samples", str(args.n_calib_samples),
+                "--calib-seqlen", str(args.calib_seqlen),
+                "--device", args.device,
+                "--max-combos", str(args.oracle_max_combos),
+                "--output", str(paths["oracle"]),
+            ])
+        bakeoff_cmd = [
+            sys.executable,
+            "-m",
+            "quantization.dynaquant.bakeoff",
+            "--calibration", str(paths["calibration"]),
+            "--candidate", "refined",
+            "--refined", str(paths["refined"]),
+            "--output", str(paths["decision"]),
+        ]
+        if not args.skip_oracle:
+            bakeoff_cmd.extend(["--oracle", str(paths["oracle"])])
+        commands.append(bakeoff_cmd)
+    return paths_by_target, commands
 
 
 def main():
@@ -150,8 +174,14 @@ def main():
     ap.add_argument("--activation-cache-dir", default=DEFAULT_ACT_CACHE)
     ap.add_argument("--formats", default="NVFP4,MXFP8,BF16")
     ap.add_argument("--target-bits", type=float, default=4.8)
+    ap.add_argument("--target-band", type=float, default=0.0,
+                    help="If > 0, also run target_bits ± target_band")
+    ap.add_argument("--target-grid", default="",
+                    help="Explicit comma-separated target list; overrides --target-band")
     ap.add_argument("--top-units", type=int, default=6)
+    ap.add_argument("--unit-scope", choices=["sibling", "block", "hybrid"], default="sibling")
     ap.add_argument("--neighbor-radius", type=int, default=1)
+    ap.add_argument("--refine-rounds", type=int, default=2)
     ap.add_argument("--n-calib-samples", type=int, default=2)
     ap.add_argument("--calib-seqlen", type=int, default=64)
     ap.add_argument("--device", default="cuda")
@@ -163,7 +193,7 @@ def main():
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    paths, commands = build_bakeoff_commands(args)
+    paths_by_target, commands = build_bakeoff_commands(args)
     cwd = os.getcwd()
     for cmd in commands:
         _run(cmd, cwd, args.dry_run)
@@ -171,10 +201,33 @@ def main():
     if args.dry_run:
         summary = {
             "output_dir": str(out_dir),
-            "paths": {k: str(v) for k, v in paths.items()},
+            "targets": {
+                tgt: {k: str(v) for k, v in paths.items()}
+                for tgt, paths in paths_by_target.items()
+            },
             "oracle_enabled": not args.skip_oracle,
         }
         print(json.dumps(summary, indent=2))
+    elif len(paths_by_target) > 1:
+        scoreboard = []
+        for tgt, paths in paths_by_target.items():
+            if not paths["decision"].exists():
+                continue
+            with open(paths["decision"]) as f:
+                decision = json.load(f)
+            scoreboard.append({
+                "target_bits": float(tgt),
+                "candidate_bits": decision["candidate"]["bits"],
+                "candidate_kl": decision["candidate"]["kl"],
+                "delta_kl_vs_baseline": decision["delta_kl_vs_baseline"],
+                "oracle_gap_abs": decision.get("oracle_gap_abs"),
+                "decision": decision["decision"],
+            })
+        scoreboard.sort(key=lambda row: (row["candidate_kl"], row["candidate_bits"]))
+        summary_path = out_dir / "scoreboard.json"
+        with open(summary_path, "w") as f:
+            json.dump(scoreboard, f, indent=2)
+        print(json.dumps(scoreboard, indent=2))
 
 
 if __name__ == "__main__":

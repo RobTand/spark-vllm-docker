@@ -53,6 +53,56 @@ def _measure_entry(W: torch.Tensor, X: torch.Tensor, spec: fr.FormatSpec, w_clip
     }
 
 
+def _candidate_clip_values(best: float, step: float) -> list[float]:
+    vals = {
+        1.0,
+        max(0.5, min(1.0, best)),
+        max(0.5, min(1.0, best - step)),
+        max(0.5, min(1.0, best + step)),
+    }
+    return sorted(vals, reverse=True)
+
+
+def _refine_measurement(
+    W: torch.Tensor,
+    X: torch.Tensor,
+    spec: fr.FormatSpec,
+    w_grid: list[float],
+    a_grid: list[float],
+    rounds: int,
+):
+    best = None
+    for w_clip in w_grid:
+        for a_clip in a_grid:
+            try:
+                entry = _measure_entry(W, X, spec, w_clip, a_clip)
+            except Exception as exc:
+                entry = {"error": str(exc), "weight_clip": w_clip, "act_clip": a_clip}
+            if "error" in entry:
+                continue
+            if best is None or entry["output_mse"] < best["output_mse"]:
+                best = entry
+    if best is None:
+        return None
+
+    step = 0.02
+    for _ in range(max(rounds, 0)):
+        improved = False
+        for w_clip in _candidate_clip_values(best["weight_clip"], step):
+            for a_clip in _candidate_clip_values(best["act_clip"], step):
+                try:
+                    entry = _measure_entry(W, X, spec, w_clip, a_clip)
+                except Exception:
+                    continue
+                if entry["output_mse"] + 1e-12 < best["output_mse"]:
+                    best = entry
+                    improved = True
+        step *= 0.5
+        if not improved:
+            continue
+    return best
+
+
 def expand_live_target_layers(critical_units, stats_alloc: dict) -> set[str]:
     target_layers = set()
     for unit in critical_units:
@@ -74,8 +124,10 @@ def main():
     ap.add_argument("--formats", required=True)
     ap.add_argument("--target-bits", type=float, required=True)
     ap.add_argument("--top-units", type=int, default=8)
+    ap.add_argument("--unit-scope", choices=["sibling", "block", "hybrid"], default="sibling")
     ap.add_argument("--w-clip-grid", default="1.0,0.995,0.99,0.98,0.95,0.9")
     ap.add_argument("--a-clip-grid", default="1.0,0.995,0.99,0.98,0.95,0.9")
+    ap.add_argument("--refine-rounds", type=int, default=2)
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     ap.add_argument("--expert-granularity", choices=["layer", "expert"], default="layer")
@@ -93,7 +145,7 @@ def main():
     if assignment is None:
         raise SystemExit("no feasible assignment at requested target")
     assignment = promote_fused(assignment, format_rank)
-    units = build_refinement_units(stats_alloc, candidates, assignment)
+    units = build_refinement_units(stats_alloc, candidates, assignment, unit_scope=args.unit_scope)
     critical = select_critical_units(units, args.top_units)
     target_layers = expand_live_target_layers(critical, stats_alloc)
 
@@ -122,17 +174,7 @@ def main():
         for spec in specs_sorted:
             if spec.name not in raw_costs.get(layer_name, {}):
                 continue
-            best = None
-            for w_clip in w_grid:
-                for a_clip in a_grid:
-                    try:
-                        entry = _measure_entry(W, X, spec, w_clip, a_clip)
-                    except Exception as exc:
-                        entry = {"error": str(exc), "weight_clip": w_clip, "act_clip": a_clip}
-                    if "error" in entry:
-                        continue
-                    if best is None or entry["output_mse"] < best["output_mse"]:
-                        best = entry
+            best = _refine_measurement(W, X, spec, w_grid, a_grid, args.refine_rounds)
             if best is not None:
                 best["source"] = "local_reconstruct"
                 per_fmt[spec.name] = best
@@ -152,8 +194,10 @@ def main():
         "target_bits": args.target_bits,
         "top_units": args.top_units,
         "formats": fmt_names,
+        "unit_scope": args.unit_scope,
         "w_clip_grid": w_grid,
         "a_clip_grid": a_grid,
+        "refine_rounds": args.refine_rounds,
         "layers_refined": sorted(upgraded),
     }
     cost_blob["meta"] = meta

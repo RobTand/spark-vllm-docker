@@ -37,21 +37,54 @@ class RefinementUnit:
         return {opt.fmt: opt for opt in self.options}
 
 
-def _unit_groups(names: list[str]) -> list[tuple[str, ...]]:
+def _block_group_for_name(name: str, present: set[str]) -> tuple[str, ...] | None:
+    parts = name.split(".")
+    if len(parts) < 5 or parts[0] != "model" or parts[1] != "layers":
+        return None
+    prefix = ".".join(parts[:3])
+    leaf = parts[-1]
+    if parts[3] == "self_attn" and leaf in {"q_proj", "k_proj", "v_proj", "o_proj"}:
+        members = tuple(
+            sorted(
+                f"{prefix}.self_attn.{proj}"
+                for proj in ("q_proj", "k_proj", "v_proj", "o_proj")
+                if f"{prefix}.self_attn.{proj}" in present
+            )
+        )
+        return members if len(members) > 1 else None
+    if parts[3] == "mlp" and leaf in {"gate_proj", "up_proj", "down_proj"}:
+        members = tuple(
+            sorted(
+                f"{prefix}.mlp.{proj}"
+                for proj in ("gate_proj", "up_proj", "down_proj")
+                if f"{prefix}.mlp.{proj}" in present
+            )
+        )
+        return members if len(members) > 1 else None
+    return None
+
+
+def _unit_groups(names: list[str], unit_scope: str = "sibling") -> list[tuple[str, ...]]:
     present = set(names)
     groups = {}
     for name in names:
         if ".__fused__." in name:
             key = (name,)
         else:
-            sib = fused_siblings(name)
-            if sib is not None:
-                siblings, _kind = sib
-                key = tuple(sorted(m for m in siblings if m in present))
-                if len(key) <= 1:
-                    key = (name,)
-            else:
+            key = None
+            if unit_scope in {"block", "hybrid"}:
+                key = _block_group_for_name(name, present)
+            if key is None:
+                sib = fused_siblings(name)
+                if sib is not None:
+                    siblings, _kind = sib
+                    key = tuple(sorted(m for m in siblings if m in present))
+                    if len(key) <= 1:
+                        key = None
+            if key is None:
                 key = (name,)
+            else:
+                key = tuple(sorted(set(key)))
         groups[key] = tuple(sorted(set(key)))
     return sorted(groups.values())
 
@@ -60,9 +93,10 @@ def build_refinement_units(
     stats: dict,
     candidates: dict[str, list[Candidate]],
     assignment: dict[str, str],
+    unit_scope: str = "sibling",
 ) -> list[RefinementUnit]:
     units = []
-    for members in _unit_groups(list(assignment.keys())):
+    for members in _unit_groups(list(assignment.keys()), unit_scope=unit_scope):
         base_fmts = {assignment[m] for m in members}
         if len(base_fmts) != 1:
             # The additive allocator should already have promoted fused siblings

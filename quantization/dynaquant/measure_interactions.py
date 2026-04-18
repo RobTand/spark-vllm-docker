@@ -101,6 +101,7 @@ def main():
     ap.add_argument("--formats", required=True)
     ap.add_argument("--target-bits", type=float, required=True)
     ap.add_argument("--top-units", type=int, default=16)
+    ap.add_argument("--unit-scope", choices=["sibling", "block", "hybrid"], default="sibling")
     ap.add_argument("--neighbor-radius", type=int, default=1)
     ap.add_argument("--n-calib-samples", type=int, default=4)
     ap.add_argument("--calib-seqlen", type=int, default=128)
@@ -130,7 +131,7 @@ def main():
         assignment = promote_fused(assignment, format_rank)
 
     achieved_bits, _ = compute_achieved(stats_alloc, assignment, format_specs)
-    units = build_refinement_units(stats_alloc, candidates, assignment)
+    units = build_refinement_units(stats_alloc, candidates, assignment, unit_scope=args.unit_scope)
     selected_units = select_critical_units(units, args.top_units)
     allowed = {unit.key: neighborhood_options(unit, args.neighbor_radius) for unit in selected_units}
 
@@ -296,6 +297,7 @@ def main():
                 }
                 for unit in selected_units
             ],
+            "unit_scope": args.unit_scope,
             "unary": unary,
             "pairwise": [
                 {

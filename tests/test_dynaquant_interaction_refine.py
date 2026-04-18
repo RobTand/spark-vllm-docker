@@ -136,6 +136,26 @@ class TestInteractionRefine(unittest.TestCase):
             },
         )
 
+    def test_build_refinement_units_block_scope_groups_attention_block(self):
+        stats = {
+            f"model.layers.0.self_attn.{name}": {"n_params": 8, "out_features": 4, "in_features": 2}
+            for name in ("q_proj", "k_proj", "v_proj", "o_proj")
+        }
+        candidates = {
+            name: [
+                Candidate("NVFP4", 4.5, 0, 10.0),
+                Candidate("MXFP8", 8.25, 0, 1.0),
+            ]
+            for name in stats
+        }
+        assignment = {name: "NVFP4" for name in stats}
+        units = build_refinement_units(stats, candidates, assignment, unit_scope="block")
+        self.assertEqual(len(units), 1)
+        self.assertEqual(
+            units[0].members,
+            tuple(sorted(stats.keys())),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
