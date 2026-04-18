@@ -155,6 +155,7 @@ def _stage_text_only(model_path: str) -> str:
 def _load_live_model(model_path: str, device: str, dtype: torch.dtype,
                      unfuse_moe: bool = True) -> nn.Module:
     from transformers import AutoModelForCausalLM
+    from .sensitivity_probe import prepare_model_for_moe_linears
 
     staged = _stage_text_only(model_path)
     model = AutoModelForCausalLM.from_pretrained(
@@ -167,18 +168,7 @@ def _load_live_model(model_path: str, device: str, dtype: torch.dtype,
 
     if unfuse_moe:
         try:
-            from auto_round.modeling.fused_moe import prepare_model_for_moe_quantization
-            prepare_model_for_moe_quantization(model)
-            # unfused linears land on CPU by default — push to target device
-            target_dev = None
-            for p in model.parameters():
-                if p.device.type != "cpu":
-                    target_dev = p.device
-                    break
-            if target_dev is not None:
-                for sub in model.modules():
-                    if isinstance(sub, nn.Linear) and sub.weight.device != target_dev:
-                        sub.to(target_dev)
+            prepare_model_for_moe_linears(model)
         except ImportError:
             pass
 

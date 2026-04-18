@@ -1,10 +1,12 @@
 import unittest
 
 import torch
+import torch.nn as nn
 
 from quantization.dynaquant import format_registry as fr
 from quantization.dynaquant.allocator import build_candidates
 from quantization.dynaquant.calibrate_allocator import install_activation_hooks, select_targets
+from quantization.dynaquant.sensitivity_probe import discover_moe_structure
 
 
 class TestDynaQuantFormatRegistry(unittest.TestCase):
@@ -116,6 +118,41 @@ class TestCalibrationHooks(unittest.TestCase):
             capture.remove()
             for handle in handles:
                 handle.remove()
+
+
+class _ToyExpertsLinearLoop(nn.Module):
+    def __init__(self, num_experts=3, hidden=4, intermediate=6):
+        super().__init__()
+        self.gate_up_proj = nn.ModuleList(
+            [nn.Linear(hidden, 2 * intermediate, bias=False) for _ in range(num_experts)]
+        )
+        self.down_proj = nn.ModuleList(
+            [nn.Linear(intermediate, hidden, bias=False) for _ in range(num_experts)]
+        )
+
+
+class _ToyMoeBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gate = nn.Linear(4, 3, bias=False)
+        self.experts = _ToyExpertsLinearLoop()
+
+
+class _ToyModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList([nn.Module()])
+        self.model.layers[0].mlp = _ToyMoeBlock()
+
+
+class TestMoeDiscovery(unittest.TestCase):
+    def test_discover_moe_structure_handles_linear_loop_projection_lists(self):
+        toy = _ToyModel()
+        info = discover_moe_structure(toy)
+        self.assertEqual(info["model.layers.0.mlp.experts.gate_up_proj.0"], ("model.layers.0.mlp.gate", "0"))
+        self.assertEqual(info["model.layers.0.mlp.experts.down_proj.2"], ("model.layers.0.mlp.gate", "2"))
+        self.assertEqual(len(info), 6)
 
 
 if __name__ == "__main__":

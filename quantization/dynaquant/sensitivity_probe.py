@@ -81,6 +81,72 @@ def stage_text_only(model_path: str) -> str:
     return str(staged)
 
 
+def prepare_model_for_moe_linears(model: nn.Module) -> str | None:
+    """Unfuse supported packed MoE expert tensors into per-expert nn.Linear.
+
+    Returns the target device string used for the unfused linears when any
+    change was made, else None.
+
+    This prefers AutoRound's public helper, but falls back to the lower-level
+    expert-interface unfuser with `check_decorator=False` for model families
+    like Qwen3.6 whose experts implement the same packed shape conventions
+    yet do not pass the public decorator gate cleanly.
+    """
+    try:
+        from auto_round.modeling.fused_moe import prepare_model_for_moe_quantization
+        from auto_round.modeling.fused_moe.moe_experts_interface import (
+            LINEAR_LOOP_IMPL,
+            _unfuse_experts_weights_inplace,
+            register_linear_loop_experts,
+        )
+    except ImportError:
+        return None
+
+    target_dev = None
+    for p in model.parameters():
+        target_dev = p.device
+        if p.device.type != "cpu":
+            break
+    if target_dev is None:
+        target_dev = torch.device("cpu")
+
+    unfused_modules: list[str] = []
+    try:
+        unfused_modules = prepare_model_for_moe_quantization(model) or []
+    except Exception:
+        unfused_modules = []
+
+    # Fallback: forcibly unfuse any experts module carrying packed 3D
+    # parameters (e.g. Qwen3.6's gate_up_proj/down_proj) even when the
+    # public helper declines due to decorator checks.
+    forced_modules: list[str] = []
+    if not unfused_modules:
+        try:
+            register_linear_loop_experts()
+        except Exception:
+            pass
+        for name, module in model.named_modules():
+            try:
+                changed = _unfuse_experts_weights_inplace(module, check_decorator=False)
+            except Exception:
+                changed = False
+            if changed:
+                forced_modules.append(name)
+        unfused_modules = forced_modules
+
+    if not unfused_modules:
+        return None
+
+    if hasattr(model, "config"):
+        model.config._experts_implementation = LINEAR_LOOP_IMPL
+
+    for sub in model.modules():
+        if isinstance(sub, nn.Linear) and sub.weight.device != target_dev:
+            sub.to(target_dev)
+
+    return str(target_dev)
+
+
 # ---------------------------------------------------------------------------
 # Model-agnostic MoE discovery
 # ---------------------------------------------------------------------------
@@ -114,17 +180,41 @@ def discover_moe_structure(model: nn.Module) -> dict[str, tuple[str, str]]:
                 [k for k in child_dict if k.isdigit()],
                 key=int,
             )
-            if not numeric_keys:
+            if numeric_keys:
+                # Require the numeric children to be 0..N-1 (no gaps)
+                if [int(k) for k in numeric_keys] != list(range(len(numeric_keys))):
+                    continue
+                if not all(isinstance(child_dict[k], nn.Module) for k in numeric_keys):
+                    continue
+                candidates.append((attr, experts_container, "nested", numeric_keys))
                 continue
-            # Require the numeric children to be 0..N-1 (no gaps)
-            if [int(k) for k in numeric_keys] != list(range(len(numeric_keys))):
-                continue
-            if not all(isinstance(child_dict[k], nn.Module) for k in numeric_keys):
-                continue
-            candidates.append((attr, experts_container, numeric_keys))
+
+            # Linear-loop layout after MoE unfuse: experts container itself
+            # remains a module, but its packed projections become ModuleLists:
+            #   experts.gate_up_proj.<expert_idx>
+            #   experts.down_proj.<expert_idx>
+            projection_lists = {}
+            for proj_name in ("gate_up_proj", "down_proj", "w1", "w2", "w3"):
+                proj = getattr(experts_container, proj_name, None)
+                if proj is None or not isinstance(proj, nn.Module):
+                    continue
+                proj_children = dict(proj.named_children())
+                proj_numeric = sorted([k for k in proj_children if k.isdigit()], key=int)
+                if not proj_numeric:
+                    continue
+                if [int(k) for k in proj_numeric] != list(range(len(proj_numeric))):
+                    continue
+                if not all(isinstance(proj_children[k], nn.Module) for k in proj_numeric):
+                    continue
+                projection_lists[proj_name] = proj_numeric
+            if projection_lists:
+                # Require a consistent expert count across projections.
+                expert_lists = list(projection_lists.values())
+                if all(v == expert_lists[0] for v in expert_lists[1:]):
+                    candidates.append((attr, experts_container, "linear_loop", expert_lists[0]))
         if not candidates:
             continue
-        attr_name, experts_container, numeric_keys = candidates[0]
+        attr_name, experts_container, layout, numeric_keys = candidates[0]
         num_experts = len(numeric_keys)
 
         # Find sibling Linear (or any module whose output feature dim
@@ -142,13 +232,26 @@ def discover_moe_structure(model: nn.Module) -> dict[str, tuple[str, str]]:
 
         experts_root = (f"{parent_qname}.{attr_name}"
                         if parent_qname else attr_name)
-        for eid_str in numeric_keys:
-            expert_mod = child_dict[eid_str]
-            for sub_name, sub_mod in expert_mod.named_modules():
-                if not isinstance(sub_mod, nn.Linear) or sub_name == "":
+        if layout == "nested":
+            for eid_str in numeric_keys:
+                expert_mod = child_dict[eid_str]
+                for sub_name, sub_mod in expert_mod.named_modules():
+                    if not isinstance(sub_mod, nn.Linear) or sub_name == "":
+                        continue
+                    leaf = f"{experts_root}.{eid_str}.{sub_name}"
+                    expert_info[leaf] = (router_qname, eid_str)
+        else:
+            for proj_name in ("gate_up_proj", "down_proj", "w1", "w2", "w3"):
+                proj = getattr(experts_container, proj_name, None)
+                if proj is None or not isinstance(proj, nn.Module):
                     continue
-                leaf = f"{experts_root}.{eid_str}.{sub_name}"
-                expert_info[leaf] = (router_qname, eid_str)
+                proj_children = dict(proj.named_children())
+                for eid_str in numeric_keys:
+                    sub_mod = proj_children.get(eid_str)
+                    if not isinstance(sub_mod, nn.Linear):
+                        continue
+                    leaf = f"{experts_root}.{proj_name}.{eid_str}"
+                    expert_info[leaf] = (router_qname, eid_str)
 
     return expert_info
 
@@ -533,23 +636,13 @@ def main():
     # models without a hard AutoRound dependency.
     if args.unfuse_moe:
         try:
-            from auto_round.modeling.fused_moe import prepare_model_for_moe_quantization
-            prepare_model_for_moe_quantization(model)
-            # The unfuser creates new nn.Linear modules on CPU by default,
-            # leaving the rest of the model on its original device. Move
-            # the new modules back to the correct device.
-            target_dev = None
-            for p in model.parameters():
-                target_dev = p.device
-                if p.device.type != "cpu":
-                    break
-            if target_dev is not None and target_dev.type != "cpu":
-                for name, sub in model.named_modules():
-                    if isinstance(sub, nn.Linear):
-                        if sub.weight.device != target_dev:
-                            sub.to(target_dev)
-            print(f"[probe] unfused MoE experts via AutoRound "
-                  f"(all on {target_dev})", flush=True)
+            target_dev = prepare_model_for_moe_linears(model)
+            if target_dev is not None:
+                print(f"[probe] unfused MoE experts into per-expert linears "
+                      f"(all on {target_dev})", flush=True)
+            else:
+                print("[probe] MoE unfuse made no changes; continuing with "
+                      "packed experts.", flush=True)
         except ImportError:
             print("[probe] AutoRound not available; skipping MoE unfuse. "
                   "Per-expert sensitivity will not be measured.", flush=True)
