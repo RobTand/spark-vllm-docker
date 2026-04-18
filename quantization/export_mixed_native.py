@@ -33,18 +33,6 @@ from typing import Iterable
 import torch
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
-from compressed_tensors.offload import dispatch_model
-from compressed_tensors.quantization.quant_scheme import (
-    FP8,
-    FP8_DYNAMIC,
-    MXFP4,
-    MXFP4A16,
-    MXFP8,
-    MXFP8A16,
-    NVFP4,
-    NVFP4A16,
-)
 from llmcompressor import oneshot
 from llmcompressor.modifiers.quantization import QuantizationModifier
 
@@ -81,6 +69,129 @@ FORMAT_RANK = {
     "MXFP8": 2,
     "FP8": 3,
     "BF16": 4,
+}
+
+NVFP4_SCHEME = {
+    "weights": {
+        "num_bits": 4,
+        "type": "float",
+        "strategy": "tensor_group",
+        "group_size": 16,
+        "symmetric": True,
+        "scale_dtype": "torch.float8_e4m3fn",
+        "observer": "memoryless_minmax",
+    },
+    "input_activations": {
+        "num_bits": 4,
+        "type": "float",
+        "strategy": "tensor_group",
+        "group_size": 16,
+        "symmetric": True,
+        "dynamic": "local",
+        "observer": "static_minmax",
+        "scale_dtype": "torch.float8_e4m3fn",
+    },
+}
+
+MXFP4_SCHEME = {
+    "weights": {
+        "num_bits": 4,
+        "type": "float",
+        "strategy": "group",
+        "group_size": 32,
+        "symmetric": True,
+        "scale_dtype": "torch.uint8",
+        "observer": "memoryless_minmax",
+    },
+    "input_activations": {
+        "num_bits": 4,
+        "type": "float",
+        "strategy": "group",
+        "group_size": 32,
+        "symmetric": True,
+        "dynamic": True,
+        "scale_dtype": "torch.uint8",
+    },
+}
+
+MXFP4A16_SCHEME = {
+    "weights": {
+        "num_bits": 4,
+        "type": "float",
+        "strategy": "group",
+        "group_size": 32,
+        "symmetric": True,
+        "scale_dtype": "torch.uint8",
+        "observer": "memoryless_minmax",
+    },
+}
+
+MXFP8_SCHEME = {
+    "weights": {
+        "num_bits": 8,
+        "type": "float",
+        "strategy": "group",
+        "group_size": 32,
+        "symmetric": True,
+        "scale_dtype": "torch.uint8",
+        "observer": "memoryless_minmax",
+    },
+    "input_activations": {
+        "num_bits": 8,
+        "type": "float",
+        "strategy": "group",
+        "group_size": 32,
+        "symmetric": True,
+        "dynamic": True,
+        "scale_dtype": "torch.uint8",
+    },
+}
+
+MXFP8A16_SCHEME = {
+    "weights": {
+        "num_bits": 8,
+        "type": "float",
+        "strategy": "group",
+        "group_size": 32,
+        "symmetric": True,
+        "scale_dtype": "torch.uint8",
+        "observer": "memoryless_minmax",
+    },
+}
+
+FP8_TENSOR_SCHEME = {
+    "weights": {
+        "num_bits": 8,
+        "type": "float",
+        "strategy": "tensor",
+        "symmetric": True,
+        "observer": "memoryless_minmax",
+    },
+    "input_activations": {
+        "num_bits": 8,
+        "type": "float",
+        "strategy": "tensor",
+        "symmetric": True,
+        "dynamic": False,
+        "observer": "memoryless_minmax",
+    },
+}
+
+FP8_DYNAMIC_SCHEME = {
+    "weights": {
+        "num_bits": 8,
+        "type": "float",
+        "strategy": "channel",
+        "symmetric": True,
+        "observer": "memoryless_minmax",
+    },
+    "input_activations": {
+        "num_bits": 8,
+        "type": "float",
+        "strategy": "token",
+        "symmetric": True,
+        "dynamic": True,
+    },
 }
 
 
@@ -223,13 +334,13 @@ def resolve_assignment(
 
 def scheme_for_format(fmt: str, *, mxfp8_flavor: str, fp8_flavor: str):
     if fmt == "NVFP4":
-        return deepcopy(NVFP4)
+        return deepcopy(NVFP4_SCHEME)
     if fmt == "MXFP4":
-        return deepcopy(MXFP4)
+        return deepcopy(MXFP4_SCHEME if mxfp8_flavor == "W8A8" else MXFP4A16_SCHEME)
     if fmt == "MXFP8":
-        return deepcopy(MXFP8 if mxfp8_flavor == "W8A8" else MXFP8A16)
+        return deepcopy(MXFP8_SCHEME if mxfp8_flavor == "W8A8" else MXFP8A16_SCHEME)
     if fmt == "FP8":
-        return deepcopy(FP8_DYNAMIC if fp8_flavor == "dynamic" else FP8)
+        return deepcopy(FP8_DYNAMIC_SCHEME if fp8_flavor == "dynamic" else FP8_TENSOR_SCHEME)
     raise ValueError(f"no export scheme for format {fmt}")
 
 
@@ -447,10 +558,15 @@ def main():
             print("[export] output groups:", list(qconfig.get("config_groups", {}).keys()), flush=True)
 
         print("[export] sample generation...", flush=True)
-        dispatch_model(model)
-        input_ids = tokenizer("Hello my name is", return_tensors="pt").input_ids.to(model.device)
-        output = model.generate(input_ids, max_new_tokens=16)
-        print(tokenizer.decode(output[0]), flush=True)
+        try:
+            from compressed_tensors.offload import dispatch_model
+
+            dispatch_model(model)
+            input_ids = tokenizer("Hello my name is", return_tensors="pt").input_ids.to(model.device)
+            output = model.generate(input_ids, max_new_tokens=16)
+            print(tokenizer.decode(output[0]), flush=True)
+        except Exception as exc:
+            print(f"[export] sample generation skipped: {exc!r}", flush=True)
         print(f"[export] done. Serve with: vllm serve {args.output} --quantization compressed-tensors", flush=True)
     finally:
         if cleanup:
