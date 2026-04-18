@@ -150,7 +150,7 @@ def main():
             enumerate_feasible_choices(
                 units,
                 allowed,
-                float(payload["target_total_bits"]),
+                max(float(payload["target_total_bits"]), float(payload.get("base_total_bits", 0.0))),
                 float(payload["fixed_bits_total"]),
             ),
             start=1,

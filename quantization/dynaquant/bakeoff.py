@@ -67,8 +67,9 @@ def _summarize(candidate: Point, baseline: Point, oracle: Point | None):
     }
     if oracle is not None:
         out["oracle"] = oracle.__dict__
-        out["oracle_gap_abs"] = candidate.kl - oracle.kl
-        out["oracle_gap_rel"] = (candidate.kl - oracle.kl) / max(abs(oracle.kl), 1e-12)
+        out["oracle_gap_signed"] = candidate.kl - oracle.kl
+        out["oracle_gap_abs"] = abs(candidate.kl - oracle.kl)
+        out["oracle_gap_rel"] = abs(candidate.kl - oracle.kl) / max(abs(oracle.kl), 1e-12)
     return out
 
 

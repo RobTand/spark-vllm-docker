@@ -65,6 +65,7 @@ class TestBakeoff(unittest.TestCase):
             self.assertAlmostEqual(refined_point.kl, 0.07)
             self.assertAlmostEqual(oracle_point.kl, 0.06)
             self.assertAlmostEqual(summary["oracle_gap_abs"], 0.01)
+            self.assertAlmostEqual(summary["oracle_gap_signed"], 0.01)
 
     def test_load_refined_point_prefers_calibrated_estimate(self):
         refined = {
