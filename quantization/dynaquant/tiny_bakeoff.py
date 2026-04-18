@@ -186,7 +186,7 @@ def main():
     ap.add_argument("--target-grid", default="",
                     help="Explicit comma-separated target list; overrides --target-band")
     ap.add_argument("--top-units", type=int, default=6)
-    ap.add_argument("--unit-scope", choices=["sibling", "block", "hybrid"], default="sibling")
+    ap.add_argument("--unit-scope", choices=["sibling", "block", "hybrid", "layer"], default="sibling")
     ap.add_argument("--neighbor-radius", type=int, default=1)
     ap.add_argument("--refine-rounds", type=int, default=2)
     ap.add_argument("--rowwise-topk", type=int, default=8)

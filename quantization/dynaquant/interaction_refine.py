@@ -64,6 +64,15 @@ def _block_group_for_name(name: str, present: set[str]) -> tuple[str, ...] | Non
     return None
 
 
+def _layer_group_for_name(name: str, present: set[str]) -> tuple[str, ...] | None:
+    parts = name.split(".")
+    if len(parts) < 5 or parts[0] != "model" or parts[1] != "layers":
+        return None
+    prefix = ".".join(parts[:3]) + "."
+    members = tuple(sorted(n for n in present if n.startswith(prefix)))
+    return members if len(members) > 1 else None
+
+
 def _unit_groups(names: list[str], unit_scope: str = "sibling") -> list[tuple[str, ...]]:
     present = set(names)
     groups = {}
@@ -72,8 +81,12 @@ def _unit_groups(names: list[str], unit_scope: str = "sibling") -> list[tuple[st
             key = (name,)
         else:
             key = None
+            if unit_scope == "layer":
+                key = _layer_group_for_name(name, present)
             if unit_scope in {"block", "hybrid"}:
                 key = _block_group_for_name(name, present)
+            if unit_scope == "layer" and key is None:
+                key = _layer_group_for_name(name, present)
             if key is None:
                 sib = fused_siblings(name)
                 if sib is not None:

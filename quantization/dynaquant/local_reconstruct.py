@@ -414,7 +414,7 @@ def main():
     ap.add_argument("--formats", required=True)
     ap.add_argument("--target-bits", type=float, required=True)
     ap.add_argument("--top-units", type=int, default=8)
-    ap.add_argument("--unit-scope", choices=["sibling", "block", "hybrid"], default="sibling")
+    ap.add_argument("--unit-scope", choices=["sibling", "block", "hybrid", "layer"], default="sibling")
     ap.add_argument("--w-clip-grid", default="1.0,0.995,0.99,0.98,0.95,0.9")
     ap.add_argument("--a-clip-grid", default="1.0,0.995,0.99,0.98,0.95,0.9")
     ap.add_argument("--refine-rounds", type=int, default=2)

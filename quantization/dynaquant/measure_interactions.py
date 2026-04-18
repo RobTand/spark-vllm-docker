@@ -101,7 +101,7 @@ def main():
     ap.add_argument("--formats", required=True)
     ap.add_argument("--target-bits", type=float, required=True)
     ap.add_argument("--top-units", type=int, default=16)
-    ap.add_argument("--unit-scope", choices=["sibling", "block", "hybrid"], default="sibling")
+    ap.add_argument("--unit-scope", choices=["sibling", "block", "hybrid", "layer"], default="sibling")
     ap.add_argument("--neighbor-radius", type=int, default=1)
     ap.add_argument("--n-calib-samples", type=int, default=4)
     ap.add_argument("--calib-seqlen", type=int, default=128)
