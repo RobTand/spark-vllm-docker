@@ -53,6 +53,18 @@ def _measure_entry(W: torch.Tensor, X: torch.Tensor, spec: fr.FormatSpec, w_clip
     }
 
 
+def expand_live_target_layers(critical_units, stats_alloc: dict) -> set[str]:
+    target_layers = set()
+    for unit in critical_units:
+        for member in unit.members:
+            fused_members = stats_alloc.get(member, {}).get("_fused_members")
+            if fused_members:
+                target_layers.update(fused_members)
+            else:
+                target_layers.add(member)
+    return target_layers
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -83,7 +95,7 @@ def main():
     assignment = promote_fused(assignment, format_rank)
     units = build_refinement_units(stats_alloc, candidates, assignment)
     critical = select_critical_units(units, args.top_units)
-    target_layers = {member for unit in critical for member in unit.members}
+    target_layers = expand_live_target_layers(critical, stats_alloc)
 
     with open(args.costs, "rb") as f:
         cost_blob = pickle.load(f)

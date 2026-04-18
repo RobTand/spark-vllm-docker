@@ -8,6 +8,7 @@ from quantization.dynaquant.interaction_refine import (
     select_critical_units,
     sparse_local_refine,
 )
+from quantization.dynaquant.local_reconstruct import expand_live_target_layers
 
 
 class TestInteractionRefine(unittest.TestCase):
@@ -102,6 +103,38 @@ class TestInteractionRefine(unittest.TestCase):
         expanded = expand_unit_assignment(units, choice)
         self.assertEqual(expanded["model.layers.0.mlp.gate_proj"], "MXFP8")
         self.assertEqual(expanded["model.layers.0.mlp.up_proj"], "MXFP8")
+
+    def test_expand_live_target_layers_unrolls_fused_moe_members(self):
+        stats = {
+            "model.layers.0.mlp.experts.__fused__.gate_proj": {
+                "n_params": 8,
+                "out_features": 4,
+                "in_features": 2,
+                "_fused_members": (
+                    "model.layers.0.mlp.experts.0.gate_proj",
+                    "model.layers.0.mlp.experts.1.gate_proj",
+                ),
+            }
+        }
+        candidates = {
+            "model.layers.0.mlp.experts.__fused__.gate_proj": [
+                Candidate("NVFP4", 4.5, 0, 10.0),
+                Candidate("MXFP8", 8.25, 0, 1.0),
+            ]
+        }
+        units = build_refinement_units(
+            stats,
+            candidates,
+            {"model.layers.0.mlp.experts.__fused__.gate_proj": "NVFP4"},
+        )
+        expanded = expand_live_target_layers(units, stats)
+        self.assertEqual(
+            expanded,
+            {
+                "model.layers.0.mlp.experts.0.gate_proj",
+                "model.layers.0.mlp.experts.1.gate_proj",
+            },
+        )
 
 
 if __name__ == "__main__":

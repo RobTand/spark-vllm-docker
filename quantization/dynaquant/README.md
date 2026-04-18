@@ -1,8 +1,7 @@
-# DynaQuant — mixed-precision quantization allocator for LLMs
+# DynaQuant — interaction-aware mixed-native quantization allocator for LLMs
 
-Model-agnostic, format-extensible, closed-loop-measured. Pairs naturally
-with [AutoRound](https://github.com/intel/auto-round) for the final
-calibrated quantization pass.
+Model-agnostic, format-extensible, closed-loop-measured. DynaQuant is the
+policy engine; export is a separate backend.
 
 ## Why?
 
@@ -19,10 +18,14 @@ proper multi-choice knapsack over them.
 
 ## Pipeline
 
-    1.  sensitivity_probe.py       per-Linear Fisher trace (route-aware)
-    2.  measure_quant_cost.py      per-(Linear, format) measured RTN error
-    3.  allocator.py               multi-choice knapsack → AutoRound config
-    4.  (external) auto-round --layer_config …   calibrated tuning
+    1.  sensitivity_probe.py           per-Linear Fisher trace (route-aware)
+    2.  measure_quant_cost.py          per-(Linear, format) measured functional cost
+    3.  local_reconstruct.py           optional elite-candidate local improvement
+    4.  allocator.py                   additive mixed-format frontier
+    5.  measure_interactions.py        sparse pairwise interaction probe near the knee
+    6.  quadratic_refine_allocator.py  interaction-aware local refinement
+    7.  calibrate_allocator.py         empirical KL calibration of frontier points
+    8.  export backend                 materialize the chosen native recipe
 
 ### 1. Sensitivity probe
 
@@ -44,9 +47,10 @@ Memory peak on 35B: ~90 GB (fits 128 GB unified). Runtime: ~5 min GPU,
 
 ### 2. Measure quantization cost
 
-For each tracked Linear and each registered format, apply RTN, measure
-`‖W·x - Ŵ·x‖²` on saved activations. Replaces analytical constants with
-measured quantities.
+For each tracked Linear and each registered format, apply the native
+weight/activation round-trip and measure the resulting output error on
+saved activations. Replaces analytical constants with measured
+quantities.
 
 ```
 python -m dynaquant.measure_quant_cost \
@@ -58,6 +62,22 @@ python -m dynaquant.measure_quant_cost \
 
 Memory: streams weights one at a time, < 5 GB overhead. Runtime: ~3 min
 GPU, ~15 min CPU.
+
+### 2.5. Improve elite candidates locally
+
+For a small set of frontier-critical layers, refine per-format costs by
+grid-searching simple symmetric clipping factors on weights and activations.
+This is intentionally slow but memory-safe because it operates one layer at a
+time.
+
+```
+python -m dynaquant.local_reconstruct \
+  --model $MODEL_PATH --probe probe.pkl --costs costs.pkl \
+  --activation-cache-dir ./act_cache \
+  --formats NVFP4,MXFP8,BF16 \
+  --target-bits 4.75 --top-units 8 \
+  --output costs_refined.pkl
+```
 
 ### 3. Allocate
 
@@ -80,19 +100,52 @@ Outputs:
 - `pareto.csv` — Δloss vs bits across budget sweep
 - Printed Kneedle knee suggestion
 
-### 4. AutoRound tuning
+### 4. Probe sparse interactions
 
-AutoRound respects our per-layer assignment and runs its calibrated
-signed-SGD tuning within each layer's scheme:
+Build the fast additive frontier first, then measure actual single-unit and
+pairwise KL deltas only for the most important units near the knee.
 
 ```
-python -m auto_round \
-  --model_name $MODEL_PATH \
-  --layer_config layer_config.json \
-  --iters 200 --nsamples 128 --seqlen 2048 \
-  --dataset ultrachat_200k \
-  --format llm_compressor --output_dir ./out \
-  --device_map cuda:0
+python -m dynaquant.measure_interactions \
+  --model $MODEL_PATH --probe probe.pkl --costs costs_refined.pkl \
+  --formats NVFP4,MXFP8,BF16 \
+  --target-bits 4.75 --top-units 16 --neighbor-radius 1 \
+  --output interactions.json
+```
+
+### 5. Refine the knee locally
+
+Use the sparse interaction terms to refine the additive assignment in the
+neighborhood of the knee without solving a dense quadratic program over the
+whole model.
+
+```
+python -m dynaquant.quadratic_refine_allocator \
+  --interactions interactions.json \
+  --output refined_recipe.json
+```
+
+### 6. Empirically calibrate the frontier
+
+Validate a few frontier points against actual KL so the predicted frontier can
+be trusted or corrected on the current model.
+
+```
+python -m dynaquant.calibrate_allocator \
+  --model $MODEL_PATH --probe probe.pkl --costs costs_refined.pkl \
+  --formats NVFP4,MXFP8,BF16 \
+  --selection baseline,knee,high \
+  --output calibration.json
+```
+
+### 7. Export backend
+
+Any exporter should consume the final native-format recipe after refinement.
+AutoRound can still be used as an export frontend when it is not also being
+asked to choose the recipe.
+
+```
+# backend-specific export step goes here
 ```
 
 ## Extending formats
@@ -187,14 +240,17 @@ output — no tuning constants, no assumption about weight distributions.
 
 ### What about inter-layer interactions?
 
-The multi-choice knapsack assumes per-layer costs are independent. This
-is the standard approximation for mixed-precision quantization and is
-well-supported empirically at typical bit budgets (4–6 bits avg).
-Cross-layer correlation terms would require pair-wise Hessian
-measurements, which is prohibitively expensive. AutoRound's block-wise
-calibration implicitly captures short-range interactions within each
-block (typically a transformer layer), so the combined pipeline handles
-this.
+The frontier builder remains additive because that is the only practical way
+to sweep the whole model cheaply. DynaQuant now addresses the missing
+cross-layer terms by:
+
+- measuring sparse pairwise interactions only for the most important units
+  near the knee
+- refining the knee locally with those terms
+- calibrating the refined frontier against actual KL
+
+This keeps memory bounded while still capturing the interaction structure that
+recent MPQ literature shows matters.
 
 ## Memory budget
 
