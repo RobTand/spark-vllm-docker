@@ -101,6 +101,8 @@ def build_bakeoff_commands(args) -> tuple[dict[str, Path], list[list[str]]]:
             "--rowwise-rounds", str(args.rowwise_rounds),
             "--groupwise-topk", str(args.groupwise_topk),
             "--groupwise-rounds", str(args.groupwise_rounds),
+            "--gptq-topk", str(args.gptq_topk),
+            "--gptq-damping", str(args.gptq_damping),
             "--output", str(paths["costs_refined"]),
         ])
         commands.append([
@@ -191,6 +193,8 @@ def main():
     ap.add_argument("--rowwise-rounds", type=int, default=1)
     ap.add_argument("--groupwise-topk", type=int, default=16)
     ap.add_argument("--groupwise-rounds", type=int, default=1)
+    ap.add_argument("--gptq-topk", type=int, default=8)
+    ap.add_argument("--gptq-damping", type=float, default=1e-4)
     ap.add_argument("--n-calib-samples", type=int, default=2)
     ap.add_argument("--calib-seqlen", type=int, default=64)
     ap.add_argument("--device", default="cuda")

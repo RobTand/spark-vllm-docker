@@ -219,6 +219,111 @@ def _groupwise_refine_weight_clip(
     return best_entry
 
 
+def _row_clip_for_weight_clip(weight_clip, row: int, groups: int):
+    if isinstance(weight_clip, torch.Tensor):
+        clip = weight_clip[row:row + 1]
+        if clip.ndim >= 2 and clip.shape[-1] == groups:
+            return clip.clone()
+        return clip.clone()
+    return float(weight_clip)
+
+
+def _quantize_row_with_clip(row_vec: torch.Tensor, spec: fr.FormatSpec, row_clip):
+    row_in = _sym_clip(row_vec.unsqueeze(0), row_clip, group_size=spec.group_size)
+    row_hat = spec.quantize_dequantize(row_in.clone())
+    return row_hat.squeeze(0)
+
+
+def _measure_with_quantized_weight(
+    W: torch.Tensor,
+    X: torch.Tensor,
+    spec: fr.FormatSpec,
+    weight_clip,
+    act_clip: float,
+    W_hat: torch.Tensor,
+):
+    X_in = _sym_clip(X, act_clip)
+    X_hat = spec.activation_quantize_dequantize(X_in.clone())
+    y_ref = X @ W.T
+    y_q = X_hat @ W_hat.T
+    out_err = (y_ref - y_q).float().pow(2)
+    weight_mse = float((W - W_hat).float().pow(2).mean().item())
+    output_mse = float(out_err.mean().item())
+    ref_energy = float(y_ref.float().pow(2).mean().item())
+    return {
+        "weight_mse": weight_mse,
+        "output_mse": output_mse,
+        "rel_output_mse": output_mse / max(ref_energy, 1e-12),
+        "weight_clip": weight_clip,
+        "act_clip": act_clip,
+        "per_output_mse": out_err.mean(dim=0).detach().cpu(),
+    }
+
+
+def _gptq_lite_quantize_row(
+    row_vec: torch.Tensor,
+    X_hat: torch.Tensor,
+    spec: fr.FormatSpec,
+    row_clip,
+    damping: float,
+):
+    n_in = row_vec.numel()
+    if spec.group_size <= 0 or n_in % spec.group_size != 0:
+        return _quantize_row_with_clip(row_vec, spec, row_clip)
+    H = (X_hat.float().T @ X_hat.float()) / max(int(X_hat.shape[0]), 1)
+    diag_mean = float(torch.diag(H).mean().item()) if H.numel() else 1.0
+    H = H + torch.eye(n_in, device=H.device, dtype=H.dtype) * max(damping * diag_mean, 1e-8)
+    row_work = row_vec.float().clone()
+    q_row = torch.empty_like(row_work)
+    group = spec.group_size
+    groups = n_in // group
+    for g in range(groups):
+        start = g * group
+        end = start + group
+        q_block = _quantize_row_with_clip(row_work[start:end], spec, _row_clip_for_weight_clip(row_clip, 0, groups)[:, g:g + 1] if isinstance(row_clip, torch.Tensor) and row_clip.ndim >= 2 and row_clip.shape[-1] == groups else row_clip)
+        q_row[start:end] = q_block
+        if end >= n_in:
+            continue
+        err = q_block - row_work[start:end]
+        H_ff = H[end:, end:]
+        H_fb = H[end:, start:end]
+        try:
+            delta = -torch.linalg.solve(H_ff, H_fb @ err.unsqueeze(-1)).squeeze(-1)
+        except RuntimeError:
+            continue
+        row_work[end:] = row_work[end:] + delta.to(row_work.dtype)
+    return q_row.to(row_vec.dtype)
+
+
+def _gptq_lite_refine_rows(
+    W: torch.Tensor,
+    X: torch.Tensor,
+    spec: fr.FormatSpec,
+    best: dict,
+    gptq_topk: int,
+    gptq_damping: float,
+):
+    if gptq_topk <= 0 or spec.name == "BF16":
+        return best
+    per_output = best.get("per_output_mse")
+    if per_output is None or per_output.numel() <= 1:
+        return best
+    topk = min(int(gptq_topk), int(per_output.numel()))
+    top_rows = torch.topk(per_output, k=topk).indices.tolist()
+    X_in = _sym_clip(X, float(best["act_clip"]))
+    X_hat = spec.activation_quantize_dequantize(X_in.clone())
+    base_weight_clip = best["weight_clip"]
+    W_in = _sym_clip(W, base_weight_clip, group_size=spec.group_size)
+    W_hat = spec.quantize_dequantize(W_in.clone())
+    for row in top_rows:
+        row_clip = _row_clip_for_weight_clip(base_weight_clip, row, W.shape[-1] // spec.group_size if spec.group_size > 0 else 1)
+        W_hat[row] = _gptq_lite_quantize_row(W_in[row], X_hat, spec, row_clip, gptq_damping)
+    entry = _measure_with_quantized_weight(W, X, spec, base_weight_clip, float(best["act_clip"]), W_hat)
+    if _entry_score(entry) + 1e-12 < _entry_score(best):
+        return entry
+    return best
+
+
 def _refine_measurement(
     W: torch.Tensor,
     X: torch.Tensor,
@@ -230,6 +335,8 @@ def _refine_measurement(
     rowwise_rounds: int,
     groupwise_topk: int,
     groupwise_rounds: int,
+    gptq_topk: int,
+    gptq_damping: float,
 ):
     best = None
     for w_clip in w_grid:
@@ -268,13 +375,21 @@ def _refine_measurement(
         rowwise_topk=rowwise_topk,
         rowwise_rounds=rowwise_rounds,
     )
-    return _groupwise_refine_weight_clip(
+    best = _groupwise_refine_weight_clip(
         W,
         X,
         spec,
         best,
         groupwise_topk=groupwise_topk,
         groupwise_rounds=groupwise_rounds,
+    )
+    return _gptq_lite_refine_rows(
+        W,
+        X,
+        spec,
+        best,
+        gptq_topk=gptq_topk,
+        gptq_damping=gptq_damping,
     )
 
 
@@ -307,6 +422,8 @@ def main():
     ap.add_argument("--rowwise-rounds", type=int, default=1)
     ap.add_argument("--groupwise-topk", type=int, default=16)
     ap.add_argument("--groupwise-rounds", type=int, default=1)
+    ap.add_argument("--gptq-topk", type=int, default=8)
+    ap.add_argument("--gptq-damping", type=float, default=1e-4)
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     ap.add_argument("--expert-granularity", choices=["layer", "expert"], default="layer")
@@ -364,6 +481,8 @@ def main():
                 rowwise_rounds=args.rowwise_rounds,
                 groupwise_topk=args.groupwise_topk,
                 groupwise_rounds=args.groupwise_rounds,
+                gptq_topk=args.gptq_topk,
+                gptq_damping=args.gptq_damping,
             )
             if best is not None:
                 best["source"] = "local_reconstruct"
@@ -401,6 +520,8 @@ def main():
         "rowwise_rounds": args.rowwise_rounds,
         "groupwise_topk": args.groupwise_topk,
         "groupwise_rounds": args.groupwise_rounds,
+        "gptq_topk": args.gptq_topk,
+        "gptq_damping": args.gptq_damping,
         "layers_refined": sorted(upgraded),
     }
     cost_blob["meta"] = meta

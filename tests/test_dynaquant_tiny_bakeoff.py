@@ -25,6 +25,8 @@ class TestTinyBakeoff(unittest.TestCase):
             rowwise_rounds=1,
             groupwise_topk=16,
             groupwise_rounds=1,
+            gptq_topk=8,
+            gptq_damping=1e-4,
             n_calib_samples=2,
             calib_seqlen=64,
             device="cuda",
@@ -51,6 +53,8 @@ class TestTinyBakeoff(unittest.TestCase):
         self.assertIn("--rowwise-rounds", cmds[0])
         self.assertIn("--groupwise-topk", cmds[0])
         self.assertIn("--groupwise-rounds", cmds[0])
+        self.assertIn("--gptq-topk", cmds[0])
+        self.assertIn("--gptq-damping", cmds[0])
         self.assertIn("quantization.dynaquant.oracle_search", cmds[4])
         self.assertIn("--oracle", cmds[-1])
         self.assertTrue(str(first_paths["oracle"]).endswith("oracle.json"))
