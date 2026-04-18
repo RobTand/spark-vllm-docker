@@ -26,7 +26,7 @@ from .interaction_refine import build_refinement_units, select_critical_units
 from .measure_quant_cost import ActivationIndex, _load_live_model
 
 
-def _sym_clip(x: torch.Tensor, factor) -> torch.Tensor:
+def _sym_clip(x: torch.Tensor, factor, group_size: int | None = None) -> torch.Tensor:
     if isinstance(factor, torch.Tensor):
         f = factor.to(device=x.device, dtype=x.dtype)
         if bool(torch.all(f >= 0.999999)):
@@ -35,13 +35,26 @@ def _sym_clip(x: torch.Tensor, factor) -> torch.Tensor:
         f = float(factor)
         if f >= 0.999999:
             return x
+    if isinstance(f, torch.Tensor) and f.ndim >= 2 and f.shape[-1] > 1:
+        if group_size is None or group_size <= 0:
+            raise ValueError("groupwise clip requested without valid group_size")
+        if x.shape[-1] % group_size != 0:
+            raise ValueError("tensor width must be divisible by group_size for groupwise clip")
+        groups = x.shape[-1] // group_size
+        if f.shape[-2:] != (x.shape[0], groups):
+            raise ValueError("groupwise clip tensor must have shape [rows, groups]")
+        xg = x.view(x.shape[0], groups, group_size)
+        max_abs = xg.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
+        fg = f.view(x.shape[0], groups, 1)
+        limit = max_abs * fg
+        return xg.clamp(-limit, limit).view_as(x)
     max_abs = x.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
     limit = max_abs * f
     return x.clamp(-limit, limit)
 
 
 def _measure_entry(W: torch.Tensor, X: torch.Tensor, spec: fr.FormatSpec, w_clip: float, a_clip: float):
-    W_in = _sym_clip(W, w_clip)
+    W_in = _sym_clip(W, w_clip, group_size=spec.group_size)
     X_in = _sym_clip(X, a_clip)
     W_hat = spec.quantize_dequantize(W_in.clone())
     X_hat = spec.activation_quantize_dequantize(X_in.clone())
@@ -77,9 +90,11 @@ def _entry_score(entry: dict) -> float:
 
 def _summarize_weight_clip(weight_clip):
     if isinstance(weight_clip, torch.Tensor):
-        flat = [float(x) for x in weight_clip.detach().cpu().view(-1).tolist()]
+        clip_cpu = weight_clip.detach().cpu()
+        flat = [float(x) for x in clip_cpu.view(-1).tolist()]
+        mode = "groupwise" if clip_cpu.ndim >= 2 and clip_cpu.shape[-1] > 1 else "rowwise"
         return {
-            "mode": "rowwise",
+            "mode": mode,
             "default": flat[0] if flat else 1.0,
             "min": min(flat) if flat else 1.0,
             "max": max(flat) if flat else 1.0,
@@ -135,6 +150,75 @@ def _rowwise_refine_weight_clip(
     return best_entry
 
 
+def _select_top_weight_blocks(
+    W: torch.Tensor,
+    X: torch.Tensor,
+    spec: fr.FormatSpec,
+    weight_clip,
+    topk: int,
+) -> list[tuple[int, int]]:
+    if topk <= 0 or spec.group_size <= 0 or W.shape[-1] % spec.group_size != 0:
+        return []
+    W_in = _sym_clip(W, weight_clip, group_size=spec.group_size)
+    W_hat = spec.quantize_dequantize(W_in.clone())
+    x_var = X.float().pow(2).mean(dim=0)
+    groups = W.shape[-1] // spec.group_size
+    weighted = (W.float() - W_hat.float()).pow(2) * x_var.unsqueeze(0)
+    block_scores = weighted.view(W.shape[0], groups, spec.group_size).sum(dim=-1)
+    topk = min(int(topk), int(block_scores.numel()))
+    if topk <= 0:
+        return []
+    flat_idx = torch.topk(block_scores.reshape(-1), k=topk).indices.tolist()
+    return [(idx // groups, idx % groups) for idx in flat_idx]
+
+
+def _groupwise_refine_weight_clip(
+    W: torch.Tensor,
+    X: torch.Tensor,
+    spec: fr.FormatSpec,
+    best: dict,
+    groupwise_topk: int,
+    groupwise_rounds: int,
+):
+    if groupwise_topk <= 0 or groupwise_rounds <= 0 or spec.group_size <= 0:
+        return best
+    groups = W.shape[-1] // spec.group_size
+    base = best["weight_clip"]
+    if isinstance(base, torch.Tensor):
+        if base.ndim >= 2 and base.shape[-1] == groups:
+            group_clips = base.clone().to(device=W.device, dtype=W.dtype)
+        elif base.ndim >= 2 and base.shape[-1] == 1:
+            group_clips = base.expand(W.shape[0], groups).clone().to(device=W.device, dtype=W.dtype)
+        else:
+            return best
+    else:
+        group_clips = torch.full((W.shape[0], groups), float(base), device=W.device, dtype=W.dtype)
+    best_entry = dict(best)
+    best_entry["weight_clip"] = group_clips.clone()
+    step = 0.02
+    for _ in range(max(groupwise_rounds, 0)):
+        improved = False
+        targets = _select_top_weight_blocks(W, X, spec, best_entry["weight_clip"], groupwise_topk)
+        for row, group in targets:
+            current = float(group_clips[row, group].item())
+            for candidate in _candidate_clip_values(current, step):
+                trial = group_clips.clone()
+                trial[row, group] = candidate
+                try:
+                    entry = _measure_entry(W, X, spec, trial, float(best_entry["act_clip"]))
+                except Exception:
+                    continue
+                if _entry_score(entry) + 1e-12 < _entry_score(best_entry):
+                    group_clips = trial
+                    best_entry = entry
+                    best_entry["weight_clip"] = group_clips.clone()
+                    improved = True
+        step *= 0.5
+        if not improved:
+            continue
+    return best_entry
+
+
 def _refine_measurement(
     W: torch.Tensor,
     X: torch.Tensor,
@@ -144,6 +228,8 @@ def _refine_measurement(
     rounds: int,
     rowwise_topk: int,
     rowwise_rounds: int,
+    groupwise_topk: int,
+    groupwise_rounds: int,
 ):
     best = None
     for w_clip in w_grid:
@@ -174,13 +260,21 @@ def _refine_measurement(
         step *= 0.5
         if not improved:
             continue
-    return _rowwise_refine_weight_clip(
+    best = _rowwise_refine_weight_clip(
         W,
         X,
         spec,
         best,
         rowwise_topk=rowwise_topk,
         rowwise_rounds=rowwise_rounds,
+    )
+    return _groupwise_refine_weight_clip(
+        W,
+        X,
+        spec,
+        best,
+        groupwise_topk=groupwise_topk,
+        groupwise_rounds=groupwise_rounds,
     )
 
 
@@ -211,6 +305,8 @@ def main():
     ap.add_argument("--refine-rounds", type=int, default=2)
     ap.add_argument("--rowwise-topk", type=int, default=8)
     ap.add_argument("--rowwise-rounds", type=int, default=1)
+    ap.add_argument("--groupwise-topk", type=int, default=16)
+    ap.add_argument("--groupwise-rounds", type=int, default=1)
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     ap.add_argument("--expert-granularity", choices=["layer", "expert"], default="layer")
@@ -266,6 +362,8 @@ def main():
                 args.refine_rounds,
                 rowwise_topk=args.rowwise_topk,
                 rowwise_rounds=args.rowwise_rounds,
+                groupwise_topk=args.groupwise_topk,
+                groupwise_rounds=args.groupwise_rounds,
             )
             if best is not None:
                 best["source"] = "local_reconstruct"
@@ -301,6 +399,8 @@ def main():
         "refine_rounds": args.refine_rounds,
         "rowwise_topk": args.rowwise_topk,
         "rowwise_rounds": args.rowwise_rounds,
+        "groupwise_topk": args.groupwise_topk,
+        "groupwise_rounds": args.groupwise_rounds,
         "layers_refined": sorted(upgraded),
     }
     cost_blob["meta"] = meta
