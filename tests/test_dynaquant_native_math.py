@@ -138,6 +138,19 @@ class _ToyMoeBlock(nn.Module):
         self.experts = _ToyExpertsLinearLoop()
 
 
+class _ToyRouter(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(3, 4))
+
+
+class _ToyMoeBlockCustomRouter(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gate = _ToyRouter()
+        self.experts = _ToyExpertsLinearLoop()
+
+
 class _ToyModel(nn.Module):
     def __init__(self):
         super().__init__()
@@ -152,6 +165,13 @@ class TestMoeDiscovery(unittest.TestCase):
         info = discover_moe_structure(toy)
         self.assertEqual(info["model.layers.0.mlp.experts.gate_up_proj.0"], ("model.layers.0.mlp.gate", "0"))
         self.assertEqual(info["model.layers.0.mlp.experts.down_proj.2"], ("model.layers.0.mlp.gate", "2"))
+        self.assertEqual(len(info), 6)
+
+    def test_discover_moe_structure_handles_router_modules_with_weight(self):
+        toy = _ToyModel()
+        toy.model.layers[0].mlp = _ToyMoeBlockCustomRouter()
+        info = discover_moe_structure(toy)
+        self.assertEqual(info["model.layers.0.mlp.experts.gate_up_proj.1"], ("model.layers.0.mlp.gate", "1"))
         self.assertEqual(len(info), 6)
 
 

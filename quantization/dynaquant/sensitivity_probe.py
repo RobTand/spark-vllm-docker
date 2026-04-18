@@ -158,6 +158,14 @@ def discover_moe_structure(model: nn.Module) -> dict[str, tuple[str, str]]:
     sibling Linear in the same parent whose out_features equals len(experts).
     That Linear is the router.
     """
+    def _router_matches_num_experts(child: nn.Module, num_experts: int) -> bool:
+        if isinstance(child, nn.Linear) and child.out_features == num_experts:
+            return True
+        weight = getattr(child, "weight", None)
+        if isinstance(weight, torch.Tensor) and weight.ndim >= 1:
+            return int(weight.shape[0]) == num_experts
+        return False
+
     expert_info: dict[str, tuple[str, str]] = {}
     for parent_qname, parent in model.named_modules():
         candidates = []
@@ -223,7 +231,7 @@ def discover_moe_structure(model: nn.Module) -> dict[str, tuple[str, str]]:
         for child_name, child in parent.named_children():
             if child is experts_container:
                 continue
-            if isinstance(child, nn.Linear) and child.out_features == num_experts:
+            if _router_matches_num_experts(child, num_experts):
                 router_qname = (f"{parent_qname}.{child_name}"
                                 if parent_qname else child_name)
                 break
