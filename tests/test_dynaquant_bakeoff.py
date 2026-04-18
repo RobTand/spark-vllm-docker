@@ -66,6 +66,19 @@ class TestBakeoff(unittest.TestCase):
             self.assertAlmostEqual(oracle_point.kl, 0.06)
             self.assertAlmostEqual(summary["oracle_gap_abs"], 0.01)
 
+    def test_load_refined_point_prefers_calibrated_estimate(self):
+        refined = {
+            "bits_per_param": 4.9,
+            "refined_delta_kl_estimate": -0.01,
+            "calibrated_last_token_kl_estimate": 0.055,
+        }
+        with tempfile.TemporaryDirectory() as td:
+            r = os.path.join(td, "ref.json")
+            with open(r, "w") as f:
+                json.dump(refined, f)
+            refined_point = _load_refined_point(r, calibrated_kl=0.08)
+            self.assertAlmostEqual(refined_point.kl, 0.055)
+
 
 if __name__ == "__main__":
     unittest.main()

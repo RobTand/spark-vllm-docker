@@ -60,6 +60,14 @@ def _shape_bits_total(stats: dict, assignment: dict[str, str]) -> tuple[float, i
     return total_bits, total_params
 
 
+def _predicted_dloss_total(stats: dict, costs: dict, assignment: dict[str, str]) -> float:
+    total = 0.0
+    for name, fmt in assignment.items():
+        entry = costs[name].get(fmt, {})
+        total += 0.5 * stats[name]["h_trace"] * entry.get("output_mse", 0.0) * stats[name]["out_features"]
+    return total
+
+
 def _measure_recipe(
     model,
     quant_map,
@@ -131,6 +139,7 @@ def main():
     base_total_bits, _ = _shape_bits_total(stats_alloc, assignment)
     selected_member_keys = {member for unit in selected_units for member in unit.members}
     fixed_bits_total = 0.0
+    fixed_predicted_dloss_total = 0.0
     for name, fmt in assignment.items():
         if name in selected_member_keys:
             continue
@@ -140,6 +149,11 @@ def main():
             stats_alloc[name].get("in_features", 1),
         )
         fixed_bits_total += spec.effective_bits_for_shape(shape) * stats_alloc[name]["n_params"]
+        entry = costs[name].get(fmt, {})
+        fixed_predicted_dloss_total += (
+            0.5 * stats_alloc[name]["h_trace"] * entry.get("output_mse", 0.0) * stats_alloc[name]["out_features"]
+        )
+    base_predicted_dloss = _predicted_dloss_total(stats_alloc, costs, assignment)
 
     model_arg = str(Path(args.model).resolve()) if Path(args.model).exists() else args.model
     staged, cleanup = stage_multimodal(model_arg)
@@ -257,6 +271,8 @@ def main():
             "target_total_bits": target_total_bits,
             "base_total_bits": base_total_bits,
             "fixed_bits_total": fixed_bits_total,
+            "base_predicted_dloss": base_predicted_dloss,
+            "fixed_predicted_dloss_total": fixed_predicted_dloss_total,
             "total_params": total_params,
             "expert_granularity": args.expert_granularity,
             "base_assignment": assignment,

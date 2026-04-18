@@ -31,9 +31,50 @@ def _load_units(payload: dict):
     return units, allowed
 
 
+def _fit_piecewise_monotone(points: list[tuple[float, float]]):
+    pts = sorted((float(x), float(y)) for x, y in points)
+    dedup = []
+    for x, y in pts:
+        if dedup and abs(dedup[-1][0] - x) < 1e-12:
+            dedup[-1] = (x, min(dedup[-1][1], y))
+        else:
+            dedup.append((x, y))
+    if not dedup:
+        return None
+    xs = [x for x, _ in dedup]
+    ys = []
+    running = float("-inf")
+    for _x, y in dedup:
+        running = max(running, y)
+        ys.append(running)
+
+    def _interp(x: float) -> float:
+        if len(xs) == 1:
+            return ys[0]
+        if x <= xs[0]:
+            x0, y0 = xs[0], ys[0]
+            x1, y1 = xs[1], ys[1]
+        elif x >= xs[-1]:
+            x0, y0 = xs[-2], ys[-2]
+            x1, y1 = xs[-1], ys[-1]
+        else:
+            for i in range(1, len(xs)):
+                if x <= xs[i]:
+                    x0, y0 = xs[i - 1], ys[i - 1]
+                    x1, y1 = xs[i], ys[i]
+                    break
+        if abs(x1 - x0) < 1e-12:
+            return y0
+        t = (x - x0) / (x1 - x0)
+        return y0 + t * (y1 - y0)
+
+    return _interp
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--interactions", required=True)
+    ap.add_argument("--calibration", help="calibrate_allocator output for KL mapping")
     ap.add_argument("--output", required=True)
     ap.add_argument("--max-passes", type=int, default=8)
     args = ap.parse_args()
@@ -68,11 +109,34 @@ def main():
     result["bits_per_param"] = result["bits_total"] / max(float(payload["total_params"]), 1.0)
     refined_assignment = dict(payload["base_assignment"])
     refined_assignment.update(expand_unit_assignment(units, result["choices"]))
+    unit_map = {unit.key: unit for unit in units}
+    refined_predicted_dloss = float(payload.get("fixed_predicted_dloss_total", 0.0))
+    for unit in units:
+        chosen_fmt = result["choices"].get(unit.key, unit.base_fmt)
+        refined_predicted_dloss += unit_map[unit.key].option_map[chosen_fmt].predicted_dloss
+
+    calibrated_last_token_kl_estimate = None
+    if args.calibration:
+        with open(args.calibration) as f:
+            calib = json.load(f)
+        mapper = _fit_piecewise_monotone(
+            [
+                (row["predicted_dloss"], row["actual_last_token_kl"])
+                for row in calib["results"]
+            ]
+        )
+        if mapper is not None:
+            calibrated_last_token_kl_estimate = float(mapper(refined_predicted_dloss))
+
     out = {
         "source": args.interactions,
+        "calibration": args.calibration,
         "base_last_token_kl": payload["base_last_token_kl"],
+        "base_predicted_dloss": payload.get("base_predicted_dloss"),
+        "refined_predicted_dloss": refined_predicted_dloss,
         "refined_delta_kl_estimate": result["objective_delta"],
         "refined_last_token_kl_estimate": payload["base_last_token_kl"] + result["objective_delta"],
+        "calibrated_last_token_kl_estimate": calibrated_last_token_kl_estimate,
         "bits_total": result["bits_total"],
         "bits_per_param": result["bits_per_param"],
         "selected_choices": result["choices"],

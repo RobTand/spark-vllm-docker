@@ -41,10 +41,13 @@ def _load_calibration_point(path: str, selector: str) -> Point:
 def _load_refined_point(path: str, calibrated_kl: float) -> Point:
     with open(path) as f:
         data = json.load(f)
+    estimate = data.get("calibrated_last_token_kl_estimate")
+    if estimate is None:
+        estimate = calibrated_kl + data["refined_delta_kl_estimate"]
     return Point(
         "refined",
         float(data["bits_per_param"]),
-        float(calibrated_kl + data["refined_delta_kl_estimate"]),
+        float(estimate),
     )
 
 
