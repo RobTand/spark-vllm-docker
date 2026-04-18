@@ -28,6 +28,7 @@ import json
 import pickle
 import random
 import re
+import sys
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -145,6 +146,26 @@ def prepare_model_for_moe_linears(model: nn.Module) -> str | None:
             sub.to(target_dev)
 
     return str(target_dev)
+
+
+def resolve_execution_device(model: nn.Module, requested_device: str) -> torch.device:
+    """Choose the device used for input ids / embeddings during probing.
+
+    When `device_map="auto"` is used for model load, the model can be sharded
+    across CPU and GPU. In that case we want to feed tokens to the device that
+    owns the input embedding weights rather than assuming a single global
+    `cuda`/`cpu` target.
+    """
+    try:
+        emb = model.get_input_embeddings()
+        if emb is not None and hasattr(emb, "weight"):
+            return emb.weight.device
+    except Exception:
+        pass
+    for p in model.parameters():
+        if p.device.type != "meta":
+            return p.device
+    return torch.device(requested_device)
 
 
 # ---------------------------------------------------------------------------
@@ -592,6 +613,10 @@ def main():
     ap.add_argument("--nsamples", type=int, default=32)
     ap.add_argument("--seqlen", type=int, default=1024)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--device-map", default=None,
+                    help="HF from_pretrained device_map. Defaults to --device. "
+                         "Use 'auto' to allow CPU/GPU model sharding while still "
+                         "running the probe on the embedding device.")
     ap.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     ap.add_argument("--output", required=True,
                     help="Pickle with per-Linear stats")
@@ -627,8 +652,9 @@ def main():
 
     print(f"[probe] loading {args.model}", flush=True)
     t0 = time.time()
+    load_device_map = args.device_map if args.device_map is not None else args.device
     model = AutoModelForCausalLM.from_pretrained(
-        staged, torch_dtype=dtype, device_map=args.device,
+        staged, torch_dtype=dtype, device_map=load_device_map,
         low_cpu_mem_usage=False, trust_remote_code=True,
     )
     model.eval()
@@ -657,6 +683,10 @@ def main():
         except Exception as e:
             print(f"[probe] MoE unfuse failed ({e}); continuing with "
                   "fused experts.", flush=True)
+
+    exec_device = resolve_execution_device(model, args.device)
+    print(f"[probe] execution device: {exec_device} "
+          f"(load device_map={load_device_map})", flush=True)
 
     for p in model.parameters():
         p.requires_grad_(False)
@@ -712,7 +742,7 @@ def main():
     model.train()
     t_fwd = t_bwd = 0.0
     for i in range(calib.size(0)):
-        ids = calib[i:i+1].to(args.device)
+        ids = calib[i:i+1].to(exec_device)
         t0 = time.time()
         with torch.no_grad():
             embed = model.get_input_embeddings()(ids)
@@ -746,7 +776,7 @@ def main():
 
         del out, loss, ids, embed, logits
         acc._saved_inputs.clear()
-        if args.device.startswith("cuda"):
+        if exec_device.type == "cuda":
             torch.cuda.empty_cache()
         gc.collect()
 
@@ -769,6 +799,8 @@ def main():
                 "nsamples": calib.size(0),
                 "seqlen": args.seqlen,
                 "dtype": args.dtype,
+                "device_map": str(load_device_map),
+                "execution_device": str(exec_device),
                 "top_k": top_k,
                 "importance_weighting": args.importance_weighting,
                 "activation_cache_dir": str(cache_dir) if cache_dir else None,
