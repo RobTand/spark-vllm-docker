@@ -47,10 +47,14 @@ def _load_units(payload: dict):
             )
             for opt in row["options"]
         )
+        base_member_fmts = tuple(tuple(x) for x in row.get("base_member_fmts", []))
+        if not base_member_fmts:
+            base_member_fmts = tuple((member, row["base_fmt"]) for member in row["members"])
         unit = RefinementUnit(
             key=row["key"],
             members=tuple(row["members"]),
             base_fmt=row["base_fmt"],
+            base_member_fmts=base_member_fmts,
             options=options,
         )
         units.append(unit)

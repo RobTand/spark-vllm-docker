@@ -285,6 +285,7 @@ def main():
                     "key": unit.key,
                     "members": list(unit.members),
                     "base_fmt": unit.base_fmt,
+                    "base_member_fmts": list(unit.base_member_fmts),
                     "options": [
                         {
                             "fmt": opt.fmt,

@@ -30,6 +30,7 @@ class RefinementUnit:
     key: str
     members: tuple[str, ...]
     base_fmt: str
+    base_member_fmts: tuple[tuple[str, str], ...]
     options: tuple[UnitOption, ...]
 
     @property
@@ -111,25 +112,23 @@ def build_refinement_units(
     units = []
     for members in _unit_groups(list(assignment.keys()), unit_scope=unit_scope):
         base_fmts = {assignment[m] for m in members}
-        if len(base_fmts) != 1:
-            # The additive allocator should already have promoted fused siblings
-            # together, but keep the refinement robust if that invariant is
-            # violated by collapsing to singleton units.
-            if len(members) > 1:
-                for member in members:
-                    unit = build_refinement_units(
-                        stats,
-                        candidates,
-                        {member: assignment[member]},
-                    )
-                    units.extend(unit)
-                continue
-        base_fmt = next(iter(base_fmts))
+        base_member_fmts = tuple((member, assignment[member]) for member in members)
+        heterogeneous_base = len(base_fmts) != 1
+        base_fmt = "__base__" if heterogeneous_base else next(iter(base_fmts))
         fmt_sets = [{cand.fmt for cand in candidates[m]} for m in members if m in candidates]
         if not fmt_sets:
             continue
         shared = set.intersection(*fmt_sets)
         options = []
+        if heterogeneous_base:
+            bits_total = 0.0
+            predicted = 0.0
+            for member in members:
+                cand = next(c for c in candidates[member] if c.fmt == assignment[member])
+                n_params = stats[member]["n_params"]
+                bits_total += cand.bits_per_param * n_params
+                predicted += cand.predicted_dloss
+            options.append(UnitOption(fmt="__base__", bits_total=bits_total, predicted_dloss=predicted))
         for fmt in shared:
             bits_total = 0.0
             predicted = 0.0
@@ -145,13 +144,14 @@ def build_refinement_units(
             continue
         key = "|".join(members)
         units.append(
-            RefinementUnit(
-                key=key,
-                members=members,
-                base_fmt=base_fmt,
-                options=tuple(options),
+                RefinementUnit(
+                    key=key,
+                    members=members,
+                    base_fmt=base_fmt,
+                    base_member_fmts=base_member_fmts,
+                    options=tuple(options),
+                )
             )
-        )
     return units
 
 
@@ -183,8 +183,12 @@ def expand_unit_assignment(units: list[RefinementUnit], choices: dict[str, str])
     out = {}
     for unit in units:
         fmt = choices.get(unit.key, unit.base_fmt)
-        for member in unit.members:
-            out[member] = fmt
+        if fmt == "__base__":
+            for member, member_fmt in unit.base_member_fmts:
+                out[member] = member_fmt
+        else:
+            for member in unit.members:
+                out[member] = fmt
     return out
 
 
