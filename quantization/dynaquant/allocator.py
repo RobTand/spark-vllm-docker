@@ -127,7 +127,17 @@ def kneedle(x: list[float], y: list[float]) -> int:
 class Candidate:
     fmt: str
     bits_per_param: float
+    memory_bytes: int
     predicted_dloss: float
+
+
+def _shape_from_stats(entry: dict) -> tuple[int, ...]:
+    out_features = int(entry.get("out_features", 0) or 0)
+    in_features = int(entry.get("in_features", 0) or 0)
+    if out_features > 0 and in_features > 0:
+        return (out_features, in_features)
+    n_params = int(entry.get("n_params", 0) or 0)
+    return (n_params,)
 
 
 def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec]
@@ -139,6 +149,7 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec]
             continue
         h_trace = s["h_trace"]
         d_out = s["out_features"]
+        shape = _shape_from_stats(s)
         cands = []
         for spec in formats:
             entry = costs[name].get(spec.name)
@@ -151,7 +162,8 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec]
             predicted = 0.5 * h_trace * entry["output_mse"] * d_out
             cands.append(Candidate(
                 fmt=spec.name,
-                bits_per_param=spec.effective_bits,
+                bits_per_param=spec.effective_bits_for_shape(shape),
+                memory_bytes=spec.memory_bytes_for_shape(shape),
                 predicted_dloss=max(predicted, 0.0),
             ))
         if cands:
@@ -294,7 +306,14 @@ def aggregate_moe_candidates(
             predicted = 0.5 * sum_h * entry["output_mse"] * d_out
             cands.append(Candidate(
                 fmt=spec.name,
-                bits_per_param=spec.effective_bits,
+                bits_per_param=spec.effective_bits_for_shape((
+                    stats_ext[super_name]["out_features"],
+                    stats_ext[super_name]["in_features"],
+                )),
+                memory_bytes=spec.memory_bytes_for_shape((
+                    stats_ext[super_name]["out_features"],
+                    stats_ext[super_name]["in_features"],
+                )),
                 predicted_dloss=max(predicted, 0.0),
             ))
         if cands:
@@ -434,8 +453,10 @@ def compute_achieved(stats: dict, assignment: dict[str, str],
                      format_specs: dict[str, fr.FormatSpec]) -> tuple[float, float]:
     """Return (avg_bits, total_predicted_dloss)."""
     total_params = sum(stats[n]["n_params"] for n in assignment)
-    total_bits = sum(format_specs[assignment[n]].effective_bits
-                     * stats[n]["n_params"] for n in assignment)
+    total_bits = 0.0
+    for n in assignment:
+        shape = _shape_from_stats(stats[n])
+        total_bits += format_specs[assignment[n]].effective_bits_for_shape(shape) * stats[n]["n_params"]
     return total_bits / max(total_params, 1), 0.0  # dloss recomputed separately
 
 

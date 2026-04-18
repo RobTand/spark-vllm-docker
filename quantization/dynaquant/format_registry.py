@@ -45,15 +45,59 @@ class FormatSpec:
     autoround_config: Callable[[], dict] = field(default=lambda: {})
     # RTN quantize+dequantize, returns the rounded tensor (same shape+dtype).
     quantize_dequantize: Callable[[torch.Tensor], torch.Tensor] = field(default=lambda x: x)
+    # Optional activation RTN path. Formats with A16 / BF16 activations should
+    # leave this as identity; W4A4/W8A8 style formats should provide the
+    # matching activation-side quantizer so functional-cost measurement reflects
+    # the actual serving bucket rather than weight-only error.
+    activation_quantize_dequantize: Callable[[torch.Tensor], torch.Tensor] = field(
+        default=lambda x: x
+    )
 
     @property
     def effective_bits(self) -> float:
         """Average bits per parameter accounting for scales."""
+        # Backward-compatible fallback when no layer shape is available.
         if self.group_size == 0:
-            # per-channel: scales cost is tiny (out_features × scale_bits / weights)
-            # caller can override if needed; default assumes amortized negligible
+            if self.scale_bits == 0:
+                return float(self.weight_bits)
+            # True overhead depends on the layer shape. Keep a small, explicit
+            # fallback here so older code doesn't crash, but new allocation code
+            # should call effective_bits_for_shape().
             return float(self.weight_bits) + 0.02
         return float(self.weight_bits) + float(self.scale_bits) / self.group_size
+
+    def scale_count_for_shape(self, shape: tuple[int, ...]) -> int:
+        """Return the number of scale values needed for a tensor shape.
+
+        Assumptions:
+          - For block/group quantization (group_size > 0), groups are taken
+            along the innermost dimension and repeated for every outer row.
+          - For per-channel formats (group_size == 0), one scale is used per
+            output channel / row, which for Linear weights is shape[0].
+        """
+        if len(shape) == 0:
+            return 0
+        if self.scale_bits == 0:
+            return 0
+        if self.group_size == 0:
+            return int(shape[0]) if len(shape) >= 1 else 1
+        if len(shape) == 1:
+            n_params = int(shape[0])
+            return math.ceil(n_params / self.group_size)
+        outer = int(math.prod(shape[:-1]))
+        inner = int(shape[-1])
+        return outer * math.ceil(inner / self.group_size)
+
+    def memory_bytes_for_shape(self, shape: tuple[int, ...]) -> int:
+        """Exact-ish serialized size for a tensor in this format."""
+        n_params = int(math.prod(shape)) if len(shape) else 1
+        weight_bytes = math.ceil(n_params * self.weight_bits / 8.0)
+        scale_bytes = math.ceil(self.scale_count_for_shape(shape) * self.scale_bits / 8.0)
+        return weight_bytes + scale_bytes
+
+    def effective_bits_for_shape(self, shape: tuple[int, ...]) -> float:
+        n_params = int(math.prod(shape)) if len(shape) else 1
+        return 8.0 * self.memory_bytes_for_shape(shape) / max(n_params, 1)
 
 
 REGISTRY: dict[str, FormatSpec] = {}
@@ -239,6 +283,19 @@ def _int_autoround(bits, gsize, act_bits=16):
     )
 
 
+def _plain_fp8_autoround(elt="fp8_e4m3", act_bits=8):
+    # Plain per-channel FP8 (no microscaling).  AutoRound's "fp8_e4m3" /
+    # "fp8_e5m2" dtypes use group_size=-1 i.e. per-tensor scale on weights,
+    # and per-token dynamic scale on activations (matches vLLM's native
+    # FP8 serving path and compressed-tensors FP8 scheme).
+    return dict(
+        bits=8, group_size=-1, sym=True, data_type=elt,
+        act_bits=act_bits, act_group_size=-1, act_sym=True,
+        act_data_type=elt if act_bits == 8 else "float",
+        act_dynamic=True,
+    )
+
+
 # NVFP4 / NVFP4A16  (NVIDIA, group_size=16, FP8 scales)
 register_format(FormatSpec(
     name="NVFP4",
@@ -247,6 +304,7 @@ register_format(FormatSpec(
     act_group_size=16, family="nv", min_capability_sm=100,
     autoround_config=lambda: _nv_autoround(4, 16, 4),
     quantize_dequantize=_make_rtn("fp4_e2m1", 16),
+    activation_quantize_dequantize=_make_rtn("fp4_e2m1", 16),
 ))
 register_format(FormatSpec(
     name="NVFP4A16",
@@ -255,6 +313,7 @@ register_format(FormatSpec(
     family="nv", min_capability_sm=100,
     autoround_config=lambda: _nv_autoround(4, 16, 16),
     quantize_dequantize=_make_rtn("fp4_e2m1", 16),
+    activation_quantize_dequantize=lambda x: x,
 ))
 
 # MXFP4 / MXFP8 / MXFP6 variants  (OCP MX, group_size=32, E8M0 scales)
@@ -265,6 +324,7 @@ register_format(FormatSpec(
     act_group_size=32, family="mx", min_capability_sm=100,
     autoround_config=lambda: _mx_autoround(4, 32, 4, "fp4_e2m1"),
     quantize_dequantize=_make_rtn("fp4_e2m1", 32),
+    activation_quantize_dequantize=_make_rtn("fp4_e2m1", 32),
 ))
 register_format(FormatSpec(
     name="MXFP6_E3M2",
@@ -273,6 +333,7 @@ register_format(FormatSpec(
     act_group_size=32, family="mx", min_capability_sm=100,
     autoround_config=lambda: _mx_autoround(6, 32, 6, "fp6_e3m2"),
     quantize_dequantize=_make_rtn("fp6_e3m2", 32),
+    activation_quantize_dequantize=_make_rtn("fp6_e3m2", 32),
 ))
 register_format(FormatSpec(
     name="MXFP6_E2M3",
@@ -281,6 +342,7 @@ register_format(FormatSpec(
     act_group_size=32, family="mx", min_capability_sm=100,
     autoround_config=lambda: _mx_autoround(6, 32, 6, "fp6_e2m3"),
     quantize_dequantize=_make_rtn("fp6_e2m3", 32),
+    activation_quantize_dequantize=_make_rtn("fp6_e2m3", 32),
 ))
 register_format(FormatSpec(
     name="MXFP8",  # alias for MXFP8_E4M3 (OCP MX canonical default)
@@ -289,6 +351,7 @@ register_format(FormatSpec(
     act_group_size=32, family="mx", min_capability_sm=100,
     autoround_config=lambda: _mx_autoround(8, 32, 8, "fp8_e4m3"),
     quantize_dequantize=_make_rtn("fp8_e4m3", 32),
+    activation_quantize_dequantize=_make_rtn("fp8_e4m3", 32),
 ))
 register_format(FormatSpec(
     name="MXFP8_E4M3",  # explicit name for the canonical variant
@@ -297,6 +360,7 @@ register_format(FormatSpec(
     act_group_size=32, family="mx", min_capability_sm=100,
     autoround_config=lambda: _mx_autoround(8, 32, 8, "fp8_e4m3"),
     quantize_dequantize=_make_rtn("fp8_e4m3", 32),
+    activation_quantize_dequantize=_make_rtn("fp8_e4m3", 32),
 ))
 register_format(FormatSpec(
     name="MXFP8_E5M2",  # wider dynamic range, less mantissa precision
@@ -305,6 +369,7 @@ register_format(FormatSpec(
     act_group_size=32, family="mx", min_capability_sm=100,
     autoround_config=lambda: _mx_autoround(8, 32, 8, "fp8_e5m2"),
     quantize_dequantize=_make_rtn("fp8_e5m2", 32),
+    activation_quantize_dequantize=_make_rtn("fp8_e5m2", 32),
 ))
 register_format(FormatSpec(
     name="MXFP8A16",
@@ -313,6 +378,28 @@ register_format(FormatSpec(
     family="mx", min_capability_sm=80,  # W8A16 works on Marlin
     autoround_config=lambda: _mx_autoround(8, 32, 16, "fp8_e4m3"),
     quantize_dequantize=_make_rtn("fp8_e4m3", 32),
+    activation_quantize_dequantize=lambda x: x,
+))
+
+# Plain FP8 (per-tensor scale on weights, no microscaling).  vLLM-native
+# serving path; works on Hopper (sm_90) and Blackwell (sm_100+).
+register_format(FormatSpec(
+    name="FP8_E4M3",
+    weight_bits=8, group_size=0, scale_bits=32, scale_dtype_name="fp32",
+    weight_element_dtype="fp8_e4m3", act_bits=8, act_dtype_name="fp8_e4m3",
+    act_group_size=0, family="fp", min_capability_sm=90,
+    autoround_config=lambda: _plain_fp8_autoround("fp8_e4m3", 8),
+    quantize_dequantize=_make_rtn("fp8_e4m3", 0),
+    activation_quantize_dequantize=_make_rtn("fp8_e4m3", 0),
+))
+register_format(FormatSpec(
+    name="FP8_E5M2",
+    weight_bits=8, group_size=0, scale_bits=32, scale_dtype_name="fp32",
+    weight_element_dtype="fp8_e5m2", act_bits=8, act_dtype_name="fp8_e5m2",
+    act_group_size=0, family="fp", min_capability_sm=90,
+    autoround_config=lambda: _plain_fp8_autoround("fp8_e5m2", 8),
+    quantize_dequantize=_make_rtn("fp8_e5m2", 0),
+    activation_quantize_dequantize=_make_rtn("fp8_e5m2", 0),
 ))
 
 # INT8 per-channel / INT4 per-group
@@ -323,6 +410,7 @@ register_format(FormatSpec(
     family="int", min_capability_sm=70,
     autoround_config=lambda: _int_autoround(8, -1, 16),
     quantize_dequantize=lambda w: _rtn_uniform_int(w, 8, 0),
+    activation_quantize_dequantize=lambda x: x,
 ))
 register_format(FormatSpec(
     name="INT4_W4A16_g128",
@@ -331,6 +419,7 @@ register_format(FormatSpec(
     family="int", min_capability_sm=70,
     autoround_config=lambda: _int_autoround(4, 128, 16),
     quantize_dequantize=lambda w: _rtn_uniform_int(w, 4, 128),
+    activation_quantize_dequantize=lambda x: x,
 ))
 
 # Passthrough for highest-precision layer when budget is loose
@@ -343,6 +432,7 @@ register_format(FormatSpec(
                                    data_type="float", act_bits=16,
                                    act_data_type="float"),
     quantize_dequantize=lambda w: w.clone(),
+    activation_quantize_dequantize=lambda x: x.clone(),
 ))
 
 
