@@ -60,7 +60,7 @@ def main():
         units=units,
         unary=unary,
         pairwise=pairwise,
-        target_total_bits=float(payload["target_total_bits"]),
+        target_total_bits=max(float(payload["target_total_bits"]), float(payload["base_total_bits"])),
         fixed_bits_total=float(payload["fixed_bits_total"]),
         allowed=allowed,
         max_passes=args.max_passes,
