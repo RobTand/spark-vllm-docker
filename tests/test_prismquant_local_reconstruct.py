@@ -2,8 +2,8 @@ import unittest
 
 import torch
 
-from quantization.dynaquant import format_registry as fr
-from quantization.dynaquant.local_reconstruct import (
+from quantization.prismquant import format_registry as fr
+from quantization.prismquant.local_reconstruct import (
     _gptq_lite_refine_rows,
     _groupwise_refine_weight_clip,
     _measure_entry,

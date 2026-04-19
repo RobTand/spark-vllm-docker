@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""calibrate_allocator.py — empirical calibration for DynaQuant frontier points.
+"""calibrate_allocator.py — empirical calibration for PrismQuant frontier points.
 
 Given:
   - sensitivity probe pickle
@@ -7,16 +7,19 @@ Given:
   - a target set of average-bit budgets
 
 This script:
-  1. Rebuilds DynaQuant assignments for each target
+  1. Rebuilds PrismQuant assignments for each target
   2. Applies the chosen native formats in-memory to a real model
   3. Measures actual KL against the BF16 reference logits on a small
      calibration corpus
+  4. Fits per-format scalar gains α_f by non-negative least squares so
+     that  Σ_f α_f · S_f(pt)  ≈  ΔKL_pt  across the bake-off frontier,
+     where  S_f(pt) = Σ_{layer assigned to f at pt} 0.5 · h · weight_mse
+     is the per-format predicted contribution at frontier point pt.
 
-The goal is not to replace the allocator. The goal is to empirically
-calibrate the predicted frontier so we can answer:
-  - is the knee actually a good operating point?
-  - do predicted Δloss and measured KL rank frontier points consistently?
-  - does a particular format bundle systematically under/over-predict quality?
+The fitted gains land in the output JSON under `calibrated_gains` and
+are consumed by `allocator.py --calibration <this output>`. With a
+single global gain (all α_f equal) the DP's choice is invariant; the
+per-format fit lets calibration actually shift the chosen recipe.
 """
 from __future__ import annotations
 
@@ -36,13 +39,14 @@ from quantization.build_rtn_cache import (
     load_wikitext_calibration,
     stage_multimodal,
 )
-from quantization.dynaquant import format_registry as fr
-from quantization.dynaquant.allocator import (
+from quantization.prismquant import format_registry as fr
+from quantization.prismquant.allocator import (
     aggregate_moe_candidates,
     build_candidates,
     compute_achieved,
     expand_moe_assignment,
     kneedle,
+    predicted_dloss,
     promote_fused,
     solve_allocation,
 )
@@ -61,6 +65,24 @@ def load_inputs(probe_path: Path, costs_path: Path, fmt_names: list[str]):
     specs = [fr.get_format(n) for n in fmt_names]
     specs_sorted = sorted(specs, key=lambda s: s.effective_bits)
     return stats, costs, specs_sorted
+
+
+def per_format_predicted_breakdown(
+    assignment: dict[str, str],
+    stats_alloc: dict,
+    costs_alloc: dict,
+) -> dict[str, float]:
+    """Sum the per-(layer, format) predicted Δloss contributions, grouped
+    by the assigned format. Returned dict maps fmt → S_f(pt)."""
+    out: dict[str, float] = {}
+    for name, fmt in assignment.items():
+        entry = costs_alloc[name].get(fmt, {})
+        contrib = predicted_dloss(
+            stats_alloc[name]["h_trace"],
+            entry.get("weight_mse", 0.0),
+        )
+        out[fmt] = out.get(fmt, 0.0) + contrib
+    return out
 
 
 def build_curve(stats: dict, costs: dict, specs_sorted, targets: list[float], bit_precision: float,
@@ -85,20 +107,118 @@ def build_curve(stats: dict, costs: dict, specs_sorted, targets: list[float], bi
         if not no_fused_promote:
             assignment = promote_fused(assignment, format_rank)
         achieved, _ = compute_achieved(stats_alloc, assignment, format_specs)
-        predicted_dloss = 0.0
-        for name, fmt in assignment.items():
-            entry = costs_alloc[name].get(fmt, {})
-            d_out = stats_alloc[name]["out_features"]
-            predicted_dloss += 0.5 * stats_alloc[name]["h_trace"] * entry.get("output_mse", 0.0) * d_out
+        per_fmt = per_format_predicted_breakdown(assignment, stats_alloc, costs_alloc)
+        total_pred = sum(per_fmt.values())
         curve.append({
             "target_bits": t,
             "feasible": True,
             "achieved_bits": achieved,
-            "predicted_dloss": predicted_dloss,
+            "predicted_dloss": total_pred,
+            "predicted_dloss_by_format": per_fmt,
             "assignment": assignment,
             "stats_scope": "aggregated" if expert_granularity == "layer" else "expert",
         })
     return curve, stats_alloc, costs_alloc, format_rank
+
+
+def fit_calibrated_gains(
+    results: list[dict],
+    baseline_kl: float,
+    *,
+    floor: float = 1e-3,
+    ceiling: float = 1e3,
+) -> tuple[dict[str, float], dict]:
+    """Fit per-format scalar gains α_f via non-negative least squares so
+    that  Σ_f α_f · S_f(pt)  ≈  ΔKL_pt  across the measured frontier.
+
+    Returns (gains, diagnostics). Gains are clamped to [`floor`, `ceiling`]
+    to keep the allocator numerically well-behaved when a frontier point
+    contributes negligible information about a particular format.
+
+    A "format with all-zero columns" cannot be identified — its gain is
+    set to 1.0 (no correction). This happens for BF16 in any bake-off
+    that includes a BF16 bucket, since BF16 weight_mse is exactly zero.
+
+    The fit is intentionally simple (NNLS, no regularization beyond
+    bounds): the bake-off frontier typically has only 3 points, so any
+    heavier model would over-fit. With ≥3 points the per-format fit is
+    over-determined for 2 active formats (the typical NVFP4+MXFP8 case).
+    """
+    measured = np.array(
+        [float(r["actual_last_token_kl"]) - float(baseline_kl) for r in results],
+        dtype=np.float64,
+    )
+    fmts = sorted({fmt for r in results for fmt in r.get("predicted_dloss_by_format", {})})
+    if not fmts or measured.size == 0:
+        return {}, {"reason": "no measured frontier points"}
+
+    A = np.zeros((len(results), len(fmts)), dtype=np.float64)
+    for i, r in enumerate(results):
+        breakdown = r.get("predicted_dloss_by_format", {})
+        for j, f in enumerate(fmts):
+            A[i, j] = float(breakdown.get(f, 0.0))
+
+    active_cols = np.where(A.sum(axis=0) > 0)[0]
+    diagnostics: dict = {
+        "frontier_points": int(measured.size),
+        "fmts_in_fit": [fmts[j] for j in active_cols],
+        "fmts_unidentifiable": [fmts[j] for j in range(len(fmts))
+                                if j not in active_cols],
+    }
+    gains = {f: 1.0 for f in fmts}
+    if active_cols.size == 0:
+        diagnostics["reason"] = "all per-format predictions zero (BF16-only?)"
+        return gains, diagnostics
+
+    A_active = A[:, active_cols]
+
+    # Non-negative least squares via SciPy if available, else a small
+    # active-set fallback that handles the typical 1-3 unknown case.
+    try:
+        from scipy.optimize import nnls  # type: ignore
+        x, residual = nnls(A_active, measured)
+    except Exception:
+        x = _fallback_nnls(A_active, measured)
+        residual = float(np.linalg.norm(A_active @ x - measured))
+
+    # Clamp away from extreme values that would arise if a frontier point
+    # has unexpectedly tiny per-format contribution.
+    for j_idx, j in enumerate(active_cols):
+        g = float(x[j_idx])
+        if not np.isfinite(g):
+            g = 1.0
+        gains[fmts[j]] = float(min(max(g, floor), ceiling))
+
+    diagnostics["residual"] = float(residual)
+    diagnostics["fit_predicted"] = (A @ np.array(
+        [gains[f] for f in fmts], dtype=np.float64,
+    )).tolist()
+    diagnostics["measured_delta_kl"] = measured.tolist()
+    return gains, diagnostics
+
+
+def _fallback_nnls(A: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Tiny NNLS substitute used when SciPy isn't available.
+
+    Closed-form least squares followed by a single nonneg projection +
+    refit on the active set. Adequate for the 1-3-unknown case typical
+    here, not a general NNLS solver.
+    """
+    if A.shape[1] == 0:
+        return np.zeros(0)
+    try:
+        x, *_ = np.linalg.lstsq(A, b, rcond=None)
+    except np.linalg.LinAlgError:
+        return np.zeros(A.shape[1])
+    if (x >= 0).all():
+        return x
+    active = np.where(x >= 0)[0]
+    if active.size == 0:
+        return np.zeros(A.shape[1])
+    x2, *_ = np.linalg.lstsq(A[:, active], b, rcond=None)
+    full = np.zeros(A.shape[1])
+    full[active] = np.maximum(x2, 0.0)
+    return full
 
 
 def build_module_param_map(model):
@@ -328,6 +448,8 @@ def main():
                 "target_bits": row["target_bits"],
                 "achieved_bits": row["achieved_bits"],
                 "predicted_dloss": row["predicted_dloss"],
+                "predicted_dloss_by_format": row.get(
+                    "predicted_dloss_by_format", {}),
                 "actual_last_token_kl": actual_kl,
                 "delta_from_baseline_kl": actual_kl - baseline_kl,
                 "format_counts": counts,
@@ -351,6 +473,17 @@ def main():
         )
         spearman = _spearman_corr(predicted, actual)
 
+        calibrated_gains, calibration_diag = fit_calibrated_gains(
+            results, baseline_kl,
+        )
+        if calibrated_gains:
+            print(
+                f"[cal] fitted gains: "
+                f"{ {k: round(v, 4) for k, v in calibrated_gains.items()} } "
+                f"(residual={calibration_diag.get('residual', float('nan')):.3e})",
+                flush=True,
+            )
+
         out = {
             "model": args.model,
             "formats": fmt_names,
@@ -361,6 +494,8 @@ def main():
             "baseline_last_token_kl": baseline_kl,
             "correlation_predicted_vs_actual_pearson": pearson,
             "correlation_predicted_vs_actual_spearman": spearman,
+            "calibrated_gains": calibrated_gains,
+            "calibration_diagnostics": calibration_diag,
             "results": results,
         }
         with open(args.output, "w") as f:

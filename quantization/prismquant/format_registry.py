@@ -141,14 +141,37 @@ def _rtn_uniform_int(w: torch.Tensor, bits: int, group_size: int,
     return w_rec.reshape(orig_shape).to(w.dtype)
 
 
+def _snap_scale_e8m0(scale: torch.Tensor) -> torch.Tensor:
+    """Snap a real-valued per-group scale to the nearest power of two.
+
+    The OCP MX spec encodes the per-block scale as an 8-bit E8M0 value:
+    unsigned, exponent-only, range 2^(-127) to 2^127. Representable
+    values are exactly the powers of two. Using a real-valued scale
+    (the previous behavior) under-estimates RTN error because the actual
+    serving path will round-trip through the E8M0 grid, introducing
+    extra error proportional to the scale's distance from a power of
+    two.
+
+    For NV (non-MX) formats, scales are FP8 and effectively continuous;
+    no snapping is applied.
+    """
+    log2_s = torch.log2(scale.clamp_min(2.0 ** -127))
+    snapped_exp = torch.round(log2_s).clamp(-127.0, 127.0)
+    return torch.pow(2.0, snapped_exp)
+
+
 def _rtn_fp_codebook(w: torch.Tensor, codebook: torch.Tensor,
-                     group_size: int) -> torch.Tensor:
+                     group_size: int, mx_scale: bool = False) -> torch.Tensor:
     """Round to nearest value in a small FP codebook, with per-group scaling.
 
     Vectorized via torch.bucketize on the sorted codebook. For each scaled
     weight value x, we binary-search the codebook to find the two bracketing
     entries and pick the closer one. O(N log K) instead of the O(N * K)
     pairwise-distance approach, with 0 extra-dim allocations.
+
+    When `mx_scale=True`, the per-group scale is snapped to the nearest
+    power of two (E8M0). This matches the OCP MX serving path; without
+    it, RTN error for MX formats is slightly under-estimated.
     """
     orig_shape = w.shape
     in_f = w.shape[-1]
@@ -162,6 +185,8 @@ def _rtn_fp_codebook(w: torch.Tensor, codebook: torch.Tensor,
     cmax = float(cb.abs().max().item())
     max_abs = w2.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
     scale = max_abs / cmax
+    if mx_scale:
+        scale = _snap_scale_e8m0(scale)
     x = w2 / scale                                    # shape (..., group)
 
     # Bucketize returns the insertion index: cb[idx-1] <= x < cb[idx].
@@ -243,10 +268,10 @@ _CODEBOOKS = {
 }
 
 
-def _make_rtn(codebook_name: str, group_size: int):
+def _make_rtn(codebook_name: str, group_size: int, mx_scale: bool = False):
     cb = _CODEBOOKS[codebook_name]
     def f(w: torch.Tensor) -> torch.Tensor:
-        return _rtn_fp_codebook(w, cb, group_size)
+        return _rtn_fp_codebook(w, cb, group_size, mx_scale=mx_scale)
     return f
 
 
@@ -317,14 +342,17 @@ register_format(FormatSpec(
 ))
 
 # MXFP4 / MXFP8 / MXFP6 variants  (OCP MX, group_size=32, E8M0 scales)
+# All MX formats use mx_scale=True so RTN models the actual E8M0 power-of-two
+# per-block scale used by the serving path. Without this the measured RTN
+# error would be slightly optimistic vs what the kernel actually produces.
 register_format(FormatSpec(
     name="MXFP4",
     weight_bits=4, group_size=32, scale_bits=8, scale_dtype_name="uint8_e8m0",
     weight_element_dtype="fp4_e2m1", act_bits=4, act_dtype_name="fp4_e2m1",
     act_group_size=32, family="mx", min_capability_sm=100,
     autoround_config=lambda: _mx_autoround(4, 32, 4, "fp4_e2m1"),
-    quantize_dequantize=_make_rtn("fp4_e2m1", 32),
-    activation_quantize_dequantize=_make_rtn("fp4_e2m1", 32),
+    quantize_dequantize=_make_rtn("fp4_e2m1", 32, mx_scale=True),
+    activation_quantize_dequantize=_make_rtn("fp4_e2m1", 32, mx_scale=True),
 ))
 register_format(FormatSpec(
     name="MXFP6_E3M2",
@@ -332,8 +360,8 @@ register_format(FormatSpec(
     weight_element_dtype="fp6_e3m2", act_bits=6, act_dtype_name="fp6_e3m2",
     act_group_size=32, family="mx", min_capability_sm=100,
     autoround_config=lambda: _mx_autoround(6, 32, 6, "fp6_e3m2"),
-    quantize_dequantize=_make_rtn("fp6_e3m2", 32),
-    activation_quantize_dequantize=_make_rtn("fp6_e3m2", 32),
+    quantize_dequantize=_make_rtn("fp6_e3m2", 32, mx_scale=True),
+    activation_quantize_dequantize=_make_rtn("fp6_e3m2", 32, mx_scale=True),
 ))
 register_format(FormatSpec(
     name="MXFP6_E2M3",
@@ -341,8 +369,8 @@ register_format(FormatSpec(
     weight_element_dtype="fp6_e2m3", act_bits=6, act_dtype_name="fp6_e2m3",
     act_group_size=32, family="mx", min_capability_sm=100,
     autoround_config=lambda: _mx_autoround(6, 32, 6, "fp6_e2m3"),
-    quantize_dequantize=_make_rtn("fp6_e2m3", 32),
-    activation_quantize_dequantize=_make_rtn("fp6_e2m3", 32),
+    quantize_dequantize=_make_rtn("fp6_e2m3", 32, mx_scale=True),
+    activation_quantize_dequantize=_make_rtn("fp6_e2m3", 32, mx_scale=True),
 ))
 register_format(FormatSpec(
     name="MXFP8",  # alias for MXFP8_E4M3 (OCP MX canonical default)
@@ -350,8 +378,8 @@ register_format(FormatSpec(
     weight_element_dtype="fp8_e4m3", act_bits=8, act_dtype_name="fp8_e4m3",
     act_group_size=32, family="mx", min_capability_sm=100,
     autoround_config=lambda: _mx_autoround(8, 32, 8, "fp8_e4m3"),
-    quantize_dequantize=_make_rtn("fp8_e4m3", 32),
-    activation_quantize_dequantize=_make_rtn("fp8_e4m3", 32),
+    quantize_dequantize=_make_rtn("fp8_e4m3", 32, mx_scale=True),
+    activation_quantize_dequantize=_make_rtn("fp8_e4m3", 32, mx_scale=True),
 ))
 register_format(FormatSpec(
     name="MXFP8_E4M3",  # explicit name for the canonical variant
@@ -359,8 +387,8 @@ register_format(FormatSpec(
     weight_element_dtype="fp8_e4m3", act_bits=8, act_dtype_name="fp8_e4m3",
     act_group_size=32, family="mx", min_capability_sm=100,
     autoround_config=lambda: _mx_autoround(8, 32, 8, "fp8_e4m3"),
-    quantize_dequantize=_make_rtn("fp8_e4m3", 32),
-    activation_quantize_dequantize=_make_rtn("fp8_e4m3", 32),
+    quantize_dequantize=_make_rtn("fp8_e4m3", 32, mx_scale=True),
+    activation_quantize_dequantize=_make_rtn("fp8_e4m3", 32, mx_scale=True),
 ))
 register_format(FormatSpec(
     name="MXFP8_E5M2",  # wider dynamic range, less mantissa precision
@@ -368,8 +396,8 @@ register_format(FormatSpec(
     weight_element_dtype="fp8_e5m2", act_bits=8, act_dtype_name="fp8_e5m2",
     act_group_size=32, family="mx", min_capability_sm=100,
     autoround_config=lambda: _mx_autoround(8, 32, 8, "fp8_e5m2"),
-    quantize_dequantize=_make_rtn("fp8_e5m2", 32),
-    activation_quantize_dequantize=_make_rtn("fp8_e5m2", 32),
+    quantize_dequantize=_make_rtn("fp8_e5m2", 32, mx_scale=True),
+    activation_quantize_dequantize=_make_rtn("fp8_e5m2", 32, mx_scale=True),
 ))
 register_format(FormatSpec(
     name="MXFP8A16",
@@ -377,7 +405,7 @@ register_format(FormatSpec(
     weight_element_dtype="fp8_e4m3", act_bits=None,
     family="mx", min_capability_sm=80,  # W8A16 works on Marlin
     autoround_config=lambda: _mx_autoround(8, 32, 16, "fp8_e4m3"),
-    quantize_dequantize=_make_rtn("fp8_e4m3", 32),
+    quantize_dequantize=_make_rtn("fp8_e4m3", 32, mx_scale=True),
     activation_quantize_dequantize=lambda x: x,
 ))
 

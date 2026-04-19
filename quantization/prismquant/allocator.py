@@ -2,7 +2,7 @@
 """allocator.py — multi-choice knapsack mixed-precision assignment.
 
 Given:
-  - per-Linear sensitivity (Fisher trace from sensitivity_probe.py)
+  - per-Linear empirical Fisher diagonal trace (from sensitivity_probe.py)
   - per-(Linear, format) measured quantization cost (from measure_quant_cost.py)
   - a bit budget (target average bits per parameter)
   - a format registry (any subset of registered formats)
@@ -10,22 +10,64 @@ Given:
 Solve for a per-Linear format assignment that minimizes total predicted
 loss increase subject to the bit budget.
 
-Predicted loss increase per layer, per format, under Gauss-Newton/Fisher:
-    Δloss_{ℓ,f} ≈ 0.5 · H_trace_ℓ · output_mse_{ℓ,f} · out_features_ℓ
+Derivation of the per-(layer, format) predicted loss term
+---------------------------------------------------------
+Let L be the per-token loss (negative log-likelihood). Quantizing layer
+ℓ's weight tensor W by ΔW = W_q - W produces a perturbed loss whose
+expectation under the calibration distribution admits the standard
+second-order expansion:
 
-where output_mse is the measured RTN functional error normalized by
-numel(W·X). H_trace is the route-aware Fisher trace for MoE experts
-(divided by route_prob during the probe), so sparse experts' scores
-are comparable to dense layers'.
+    E[ΔL] ≈ 0.5 · ΔW · F · ΔWᵀ                         (1)
+
+where F is the Fisher information matrix of L w.r.t. W. Replacing F by
+its diagonal (the standard HAWQ-V1 simplification) and approximating
+F_ww by the empirical Fisher diagonal F̂_ww = E_token[(∂L/∂W_w)²]:
+
+    E[ΔL] ≈ 0.5 · Σ_w F̂_ww · (ΔW_w)²                   (2)
+
+Under the further assumption that the per-weight quantization error
+(ΔW_w)² and the per-weight Fisher diagonal F̂_ww are uncorrelated across
+w (which is the same assumption HAWQ already makes when it summarizes a
+layer by a single scalar), this collapses to the product of two
+per-layer scalars:
+
+    E[ΔL] ≈ 0.5 · H_trace · MSE_W                       (3)
+
+where
+    H_trace = Σ_w F̂_ww            (per-token Fisher diagonal trace)
+    MSE_W   = (1/n_w) · Σ_w (ΔW_w)²
+
+Both quantities are produced by upstream stages:
+    H_trace ← sensitivity_probe.py / FisherAccumulator (`h_trace`)
+    MSE_W   ← measure_quant_cost.py (per-(layer, format) `weight_mse`)
+
+So we use eq. (3) directly. There is no `* d_out` factor; the previous
+implementation carried one but it does not appear in the derivation —
+it was a holdover from an earlier output-side formulation that mixed
+units and was off by a per-layer multiplicative constant that varies
+with d_out.
+
+For MoE experts an additional route-probability normalization is folded
+into H_trace inside the probe so that sparsely-routed experts' Fisher
+contributions are on the same per-token footing as dense layers'.
 
 Solver:
   Multi-choice knapsack via DP with bit-budget discretization (we round
-  bit costs to 0.01-bit bins, making the budget an integer). For 35B
-  with ~300 Linears × 8 formats × 400 budget bins, runtime is under 1s.
+  bit costs to 0.001-bit bins). For 35B with ~300 Linears × 8 formats ×
+  ~5000 budget bins, runtime is under 1s.
 
 Fused-projection siblings (q/k/v/o, gate/up, ...) are post-processed:
   all siblings promoted to the highest format chosen for any of them,
-  to match vLLM's fused-tensor loader constraints.
+  to match vLLM's fused-tensor loader constraints. Since promotion can
+  push achieved bits past the requested budget, the DP is re-run with a
+  tightened target until achieved is within tolerance.
+
+Optional empirical calibration:
+  If `--calibration` points at a JSON produced by calibrate_allocator.py
+  containing `calibrated_gains[fmt] = α_fmt`, the predicted Δloss for
+  format f is multiplied by α_f before the DP runs. This corrects for
+  systematic over- or under-prediction per format observed against
+  measured KL on the bake-off frontier.
 
 Auto-Pareto knee via Kneedle (Satopää et al.). Reports the knee target
 plus a few flanking points so you can eyeball.
@@ -61,6 +103,13 @@ _FUSED_PATTERNS = [
     # Legacy PaLM-style
     (r"^(?P<pre>.+)\.(?P<sib>gate|up)_proj$",
      ("gate_proj", "up_proj"), "gate_up_alt"),
+    # Qwen3.6 hybrid linear-attention: vLLM fuses in_proj_qkv + in_proj_z
+    # into a single `in_proj_qkvz` parameter, so they must share format.
+    (r"^(?P<pre>.+)\.linear_attn\.(?P<sib>in_proj_qkv|in_proj_z)$",
+     ("in_proj_qkv", "in_proj_z"), "linear_attn_qkvz"),
+    # Qwen3.6 also fuses in_proj_a + in_proj_b into `in_proj_ba`.
+    (r"^(?P<pre>.+)\.linear_attn\.(?P<sib>in_proj_a|in_proj_b)$",
+     ("in_proj_a", "in_proj_b"), "linear_attn_ba"),
 ]
 
 
@@ -96,6 +145,55 @@ def promote_fused(assignment: dict[str, str],
             if format_rank[out[m]] < best:
                 out[m] = best_fmt
     return out
+
+
+def solve_with_promotion(
+    stats: dict,
+    candidates: dict[str, list[Candidate]],
+    target_bits: float,
+    format_specs: dict[str, fr.FormatSpec],
+    format_rank: dict[str, int],
+    bit_precision: float,
+    *,
+    no_fused_promote: bool = False,
+    overshoot_tolerance: float = 0.01,
+    max_iters: int = 6,
+) -> tuple[dict[str, str] | None, float]:
+    """Solve the allocation, promote fused siblings, and re-solve with a
+    tightened target if promotion blew past the budget.
+
+    Promotion is allowed to inflate the achieved bits because vLLM's
+    fused tensor loader requires a single format per fused group. The
+    natural fix — already employed implicitly by the previous version —
+    is to reserve some headroom in the DP for promotion. We make this
+    explicit and adaptive: if promotion overshoots the requested target
+    by more than `overshoot_tolerance` bits/param, halve the overshoot
+    by tightening the next solve, and repeat up to `max_iters` times.
+
+    Returns (assignment, achieved_bits). Assignment is None if even the
+    untightened solve was infeasible.
+    """
+    tightened = float(target_bits)
+    last_assign: dict[str, str] | None = None
+    last_achieved = float("nan")
+    for _ in range(max_iters):
+        assign = solve_allocation(stats, candidates, tightened, bit_precision)
+        if assign is None:
+            return last_assign, last_achieved
+        if not no_fused_promote:
+            assign = promote_fused(assign, format_rank)
+        achieved, _ = compute_achieved(stats, assign, format_specs)
+        last_assign = assign
+        last_achieved = achieved
+        overshoot = achieved - target_bits
+        if overshoot <= overshoot_tolerance:
+            return assign, achieved
+        # Tighten by half the overshoot. This converges geometrically:
+        # if the first solve overshot by 0.1b, second by ~0.05b, etc.
+        tightened -= overshoot / 2.0
+        if tightened <= 0:
+            break
+    return last_assign, last_achieved
 
 
 # ---------------------------------------------------------------------------
@@ -140,26 +238,42 @@ def _shape_from_stats(entry: dict) -> tuple[int, ...]:
     return (n_params,)
 
 
-def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec]
+def predicted_dloss(h_trace: float, weight_mse: float,
+                    gain: float = 1.0) -> float:
+    """Per-(layer, format) predicted ΔL under the diagonal-Fisher model.
+
+    Δloss ≈ 0.5 · H_trace · MSE_W · α    (see module docstring eq. (3)).
+
+    `gain` is the optional per-format calibration scalar α_f. Default
+    1.0 leaves predictions uncalibrated.
+    """
+    return 0.5 * float(h_trace) * float(weight_mse) * float(gain)
+
+
+def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec],
+                     calibrated_gains: dict[str, float] | None = None
                      ) -> dict[str, list[Candidate]]:
-    """For each Linear, build its candidate list (one per format)."""
+    """For each Linear, build its candidate list (one per format).
+
+    Per-(layer, format) predicted Δloss uses the closed-form
+    diagonal-Fisher term `0.5 · h_trace · weight_mse` (see module
+    docstring), optionally scaled by per-format calibrated_gains[fmt].
+    """
+    gains = calibrated_gains or {}
     out: dict[str, list[Candidate]] = {}
     for name, s in stats.items():
         if name not in costs:
             continue
         h_trace = s["h_trace"]
-        d_out = s["out_features"]
         shape = _shape_from_stats(s)
         cands = []
         for spec in formats:
             entry = costs[name].get(spec.name)
             if entry is None or "error" in entry:
                 continue
-            # Predicted Δloss under Gauss-Newton approximation
-            #   Δloss ≈ 0.5 · sensitivity · perturbation
-            # where sensitivity (h_trace) is a second-derivative magnitude
-            # and perturbation is scaled by dim of the layer output.
-            predicted = 0.5 * h_trace * entry["output_mse"] * d_out
+            weight_mse = float(entry.get("weight_mse", 0.0))
+            gain = float(gains.get(spec.name, 1.0))
+            predicted = predicted_dloss(h_trace, weight_mse, gain=gain)
             cands.append(Candidate(
                 fmt=spec.name,
                 bits_per_param=spec.effective_bits_for_shape(shape),
@@ -205,6 +319,7 @@ def aggregate_moe_candidates(
     stats: dict, costs: dict, formats: list[fr.FormatSpec],
     candidates: dict[str, list[Candidate]],
     granularity: str = "projection",
+    calibrated_gains: dict[str, float] | None = None,
 ) -> tuple[dict, dict, dict]:
     """Aggregate per-expert Linears into per-layer MoE super-candidates.
 
@@ -219,13 +334,32 @@ def aggregate_moe_candidates(
          `model.layers.5.mlp.experts.*.gate_proj` becomes one group.
       2. Builds a synthetic "super-Linear" per group in returned stats_ext
          and costs_ext, with aggregated params/sensitivity/RTN errors.
-      3. Aggregated predicted Δloss per format = sum of per-expert
-         predicted Δloss (same as summing 0.5·h_i·mse_i,f·d_out_i).
+      3. The super-Linear's `n_params` = Σ_i n_params_i (so MSE_W terms
+         can be aggregated as a parameter-weighted mean).
+
+    The aggregated predicted Δloss for the super-Linear at format f is
+    the sum of per-expert predicted Δlosses, which under the closed-form
+    formula 0.5 · h_i · mse_i,f decomposes cleanly:
+
+        sum_pred(f) = Σ_i 0.5 · h_i · weight_mse_{i,f}
+
+    To make the super-Linear behave identically under
+    `predicted_dloss(h, mse, ...)` (which uses one h and one mse), we
+    pick the natural representatives:
+
+        h_super  = Σ_i h_i                (sum of per-expert Fisher trace)
+        mse_super(f) = sum_pred(f) / (0.5 · h_super) if h_super > 0 else 0
+
+    With that, `0.5 · h_super · mse_super(f)` reproduces sum_pred(f)
+    exactly. The super-Linear's `out_features` is preserved as the
+    expert's true `out_features` so downstream code that consults it
+    (e.g. the bake-off summary) sees a real shape, not a sentinel.
 
     Returns (stats_ext, costs_ext, candidates_ext) where non-expert
     Linears are unchanged and each MoE expert-group becomes one synthetic
     entry keyed by `<group>.__fused__.<projection>`.
     """
+    gains = calibrated_gains or {}
     expert_leaves: dict[tuple[str, str], list[str]] = {}
     non_expert_names: list[str] = []
     for name in stats:
@@ -245,15 +379,14 @@ def aggregate_moe_candidates(
                       if n in candidates}
 
     for (grp, projection), members in expert_leaves.items():
-        # Aggregate stats
         n_params = sum(stats[m_]["n_params"] for m_ in members)
-        d_out = stats[members[0]]["out_features"]
-        # Sum Fisher per-expert (already route-normalized if tracker existed;
-        # summing is the right "super-Linear" aggregation because the total
-        # loss-contribution of the fused layer = sum of per-expert
-        # contributions).
+        # Preserve a real out_features for the super-Linear: pick the
+        # representative expert's value (uniform across experts in a
+        # well-formed MoE). This avoids the previous out_features=1
+        # sentinel which forced downstream callers to special-case.
+        d_out = int(stats[members[0]]["out_features"])
+        d_in = int(stats[members[0]]["in_features"])
         sum_h = sum(stats[m_]["h_trace"] for m_ in members)
-        # Synthetic super-name
         super_name = f"{grp}.__fused__.{projection}"
 
         stats_ext[super_name] = {
@@ -263,8 +396,8 @@ def aggregate_moe_candidates(
             "w_max_abs": max(stats[m_]["w_max_abs"] for m_ in members),
             "w_norm_sq": sum(stats[m_]["w_norm_sq"] for m_ in members),
             "n_params": n_params,
-            "in_features": 1,
-            "out_features": 1,
+            "in_features": d_in,
+            "out_features": d_out,
             "n_tokens_seen": sum(stats[m_].get("n_tokens_seen", 0) for m_ in members),
             "route_prob": None,  # aggregation washes out per-expert route prob
             "router_path": None,
@@ -273,12 +406,12 @@ def aggregate_moe_candidates(
             "_memory_bytes_by_format": {},
         }
 
-        # Aggregate per-format cost = mean weight_mse (weighted by params)
-        # and mean output_mse (same weighting). Predicted Δloss at format f
-        # for the fused layer = 0.5 * h_sum_over_experts * output_mse_per_expert
-        # · d_out; if we use per-expert mse directly it doesn't aggregate
-        # correctly because different experts have different sensitivities.
-        # Instead we sum predicted Δloss across members per format.
+        # Per-format aggregation. The true summed Δloss across experts is
+        #     sum_pred(f) = Σ_i 0.5 · h_i · weight_mse_{i,f} · α_f
+        # Setting mse_super(f) = sum_pred(f) / (0.5 · sum_h · α_f) lets
+        # the super-Linear use the same closed-form predicted_dloss as
+        # any other Linear. The α_f gain is canceled in the inversion so
+        # build_candidates re-applies it cleanly.
         super_cost = {}
         for spec in formats:
             available_members = [
@@ -289,51 +422,52 @@ def aggregate_moe_candidates(
             if not available_members:
                 super_cost[spec.name] = {"error": "partial"}
                 continue
+            # Parameter-weighted mean weight_mse (correct expert-level summary
+            # because Σ_w (ΔW_w)² over the fused tensor equals the param-
+            # weighted average of per-expert mean (ΔW_w)²).
+            sum_weight_mse_x_params = 0.0
+            sum_params_avail = 0
+            for m_ in available_members:
+                p_i = stats[m_]["n_params"]
+                sum_weight_mse_x_params += costs[m_][spec.name]["weight_mse"] * p_i
+                sum_params_avail += p_i
+            mean_weight_mse = sum_weight_mse_x_params / max(sum_params_avail, 1)
             mean_output_mse = sum(
                 costs[m_][spec.name]["output_mse"] for m_ in available_members
             ) / len(available_members)
-            mean_weight_mse = sum(
-                costs[m_][spec.name]["weight_mse"] * stats[m_]["n_params"]
-                for m_ in available_members
-            ) / max(sum(stats[m_]["n_params"] for m_ in available_members), 1)
-            # sum of per-expert predicted Δloss, rescaled so the allocator's
-            # formula (0.5 * h_trace * output_mse * d_out) reproduces it
+
+            # True summed Δloss across all members at format f, using the
+            # closed-form per-(layer, format) term.
             sum_pred = 0.0
-            sum_weight_mse = 0.0
             for m_ in members:
                 c = costs.get(m_, {}).get(spec.name)
                 if c is None or "error" in c:
-                    c = {
-                        "weight_mse": mean_weight_mse,
-                        "output_mse": mean_output_mse,
-                    }
+                    c = {"weight_mse": mean_weight_mse,
+                         "output_mse": mean_output_mse}
                 h_i = stats[m_]["h_trace"]
-                d_i = stats[m_]["out_features"]
-                sum_pred += 0.5 * h_i * c["output_mse"] * d_i
-                sum_weight_mse += c["weight_mse"] * stats[m_]["n_params"]
-            # Invert to an "effective output_mse" so the allocator's
-            # predicted_dloss = 0.5 * sum_h * effective_mse * out_features
-            # matches the true summed Δloss. We use out_features=1 for the
-            # synthetic packed-MoE unit so mixed projection shapes collapse
-            # cleanly into one serving unit.
+                sum_pred += 0.5 * h_i * float(c["weight_mse"])
+
+            # Invert to an effective per-element MSE so build_candidates'
+            # formula 0.5 · sum_h · effective_mse · α_f reproduces sum_pred.
             if sum_h > 0:
-                eff_mse = sum_pred / (0.5 * sum_h)
+                effective_mse = sum_pred / (0.5 * sum_h)
             else:
-                eff_mse = 0.0
+                effective_mse = 0.0
+
             super_cost[spec.name] = {
-                "weight_mse": sum_weight_mse / max(n_params, 1),
-                "output_mse": eff_mse,
-                "rel_output_mse": eff_mse,  # not used by allocator
+                "weight_mse": effective_mse,
+                "output_mse": mean_output_mse,    # diagnostic only
+                "rel_output_mse": mean_output_mse,
             }
         costs_ext[super_name] = super_cost
 
-        # Build candidates for the super-Linear
         cands = []
         for spec in formats:
             entry = super_cost.get(spec.name)
             if entry is None or "error" in entry:
                 continue
-            predicted = 0.5 * sum_h * entry["output_mse"]
+            gain = float(gains.get(spec.name, 1.0))
+            predicted = predicted_dloss(sum_h, entry["weight_mse"], gain=gain)
             memory_bytes, bits_per_param = _aggregate_candidate_memory_bits(
                 members, spec, stats
             )
@@ -560,6 +694,16 @@ def main():
                          "'vllm_qwen3_5_packed_moe' collapses Qwen3.5/3.6 MoE "
                          "to legal packed serving units and restricts MoE "
                          "formats to the existing vLLM path.")
+    ap.add_argument("--calibration", default=None,
+                    help="Optional path to a calibrate_allocator.py JSON "
+                         "containing 'calibrated_gains[fmt] = α_fmt'. When "
+                         "present, the per-(layer, format) predicted Δloss "
+                         "is multiplied by α_fmt before the DP runs.")
+    ap.add_argument("--overshoot-tolerance", type=float, default=0.01,
+                    help="Maximum allowed overshoot (bits/param) of the "
+                         "achieved budget over the requested target after "
+                         "fused-sibling promotion. The DP is re-run with a "
+                         "tightened target until overshoot is within tol.")
     args = ap.parse_args()
 
     if args.threads > 0:
@@ -616,17 +760,39 @@ def main():
     print(f"[alloc] formats (low→high bits): "
           f"{[f'{s.name}({s.effective_bits:.2f}b)' for s in specs_sorted]}")
 
-    candidates = build_candidates(stats, costs, specs_sorted)
+    # Optional empirical calibration: per-format scalar gain α_f produced
+    # by calibrate_allocator.py. When absent, all gains default to 1.0.
+    calibrated_gains: dict[str, float] = {}
+    if args.calibration:
+        with open(args.calibration) as f:
+            cal_payload = json.load(f)
+        cal_raw = cal_payload.get("calibrated_gains") or {}
+        for fmt_name, gain_val in cal_raw.items():
+            try:
+                calibrated_gains[fmt_name] = float(gain_val)
+            except (TypeError, ValueError):
+                continue
+        if calibrated_gains:
+            print(f"[alloc] calibration loaded from {args.calibration}: "
+                  f"{ {k: round(v, 4) for k, v in calibrated_gains.items()} }",
+                  flush=True)
+        else:
+            print(f"[alloc] WARNING: {args.calibration} has no usable "
+                  f"calibrated_gains; running uncalibrated", flush=True)
+
+    candidates = build_candidates(stats, costs, specs_sorted, calibrated_gains)
     print(f"[alloc] candidates built for {len(candidates)} Linears")
 
     if args.target_profile == "vllm_qwen3_5_packed_moe":
         stats, costs, candidates = aggregate_moe_candidates(
-            stats, costs, specs_sorted, candidates, granularity="layer")
+            stats, costs, specs_sorted, candidates, granularity="layer",
+            calibrated_gains=calibrated_gains)
         moe_groups = sum(1 for n in candidates if ".__fused__." in n)
         print(f"[alloc] packed-MoE serving aggregation: {moe_groups} fused MoE blocks")
     elif args.expert_granularity == "layer":
         stats, costs, candidates = aggregate_moe_candidates(
-            stats, costs, specs_sorted, candidates, granularity="projection")
+            stats, costs, specs_sorted, candidates, granularity="projection",
+            calibrated_gains=calibrated_gains)
         moe_groups = sum(1 for n in candidates if ".__fused__." in n)
         print(f"[alloc] MoE aggregation: {moe_groups} fused-expert super-Linears")
 
@@ -636,21 +802,24 @@ def main():
     targets = [float(x) for x in args.pareto_targets.split(",")]
     curve = []
     for t in targets:
-        assignment = solve_allocation(stats, candidates, t, args.bit_precision)
+        assignment, achieved = solve_with_promotion(
+            stats, candidates, t, format_specs, format_rank,
+            args.bit_precision,
+            no_fused_promote=args.no_fused_promote,
+            overshoot_tolerance=args.overshoot_tolerance,
+        )
         if assignment is None:
             curve.append({"target_bits": t, "feasible": False})
             continue
-        if not args.no_fused_promote:
-            assignment = promote_fused(assignment, format_rank)
-        achieved, _ = compute_achieved(stats, assignment, format_specs)
         total_dloss = 0.0
         format_counts = defaultdict(int)
         format_params = defaultdict(int)
         for name, fmt in assignment.items():
             entry = costs[name].get(fmt, {})
-            d_out = stats[name]["out_features"]
-            total_dloss += 0.5 * stats[name]["h_trace"] * entry.get(
-                "output_mse", 0.0) * d_out
+            gain = float(calibrated_gains.get(fmt, 1.0))
+            total_dloss += predicted_dloss(
+                stats[name]["h_trace"], entry.get("weight_mse", 0.0), gain=gain,
+            )
             format_counts[fmt] += 1
             format_params[fmt] += stats[name]["n_params"]
         curve.append({
@@ -694,14 +863,16 @@ def main():
               f"{row['predicted_dloss']:>14.4e}   {fmt_str}")
 
     # Emit chosen layer_config for target_bits
-    assignment = solve_allocation(stats, candidates, args.target_bits,
-                                   args.bit_precision)
+    assignment, achieved = solve_with_promotion(
+        stats, candidates, args.target_bits, format_specs, format_rank,
+        args.bit_precision,
+        no_fused_promote=args.no_fused_promote,
+        overshoot_tolerance=args.overshoot_tolerance,
+    )
     if assignment is None:
         raise SystemExit(
             f"Infeasible at target_bits={args.target_bits}. "
             "Consider raising the target or widening the format set.")
-    if not args.no_fused_promote:
-        assignment = promote_fused(assignment, format_rank)
 
     # Expand MoE super-Linears back to per-expert entries before writing
     # the AutoRound layer_config (which expects one entry per individual
@@ -710,7 +881,6 @@ def main():
         assignment_expanded = expand_moe_assignment(assignment, stats)
     else:
         assignment_expanded = assignment
-    achieved, _ = compute_achieved(stats, assignment, format_specs)
 
     layer_cfg = {}
     for name, fmt in assignment_expanded.items():

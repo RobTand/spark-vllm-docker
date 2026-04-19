@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from quantization.dynaquant.incremental_measure_quant_cost import merge_cost_pickles
+from quantization.prismquant.incremental_measure_quant_cost import merge_cost_pickles
 
 
 class TestIncrementalMeasureQuantCost(unittest.TestCase):

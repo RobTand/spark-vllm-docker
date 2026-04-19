@@ -25,14 +25,14 @@ from quantization.build_rtn_cache import (
     load_wikitext_calibration,
     stage_multimodal,
 )
-from quantization.dynaquant.calibrate_allocator import (
+from quantization.prismquant.calibrate_allocator import (
     apply_recipe_in_place,
     build_module_param_map,
     install_activation_hooks,
     measure_avg_last_token_kl,
     restore_in_place,
 )
-from quantization.dynaquant.interaction_refine import RefinementUnit, UnitOption, expand_unit_assignment
+from quantization.prismquant.interaction_refine import RefinementUnit, UnitOption, expand_unit_assignment
 
 
 def _load_units(payload: dict):
@@ -162,7 +162,7 @@ def main():
             assignment = dict(payload["base_assignment"])
             assignment.update(expand_unit_assignment(units, choices))
             if payload["expert_granularity"] == "layer":
-                from quantization.dynaquant.allocator import expand_moe_assignment
+                from quantization.prismquant.allocator import expand_moe_assignment
 
                 stats_alloc = {}
                 for row in payload["selected_units"]:

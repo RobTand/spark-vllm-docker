@@ -13,7 +13,11 @@ from pathlib import Path
 
 import torch
 
-from .incremental_probe import build_layer_shard_regexes, load_num_hidden_layers
+from .incremental_probe import (
+    build_extended_shard_regexes,
+    build_layer_shard_regexes,
+    load_num_hidden_layers,
+)
 from .measure_quant_cost import (
     load_cost_model,
     prepare_cost_context,
@@ -66,7 +70,6 @@ def main():
     ap.add_argument("--threads", type=int, default=0)
     ap.add_argument("--mode", choices=["auto", "batched", "unbatched"], default="auto")
     ap.add_argument("--chunk-size", type=int, default=256)
-    ap.add_argument("--no-unfuse-moe", action="store_false", dest="unfuse_moe", default=True)
     ap.add_argument("--swap-grow-limit-mb", type=int, default=256)
     ap.add_argument("--min-mem-available-mb", type=int, default=2048)
     ap.add_argument("--no-watchdog", action="store_true")
@@ -81,12 +84,22 @@ def main():
     if start >= end:
         raise SystemExit(f"empty layer range: start={start} end={end}")
 
-    all_regexes = build_layer_shard_regexes(n_layers,
-                                            args.layers_per_shard,
-                                            layer_prefix="model.layers")
+    body_regexes = build_layer_shard_regexes(n_layers,
+                                             args.layers_per_shard,
+                                             layer_prefix="model.layers")
     first_shard = start // args.layers_per_shard
     last_shard = (end + args.layers_per_shard - 1) // args.layers_per_shard
-    shard_regexes = all_regexes[first_shard:last_shard]
+    shard_regexes = body_regexes[first_shard:last_shard]
+    # MTP / visual / lm_head shards match the probe's coverage so cost
+    # has measurements for every probe stat entry.
+    extra = build_extended_shard_regexes(
+        args.model, args.layers_per_shard,
+        include_body=False,
+        include_mtp=True,
+        include_visual=True,
+        include_lm_head=True,
+    )
+    shard_regexes = shard_regexes + extra
 
     work_dir = Path(args.work_dir)
     shard_dir = work_dir / "shards"
@@ -106,7 +119,6 @@ def main():
     )
     print(f"[incremental-cost] loading model once for {len(shard_regexes)} shards", flush=True)
     model = load_cost_model(args.model, args.device, dtype,
-                            unfuse_moe=args.unfuse_moe,
                             device_map=args.device_map)
     if not args.no_watchdog:
         start_mem_watchdog(swap_grow_limit_mb=args.swap_grow_limit_mb,

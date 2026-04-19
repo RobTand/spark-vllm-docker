@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""measure_interactions.py — sparse pairwise interaction probing for DynaQuant.
+"""measure_interactions.py — sparse pairwise interaction probing for PrismQuant.
 
 Build a base additive assignment at a target bit budget, select the most
 important refinement units near that point, and measure actual KL deltas for
@@ -16,8 +16,8 @@ from pathlib import Path
 
 import torch
 
-from quantization.dynaquant import format_registry as fr
-from quantization.dynaquant.allocator import (
+from quantization.prismquant import format_registry as fr
+from quantization.prismquant.allocator import (
     aggregate_moe_candidates,
     build_candidates,
     compute_achieved,
@@ -25,14 +25,14 @@ from quantization.dynaquant.allocator import (
     promote_fused,
     solve_allocation,
 )
-from quantization.dynaquant.calibrate_allocator import (
+from quantization.prismquant.calibrate_allocator import (
     apply_recipe_in_place,
     build_module_param_map,
     install_activation_hooks,
     load_inputs,
     measure_avg_last_token_kl,
 )
-from quantization.dynaquant.interaction_refine import (
+from quantization.prismquant.interaction_refine import (
     build_refinement_units,
     expand_unit_assignment,
     make_pair_key,
@@ -85,7 +85,7 @@ def _measure_recipe(
     finally:
         for handle in hook_handles:
             handle.remove()
-        from quantization.dynaquant.calibrate_allocator import restore_in_place
+        from quantization.prismquant.calibrate_allocator import restore_in_place
 
         restore_in_place(originals)
         if torch.cuda.is_available():

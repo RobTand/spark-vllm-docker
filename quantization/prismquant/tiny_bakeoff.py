@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tiny_bakeoff.py — one-command tiny-model DynaQuant regression bakeoff.
+"""tiny_bakeoff.py — one-command tiny-model PrismQuant regression bakeoff.
 
 This orchestrates the canonical small-model validation loop:
 
@@ -34,7 +34,7 @@ DEFAULT_MODEL = (
 DEFAULT_PROBE = "/tmp/tiny_probe.pkl"
 DEFAULT_COSTS = "/tmp/tiny_cost.pkl"
 DEFAULT_ACT_CACHE = "/tmp/tiny_act"
-DEFAULT_OUTPUT_DIR = "/tmp/dynaquant_tiny_bakeoff"
+DEFAULT_OUTPUT_DIR = "/tmp/prismquant_tiny_bakeoff"
 
 
 def _run(cmd: list[str], cwd: str, dry_run: bool):
@@ -85,7 +85,7 @@ def build_bakeoff_commands(args) -> tuple[dict[str, Path], list[list[str]]]:
         commands.append([
             sys.executable,
             "-m",
-            "quantization.dynaquant.local_reconstruct",
+            "quantization.prismquant.local_reconstruct",
             "--model", args.model,
             "--probe", args.probe,
             "--costs", args.costs,
@@ -108,7 +108,7 @@ def build_bakeoff_commands(args) -> tuple[dict[str, Path], list[list[str]]]:
         commands.append([
             sys.executable,
             "-m",
-            "quantization.dynaquant.measure_interactions",
+            "quantization.prismquant.measure_interactions",
             "--model", args.model,
             "--probe", args.probe,
             "--costs", str(paths["costs_refined"]),
@@ -125,7 +125,7 @@ def build_bakeoff_commands(args) -> tuple[dict[str, Path], list[list[str]]]:
         commands.append([
             sys.executable,
             "-m",
-            "quantization.dynaquant.calibrate_allocator",
+            "quantization.prismquant.calibrate_allocator",
             "--model", args.model,
             "--probe", args.probe,
             "--costs", str(paths["costs_refined"]),
@@ -140,7 +140,7 @@ def build_bakeoff_commands(args) -> tuple[dict[str, Path], list[list[str]]]:
         commands.append([
             sys.executable,
             "-m",
-            "quantization.dynaquant.quadratic_refine_allocator",
+            "quantization.prismquant.quadratic_refine_allocator",
             "--interactions", str(paths["interactions"]),
             "--calibration", str(paths["calibration"]),
             "--output", str(paths["refined"]),
@@ -149,7 +149,7 @@ def build_bakeoff_commands(args) -> tuple[dict[str, Path], list[list[str]]]:
             commands.append([
                 sys.executable,
                 "-m",
-                "quantization.dynaquant.oracle_search",
+                "quantization.prismquant.oracle_search",
                 "--interactions", str(paths["interactions"]),
                 "--model", args.model,
                 "--n-calib-samples", str(args.n_calib_samples),
@@ -161,7 +161,7 @@ def build_bakeoff_commands(args) -> tuple[dict[str, Path], list[list[str]]]:
         bakeoff_cmd = [
             sys.executable,
             "-m",
-            "quantization.dynaquant.bakeoff",
+            "quantization.prismquant.bakeoff",
             "--calibration", str(paths["calibration"]),
             "--candidate", "refined",
             "--refined", str(paths["refined"]),

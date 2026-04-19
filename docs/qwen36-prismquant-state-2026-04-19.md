@@ -1,8 +1,8 @@
-# Qwen3.6 DynaQuant State - 2026-04-19
+# Qwen3.6 PrismQuant State - 2026-04-19
 
 ## Summary
 
-The repo now has a working end-to-end path from DynaQuant analysis to a locally served
+The repo now has a working end-to-end path from PrismQuant analysis to a locally served
 `Qwen3.6-35B-A3B` artifact on a single GB10/Spark-class machine.
 
 The current served artifact is:
@@ -14,9 +14,9 @@ repo-patched vLLM path and has been verified to serve completions successfully.
 
 ## What Works
 
-### 1. DynaQuant analysis on Qwen3.6 MoE
+### 1. PrismQuant analysis on Qwen3.6 MoE
 
-The Qwen3.6 MoE path was fixed so that DynaQuant correctly sees:
+The Qwen3.6 MoE path was fixed so that PrismQuant correctly sees:
 
 - packed experts
 - routers
@@ -47,11 +47,11 @@ Key recent changes:
 ### 3. Qwen3.6 materialization
 
 The direct `llmcompressor` mixed-native path was not sufficient for packed Qwen3.6 MoE.
-The working route instead uses the repo’s DynaQuant export/runtime path:
+The working route instead uses the repo’s PrismQuant export/runtime path:
 
-- `quantization/export_dynaquant_ct.py`
-- `quantization/dynaquant_pkg/patch_vllm.py`
-- `quantization/dynaquant_pkg/dynaquant_moe.py`
+- `quantization/export_prismquant_ct.py`
+- `quantization/prismquant_pkg/patch_vllm.py`
+- `quantization/prismquant_pkg/prismquant_moe.py`
 
 This produced:
 
@@ -147,7 +147,7 @@ quantize them.
 
 ### Upstreamability
 
-The current DynaQuant MoE runtime path is a local proof path, not an upstream-friendly
+The current PrismQuant MoE runtime path is a local proof path, not an upstream-friendly
 vLLM architecture.
 
 It relies on:
@@ -167,7 +167,7 @@ The standard native mixed-format route is still preferable long-term where possi
 - FP8
 - MXFP8
 
-But packed Qwen3.6 MoE currently required the repo’s DynaQuant-specific runtime bridge
+But packed Qwen3.6 MoE currently required the repo’s PrismQuant-specific runtime bridge
 to get a real served model.
 
 ## Current Recommended Launch
@@ -204,23 +204,23 @@ vllm serve /workspace/Qwen3.6-35B-A3B-DQ-SERVE \
    - no return to `FULL_AND_PIECEWISE`
 
 4. Decide whether to spend effort on:
-   - making the DynaQuant custom MoE path faster locally
-   - or translating the winning DynaQuant policy into a more upstream-compatible format/runtime path
+   - making the PrismQuant custom MoE path faster locally
+   - or translating the winning PrismQuant policy into a more upstream-compatible format/runtime path
 
 ## Files To Know
 
-- `quantization/dynaquant/allocator.py`
-- `quantization/dynaquant/measure_quant_cost.py`
-- `quantization/export_dynaquant_ct.py`
-- `quantization/dynaquant_pkg/patch_vllm.py`
-- `quantization/dynaquant_pkg/dynaquant_moe.py`
-- `recipes/qwen3.5-35b-a3b-dynaquant.yaml`
+- `quantization/prismquant/allocator.py`
+- `quantization/prismquant/measure_quant_cost.py`
+- `quantization/export_prismquant_ct.py`
+- `quantization/prismquant_pkg/patch_vllm.py`
+- `quantization/prismquant_pkg/prismquant_moe.py`
+- `recipes/qwen3.5-35b-a3b-prismquant.yaml`
 
 ## Bottom Line
 
 The project crossed the important threshold:
 
-- DynaQuant analysis works on Qwen3.6 MoE
+- PrismQuant analysis works on Qwen3.6 MoE
 - a local exported artifact exists
 - that artifact serves in vLLM on this hardware
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""bakeoff.py — decide whether a DynaQuant change is worth keeping.
+"""bakeoff.py — decide whether a PrismQuant change is worth keeping.
 
 This script compares a candidate run against:
   - the additive baseline calibration
@@ -51,6 +51,35 @@ def _load_refined_point(path: str, calibrated_kl: float) -> Point:
     )
 
 
+def _load_refined_actual_kl(path: str) -> float | None:
+    """Pull the measured KL of the refined recipe out of a calibration
+    JSON, if one was produced after re-running calibrate_allocator.py
+    against the refined assignment.
+
+    Accepts either:
+      - a calibrate_allocator.py output containing `results: [...]` with
+        a single entry tagged for the refined recipe, or
+      - a small JSON `{ "actual_last_token_kl": <float> }` written by
+        an ad-hoc measurement script.
+
+    Returns None if no usable value is found.
+    """
+    with open(path) as f:
+        data = json.load(f)
+    if isinstance(data, dict) and "actual_last_token_kl" in data:
+        try:
+            return float(data["actual_last_token_kl"])
+        except (TypeError, ValueError):
+            return None
+    results = data.get("results") if isinstance(data, dict) else None
+    if isinstance(results, list) and results:
+        try:
+            return float(results[0]["actual_last_token_kl"])
+        except (TypeError, ValueError, KeyError):
+            return None
+    return None
+
+
 def _load_oracle_best(path: str) -> Point:
     with open(path) as f:
         data = json.load(f)
@@ -58,7 +87,8 @@ def _load_oracle_best(path: str) -> Point:
     return Point("oracle", float(best["bits_per_param"]), float(best["actual_last_token_kl"]))
 
 
-def _summarize(candidate: Point, baseline: Point, oracle: Point | None):
+def _summarize(candidate: Point, baseline: Point, oracle: Point | None,
+               candidate_actual_kl: float | None = None):
     out = {
         "candidate": candidate.__dict__,
         "baseline": baseline.__dict__,
@@ -70,6 +100,18 @@ def _summarize(candidate: Point, baseline: Point, oracle: Point | None):
         out["oracle_gap_signed"] = candidate.kl - oracle.kl
         out["oracle_gap_abs"] = abs(candidate.kl - oracle.kl)
         out["oracle_gap_rel"] = abs(candidate.kl - oracle.kl) / max(abs(oracle.kl), 1e-12)
+    if candidate_actual_kl is not None:
+        # The candidate.kl coming from a refined recipe is the unary +
+        # pairwise interaction-model PREDICTION. If we also have the
+        # actually measured KL of that recipe, the residual quantifies
+        # how much the sparse-pairwise model failed to capture (triples
+        # and out-of-knee interactions).
+        residual = float(candidate_actual_kl) - float(candidate.kl)
+        out["candidate_actual_kl"] = float(candidate_actual_kl)
+        out["interaction_model_residual_kl"] = residual
+        out["interaction_model_residual_kl_rel"] = (
+            residual / max(abs(candidate.kl - baseline.kl), 1e-12)
+        )
     return out
 
 
@@ -95,6 +137,17 @@ def main():
     ap.add_argument("--candidate", choices=["baseline", "knee", "high", "refined"], default="knee")
     ap.add_argument("--refined", help="quadratic_refine_allocator output when --candidate refined")
     ap.add_argument("--oracle", help="oracle_search output")
+    ap.add_argument("--refined-actual-kl",
+                    help="Optional path to a JSON containing the actually "
+                         "measured KL of the refined recipe (e.g. a second "
+                         "calibrate_allocator.py run). Enables an "
+                         "interaction-model residual diagnostic: "
+                         "measured_kl - predicted_kl tells us how much the "
+                         "sparse-pairwise interaction model under- or "
+                         "over-estimates the truth.")
+    ap.add_argument("--refined-actual-kl-value", type=float, default=None,
+                    help="Same as --refined-actual-kl but pass the float "
+                         "directly. Useful in scripted bake-offs.")
     ap.add_argument("--max-kl-regression", type=float, default=1e-3)
     ap.add_argument("--min-kl-gain", type=float, default=1e-3)
     ap.add_argument("--max-oracle-gap", type=float, default=5e-3)
@@ -111,7 +164,14 @@ def main():
         candidate = _load_calibration_point(args.calibration, args.candidate)
     oracle = _load_oracle_best(args.oracle) if args.oracle else None
 
-    summary = _summarize(candidate, baseline, oracle)
+    candidate_actual_kl: float | None = None
+    if args.refined_actual_kl_value is not None:
+        candidate_actual_kl = float(args.refined_actual_kl_value)
+    elif args.refined_actual_kl:
+        candidate_actual_kl = _load_refined_actual_kl(args.refined_actual_kl)
+
+    summary = _summarize(candidate, baseline, oracle,
+                         candidate_actual_kl=candidate_actual_kl)
     decision, reason = _decision(
         summary,
         max_kl_regression=args.max_kl_regression,

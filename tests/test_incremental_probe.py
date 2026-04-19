@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from quantization.dynaquant.incremental_probe import (
+from quantization.prismquant.incremental_probe import (
     build_layer_shard_regexes,
     merge_probe_pickles,
 )

@@ -1,11 +1,47 @@
 #!/usr/bin/env python3
-"""sensitivity_probe.py — per-Linear curvature measurement.
+"""sensitivity_probe.py — per-Linear empirical Fisher diagonal trace.
 
-Cleaned rewrite of streaming_hawq_v2.py, now inside the dynaquant package.
-Removes the broken Hutchinson stub; Fisher trace stays the default. Adds:
+What this measures
+------------------
+For each tracked Linear with weight W, this script estimates the
+per-token empirical Fisher diagonal trace
 
-  - route-aware MoE scaling (discover routers by walking module tree)
-  - per-token importance weighting (harder tokens count more)
+    H_trace = Σ_w E_token[(∂L/∂W_w)²]
+
+where L is the per-token negative log-likelihood (same loss a language
+model is trained against) and the expectation is over a calibration
+corpus. This quantity is used by allocator.py as the sensitivity score
+in the closed-form predicted Δloss
+
+    Δloss ≈ 0.5 · H_trace · MSE_W                           (eq. 3 in
+                                                             allocator.py)
+
+Naming. The literature uses several names for E[(∂L/∂W)²]: "empirical
+Fisher", "Gauss-Newton diagonal", "gradient-squared". This is NOT the
+true Hessian diagonal — for that you would need a vHv-style probe
+(Hutchinson). The empirical Fisher equals the Hessian only at a true
+loss minimum, which a calibration corpus does not in general satisfy.
+For ranking layers and predicting first-order quantization sensitivity,
+empirical Fisher is the standard HAWQ-V1 choice and works well.
+
+How the per-token estimator stays unbiased
+------------------------------------------
+HuggingFace's `out.loss` is `mean(CE)` over the T tokens in a batch, so
+its gradient is `(1/T) · Σ_t ∂CE_t/∂W`. Squaring that under-estimates
+per-token Fisher by a factor of T (under the standard assumption of
+independent per-token gradients). To avoid that, we reconstruct CE with
+`reduction="sum"` for the backward pass; the gradient then aggregates
+per-token gradients without the 1/T factor, and dividing the
+accumulated `||grad_W||²_F` by total tokens recovers the per-token
+Fisher trace estimator directly.
+
+Other features:
+  - route-aware MoE scaling (discover routers by walking module tree;
+    divide each expert's H_trace by observed routing probability so
+    sparse experts' Fisher is comparable to dense layers')
+  - per-token importance weighting (harder tokens count more); this
+    reweights the loss but preserves the per-token-Fisher units when
+    used with sum reduction
   - activation snapshot cache for measure_quant_cost.py
 
 Memory:
@@ -58,17 +94,20 @@ def stage_text_only(model_path: str) -> str:
     if "text_config" in cfg:
         tc = cfg.pop("text_config")
         for k, v in tc.items():
+            if k == "model_type":
+                # Don't shadow the top-level model_type with the inner
+                # sub-schema name (e.g. qwen3_5_moe_text). The outer
+                # model_type is what AutoModel registries match against.
+                continue
             if k not in cfg:
                 cfg[k] = v
-        if "model_type" in tc:
-            cfg["model_type"] = tc["model_type"]
     archs = cfg.get("architectures", [])
     if archs:
         cfg["architectures"] = [
             a.replace("ForConditionalGeneration", "ForCausalLM") for a in archs
         ]
 
-    staged = Path(tempfile.mkdtemp(prefix="dynaquant_stage_"))
+    staged = Path(tempfile.mkdtemp(prefix="prismquant_stage_"))
     skip = {"config.json", "preprocessor_config.json",
             "video_preprocessor_config.json", "processor_config.json"}
     for p in src.iterdir():
@@ -80,70 +119,236 @@ def stage_text_only(model_path: str) -> str:
     return str(staged)
 
 
-def prepare_model_for_moe_linears(model: nn.Module) -> str | None:
-    """Unfuse supported packed MoE expert tensors into per-expert nn.Linear.
+class _GradNormCapture(torch.autograd.Function):
+    """Identity in forward; in backward, accumulates the squared Frobenius
+    norm of the incoming gradient into a per-name scalar in `accumulator`,
+    then returns None for the weight gradient — which tells autograd to
+    NOT accumulate to the leaf parameter's .grad.
 
-    Returns the target device string used for the unfused linears when any
-    change was made, else None.
+    Used to capture the per-token empirical Fisher diagonal trace of a
+    packed expert tensor (e.g. Qwen3.6's `gate_up_proj` of shape
+    `[E, 2*I, H]`) without ever storing a full-size .grad on the leaf.
 
-    This prefers AutoRound's public helper, but falls back to the lower-level
-    expert-interface unfuser with `check_decorator=False` for model families
-    like Qwen3.6 whose experts implement the same packed shape conventions
-    yet do not pass the public decorator gate cleanly.
+    Why return None? With 40 MoE layers × 2 packed params × ~5 GB of
+    bf16 grads = 400 GB if .grad were retained per leaf. By returning
+    None we tell autograd "this input doesn't need a stored gradient";
+    .grad stays None on the leaf and only the transient grad_output
+    (one per backward node, freed in topological order) is alive at
+    any one time.
+
+    The norm is summed in chunks to keep the squared-tensor intermediate
+    small; the parameter itself can be 5+ GB on a 35B model.
     """
-    try:
-        from auto_round.modeling.fused_moe import prepare_model_for_moe_quantization
-        from auto_round.modeling.fused_moe.moe_experts_interface import (
-            LINEAR_LOOP_IMPL,
-            _unfuse_experts_weights_inplace,
-            register_linear_loop_experts,
-        )
-    except ImportError:
-        return None
 
-    target_dev = None
-    for p in model.parameters():
-        target_dev = p.device
-        if p.device.type != "cpu":
-            break
-    if target_dev is None:
-        target_dev = torch.device("cpu")
+    @staticmethod
+    def forward(ctx, weight, name, accumulator):
+        ctx.name = name
+        ctx.accumulator = accumulator
+        return weight
 
-    unfused_modules: list[str] = []
-    try:
-        unfused_modules = prepare_model_for_moe_quantization(model) or []
-    except Exception:
-        unfused_modules = []
+    @staticmethod
+    def backward(ctx, grad_output):
+        if grad_output is None:
+            return None, None, None
+        flat = grad_output.detach().reshape(-1)
+        # Streaming sum keeps the squared intermediate well under the
+        # full-tensor size. 1e6 elements × 4 B = 4 MB per chunk.
+        chunk = 1_000_000
+        total = 0.0
+        for i in range(0, flat.numel(), chunk):
+            total += float(flat[i:i + chunk].float().pow(2).sum().item())
+        ctx.accumulator[ctx.name] = ctx.accumulator.get(ctx.name, 0.0) + total
+        # Return None so no .grad allocation accumulates on the leaf
+        # parameter. PyTorch handles None as "no gradient contribution".
+        return None, None, None
 
-    # Fallback: forcibly unfuse any experts module carrying packed 3D
-    # parameters (e.g. Qwen3.6's gate_up_proj/down_proj) even when the
-    # public helper declines due to decorator checks.
-    forced_modules: list[str] = []
-    if not unfused_modules:
-        try:
-            register_linear_loop_experts()
-        except Exception:
-            pass
-        for name, module in model.named_modules():
+
+_PACKED_EXPERT_PARAM_NAMES = {
+    "gate_up_proj", "down_proj",            # Qwen3.5 / 3.6 packed MoE
+    "w1", "w2", "w3",                       # Mixtral-style legacy
+    "gate_proj", "up_proj",                 # Some HF layouts
+}
+
+
+def _is_packed_experts_module(module: nn.Module) -> bool:
+    """A module qualifies as a packed-experts container iff (a) its
+    class name contains "Experts" (case-insensitive), and (b) it owns
+    at least one 3D nn.Parameter whose attribute name is in
+    `_PACKED_EXPERT_PARAM_NAMES`.
+
+    The class-name check excludes other modules that happen to own 3D
+    parameters — most importantly Conv1d in linear-attention paths,
+    whose `weight` is shape `[out, in, kernel]`. The param-name check
+    is a second safety net against unusual modules with unrelated 3D
+    state.
+    """
+    cls_name = type(module).__name__.lower()
+    if "expert" not in cls_name:
+        return False
+    for n, p in module.named_parameters(recurse=False):
+        if (isinstance(p, nn.Parameter)
+                and p.dim() == 3
+                and n in _PACKED_EXPERT_PARAM_NAMES):
+            return True
+    return False
+
+
+def _packed_experts_param_names(module: nn.Module) -> list[str]:
+    """Return the attribute names of all 3D packed parameters on
+    `module`, restricted to the known MoE expert names. Order is stable
+    across Python runs."""
+    names = []
+    for n, p in module.named_parameters(recurse=False):
+        if (isinstance(p, nn.Parameter)
+                and p.dim() == 3
+                and n in _PACKED_EXPERT_PARAM_NAMES):
+            names.append(n)
+    return sorted(names)
+
+
+_PRISMQUANT_PATCH_SENTINEL = "_prismquant_packed_expert_patch"
+
+
+def install_packed_expert_hooks(
+    model: nn.Module,
+    accumulator: dict,
+) -> dict[str, dict]:
+    """Patch every packed-experts module's forward so its 3D parameters
+    route through `_GradNormCapture` before each use.
+
+    Returns a metadata dict keyed by `<module_qname>.<param_name>` with
+    the same shape/role information stored for nn.Linear modules in
+    `FisherAccumulator`. The probe inserts these into its main `stats`
+    dict so the allocator can treat them uniformly.
+
+    Idempotent across calls. If a module has already been patched (by
+    a prior call within the same Python process), we re-bind the
+    grad-norm dict reference to the new `accumulator` rather than
+    wrapping the patch again. This is essential for the incremental
+    probe path, which constructs a fresh FisherAccumulator per shard
+    against a single loaded model.
+
+    Activation snapshotting for measure_quant_cost is handled by
+    `FisherAccumulator` directly (forward hook on the experts module).
+    """
+    meta: dict[str, dict] = {}
+    for qname, module in model.named_modules():
+        if not _is_packed_experts_module(module):
+            continue
+        param_names = _packed_experts_param_names(module)
+        if not param_names:
+            continue
+
+        # Idempotent re-bind path. The sentinel holds a reference to the
+        # mutable accumulator dict that patched_forward writes to. We
+        # rebind it (clear contents and adopt the new dict's identity by
+        # swapping references) — but the simpler primitive is to update
+        # the closure's *target dict identity* via attribute, since
+        # patched_forward's closure already binds the original dict by
+        # reference. Easiest: store the live accumulator on the module
+        # and have patched_forward read it indirectly each call.
+        if hasattr(module, _PRISMQUANT_PATCH_SENTINEL):
+            # Update the live accumulator binding for this module's patch.
+            setattr(module, _PRISMQUANT_PATCH_SENTINEL, accumulator)
+            # Still report metadata so callers can refresh their stats dict.
+            for pn in param_names:
+                p_existing = module._parameters.get(pn)
+                if p_existing is None:
+                    continue
+                shape = tuple(p_existing.shape)
+                full_name = f"{qname}.{pn}" if qname else pn
+                meta[full_name] = {
+                    "h_trace_raw": 0.0,
+                    "h_w2_sum_raw": 0.0,
+                    "w_max_abs": float(p_existing.detach().abs().max().item()),
+                    "w_norm_sq": float(p_existing.detach().pow(2).sum().item()),
+                    "n_params": int(p_existing.numel()),
+                    "in_features": int(shape[2]),
+                    "out_features": int(shape[1]),
+                    "num_experts": int(shape[0]),
+                    "n_tokens_seen": 0,
+                    "route_prob": None,
+                    "router_path": None,
+                    "expert_id": None,
+                    "_packed_experts_module": qname,
+                    "_packed_param": pn,
+                }
+            continue
+
+        # Enable grad on packed params so autograd computes their gradient
+        # through our identity wrapper.
+        for pn in param_names:
+            getattr(module, pn).requires_grad_(True)
+
+        for pn in param_names:
+            p: nn.Parameter = getattr(module, pn)
+            full_name = f"{qname}.{pn}" if qname else pn
+            shape = tuple(p.shape)
+            # Convention: shape[0] = num_experts; the per-expert matrix is
+            # the trailing two dims. Use (out_features, in_features) =
+            # (shape[1], shape[2]) to match nn.Linear's convention; the
+            # allocator's predicted_dloss only needs n_params correct.
+            num_experts = int(shape[0])
+            out_features = int(shape[1])
+            in_features = int(shape[2])
+            n_params = int(p.numel())
+            meta[full_name] = {
+                "h_trace_raw": 0.0,
+                "h_w2_sum_raw": 0.0,  # not measured for packed; kept for schema
+                "w_max_abs": float(p.detach().abs().max().item()),
+                "w_norm_sq": float(p.detach().pow(2).sum().item()),
+                "n_params": n_params,
+                "in_features": in_features,
+                "out_features": out_features,
+                "num_experts": num_experts,
+                "n_tokens_seen": 0,
+                "route_prob": None,  # rolled into per-expert sensitivity by sum
+                "router_path": None,
+                "expert_id": None,
+                "_packed_experts_module": qname,
+                "_packed_param": pn,
+            }
+
+        # Patch forward to wrap each packed param with _GradNormCapture.
+        # The original forward uses self.<pn>; we shadow those attributes
+        # with the wrapped tensors for the duration of the call. nn.Module
+        # __getattribute__ checks _parameters before __dict__, so we have
+        # to temporarily move the param out of _parameters and shadow via
+        # __dict__ to make the wrapped tensor visible to the original
+        # forward.
+        original_forward = module.forward
+        ns = list(param_names)
+        full_names = [f"{qname}.{pn}" if qname else pn for pn in ns]
+        mod_ref = module
+
+        # Store the live accumulator as an attribute so subsequent calls
+        # to install_packed_expert_hooks can re-bind it (per-shard) by
+        # just updating this attribute. patched_forward reads it
+        # indirectly each invocation via getattr.
+        setattr(mod_ref, _PRISMQUANT_PATCH_SENTINEL, accumulator)
+
+        def patched_forward(*args, _ns=ns, _full=full_names, _orig=original_forward,
+                            _mod=mod_ref, **kwargs):
+            acc = getattr(_mod, _PRISMQUANT_PATCH_SENTINEL, None)
+            if acc is None:
+                # Should not happen, but degrade gracefully.
+                return _orig(*args, **kwargs)
+            saved_params = {}
+            wrapped = {}
+            for pn, fn in zip(_ns, _full):
+                saved_params[pn] = _mod._parameters.pop(pn)
+                wrapped[pn] = _GradNormCapture.apply(saved_params[pn], fn, acc)
+                _mod.__dict__[pn] = wrapped[pn]
             try:
-                changed = _unfuse_experts_weights_inplace(module, check_decorator=False)
-            except Exception:
-                changed = False
-            if changed:
-                forced_modules.append(name)
-        unfused_modules = forced_modules
+                return _orig(*args, **kwargs)
+            finally:
+                for pn in _ns:
+                    _mod.__dict__.pop(pn, None)
+                    _mod._parameters[pn] = saved_params[pn]
 
-    if not unfused_modules:
-        return None
+        module.forward = patched_forward
 
-    if hasattr(model, "config"):
-        model.config._experts_implementation = LINEAR_LOOP_IMPL
-
-    for sub in model.modules():
-        if isinstance(sub, nn.Linear) and sub.weight.device != target_dev:
-            sub.to(target_dev)
-
-    return str(target_dev)
+    return meta
 
 
 def resolve_execution_device(model: nn.Module, requested_device: str) -> torch.device:
@@ -378,7 +583,8 @@ class FisherAccumulator:
     def __init__(self, model: nn.Module, tracked: list[str],
                  expert_info: dict[str, tuple[str, str]],
                  act_cache_dir: Path | None = None,
-                 input_rows: int = 256):
+                 input_rows: int = 256,
+                 hook_packed_experts: bool = True):
         self.stats: dict[str, dict] = {}
         self._saved_inputs: dict[str, torch.Tensor] = {}
         self._fwd_handles, self._bwd_handles = [], []
@@ -388,6 +594,16 @@ class FisherAccumulator:
         self.input_rows = input_rows
         self._input_snaps: dict[str, list[torch.Tensor]] = defaultdict(list)
         self._rows_got: dict[str, int] = defaultdict(int)
+        # Packed expert grad-norm accumulator: written by _GradNormCapture
+        # during backward, read in finalize().
+        self._packed_grad_acc: dict[str, float] = {}
+        # Per-(experts module qname) sample count (one per backward),
+        # populated by the experts forward hook below.
+        self._packed_sample_count: dict[str, int] = defaultdict(int)
+        # Per-experts-module activation snapshots, captured live so
+        # measure_quant_cost can read packed expert inputs.
+        self._packed_act_snaps: dict[str, list[torch.Tensor]] = defaultdict(list)
+        self._packed_act_rows: dict[str, int] = defaultdict(int)
 
         for name, mod in model.named_modules():
             if name not in self.tracked or not isinstance(mod, nn.Linear):
@@ -411,6 +627,54 @@ class FisherAccumulator:
                 mod.register_forward_hook(self._make_fwd(name)))
             self._bwd_handles.append(
                 mod.register_full_backward_hook(self._make_bwd(name, mod)))
+
+        if hook_packed_experts:
+            packed_meta = install_packed_expert_hooks(
+                model,
+                accumulator=self._packed_grad_acc,
+            )
+            for full_name, meta in packed_meta.items():
+                # Filter against the tracked set when tracked is a regex
+                # match; here we accept any packed param under a tracked
+                # parent (the regex from run_probe_pass already filters
+                # by layer).
+                experts_qname = meta.pop("_packed_experts_module")
+                meta.pop("_packed_param", None)
+                # Heuristic: include packed entry if any of its conjugate
+                # "in this same parent layer" Linears are tracked. This
+                # makes shard regexes (`model.layers.X.`) work cleanly.
+                parent_layer = ".".join(experts_qname.split(".")[:3])  # e.g. model.layers.7
+                if any(t.startswith(parent_layer + ".") for t in self.tracked):
+                    self.stats[full_name] = meta
+                    # Register a forward hook on the experts module to
+                    # bump the per-backward sample count (used to keep
+                    # n_tokens_seen aligned with the Linear path's
+                    # accounting).
+                    try:
+                        experts_mod = model.get_submodule(experts_qname)
+                    except AttributeError:
+                        continue
+
+                    def _exp_fwd(_mod, inp, _out, _qn=experts_qname,
+                                 _full=full_name, _x_acc=self._packed_act_snaps,
+                                 _r=self._packed_act_rows):
+                        x = inp[0] if isinstance(inp, tuple) else inp
+                        if isinstance(x, torch.Tensor):
+                            self._packed_sample_count[_full] += int(
+                                x.detach().reshape(-1, x.size(-1)).size(0))
+                            if act_cache_dir is not None:
+                                need = self.input_rows - _r[_qn]
+                                if need > 0:
+                                    flat = x.detach().reshape(-1, x.size(-1))
+                                    if flat.size(0) > need:
+                                        idx = torch.randperm(flat.size(0),
+                                                             device=flat.device)[:need]
+                                        flat = flat.index_select(0, idx)
+                                    _x_acc[_qn].append(flat.to("cpu"))
+                                    _r[_qn] += flat.size(0)
+
+                    self._fwd_handles.append(
+                        experts_mod.register_forward_hook(_exp_fwd))
 
     def _make_fwd(self, name: str):
         def hook(module, inp, out):
@@ -444,6 +708,15 @@ class FisherAccumulator:
         return hook
 
     def finalize(self, tracker: RouterTracker | None):
+        # Flush packed-expert grad-norm accumulator into stats h_trace_raw.
+        # The packed accumulator key matches the stats key by construction
+        # (full param name `<experts_qname>.<param_name>`).
+        for full_name, raw in self._packed_grad_acc.items():
+            if full_name in self.stats:
+                self.stats[full_name]["h_trace_raw"] += float(raw)
+                self.stats[full_name]["n_tokens_seen"] = int(
+                    self._packed_sample_count.get(full_name, 0))
+
         if tracker is not None:
             for name, s in self.stats.items():
                 if s["router_path"]:
@@ -467,6 +740,17 @@ class FisherAccumulator:
                 X = torch.cat(snaps, dim=0).to(torch.bfloat16).contiguous()
                 fname = re.sub(r"[^A-Za-z0-9_-]", "__", name) + ".pt"
                 torch.save({"inputs": X, "name": name},
+                           self.cache_dir / fname)
+            # Also write packed-experts module input snapshots. We key
+            # these by the experts module qname (not the parameter name);
+            # measure_quant_cost looks for the same input regardless of
+            # which packed parameter is being measured.
+            for experts_qname, snaps in self._packed_act_snaps.items():
+                if not snaps:
+                    continue
+                X = torch.cat(snaps, dim=0).to(torch.bfloat16).contiguous()
+                fname = re.sub(r"[^A-Za-z0-9_-]", "__", experts_qname) + ".pt"
+                torch.save({"inputs": X, "name": experts_qname},
                            self.cache_dir / fname)
 
     def remove_hooks(self):
@@ -624,34 +908,23 @@ def load_probe_model_and_tokenizer(model_path: str,
                                    requested_device: str,
                                    dtype: torch.dtype,
                                    device_map: str | None = None,
-                                   unfuse_moe: bool = True,
                                    gradient_checkpointing: bool = True):
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     staged = stage_text_only(model_path)
     tokenizer = AutoTokenizer.from_pretrained(staged, trust_remote_code=True)
     load_device_map = device_map if device_map is not None else requested_device
+
     model = AutoModelForCausalLM.from_pretrained(
         staged, torch_dtype=dtype, device_map=load_device_map,
         low_cpu_mem_usage=False, trust_remote_code=True,
     )
     model.eval()
 
-    if unfuse_moe:
-        try:
-            target_dev = prepare_model_for_moe_linears(model)
-            if target_dev is not None:
-                print(f"[probe] unfused MoE experts into per-expert linears "
-                      f"(all on {target_dev})", flush=True)
-            else:
-                print("[probe] MoE unfuse made no changes; continuing with "
-                      "packed experts.", flush=True)
-        except ImportError:
-            print("[probe] AutoRound not available; skipping MoE unfuse. "
-                  "Per-expert sensitivity will not be measured.", flush=True)
-        except Exception as e:
-            print(f"[probe] MoE unfuse failed ({e}); continuing with "
-                  "fused experts.", flush=True)
+    # Packed MoE experts (e.g. Qwen3.5/3.6's 3D `gate_up_proj` /
+    # `down_proj`) are sensed natively by FisherAccumulator via
+    # install_packed_expert_hooks. No unfuse step needed; auto_round is
+    # not a probe-time dependency.
 
     exec_device = resolve_execution_device(model, requested_device)
     print(f"[probe] execution device: {exec_device} "
@@ -734,25 +1007,35 @@ def run_probe_pass(model: nn.Module,
         t_fwd += time.time() - t0
 
         t0 = time.time()
+        # Use sum-reduction CE so per-token gradients aggregate without
+        # the 1/T factor that mean-reduction introduces. The accumulated
+        # ||grad_W||²_F divided by total tokens then gives the per-token
+        # empirical Fisher diagonal trace under the standard assumption
+        # of independence across token positions.
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = ids[..., 1:].contiguous()
+        lp = F.log_softmax(
+            shift_logits.reshape(-1, shift_logits.size(-1)), dim=-1)
+        gather = -lp.gather(1, shift_labels.reshape(-1, 1)).squeeze(1)
         if importance_weighting:
             with torch.no_grad():
-                tok = per_token_ce(logits.detach(), ids)
+                tok = per_token_ce(logits.detach(), ids).reshape(-1)
                 mean = float(tok.mean().item())
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = ids[..., 1:].contiguous()
-            lp = F.log_softmax(
-                shift_logits.reshape(-1, shift_logits.size(-1)), dim=-1)
-            gather = -lp.gather(1, shift_labels.reshape(-1, 1)).squeeze(1)
-            w = (tok.reshape(-1) / max(mean, 1e-6)).clamp(0.25, 4.0)
-            loss = (gather * w).mean()
+            # Importance weights renormalized to mean ~1 so the per-token
+            # Fisher units are preserved (the weights only redistribute
+            # contributions across token positions, not change the total).
+            w = (tok / max(mean, 1e-6)).clamp(0.25, 4.0)
+            loss = (gather * w).sum()
         else:
-            loss = out.loss
+            loss = gather.sum()
         loss.backward()
         t_bwd += time.time() - t0
 
         if (i + 1) % 4 == 0 or i == 0:
+            n_tok = max(int(gather.numel()), 1)
+            mean_loss = float(loss.detach().item()) / n_tok
             print(f"[probe] sample {i+1}/{calib.size(0)} "
-                  f"loss={float(loss.item()):.3f} "
+                  f"loss={mean_loss:.3f} "
                   f"fwd_avg={t_fwd/(i+1):.2f}s bwd_avg={t_bwd/(i+1):.2f}s",
                   flush=True)
 
@@ -815,8 +1098,12 @@ def main():
                          "(for measure_quant_cost.py)")
     ap.add_argument("--linear-include", default=".*")
     ap.add_argument("--linear-exclude",
-                    default=r"(?:^lm_head$|\.lm_head$|mlp\.gate$|"
-                            r"mlp\..*gate$|\.router(?:$|\.)|"
+                    # Routers stay BF16 — quantizing per-token routing
+                    # decisions is high-risk for negligible memory gain.
+                    # `lm_head` is intentionally NOT excluded; the
+                    # allocator can pick a sensible format for it.
+                    default=r"(?:mlp\.gate$|mlp\..*gate$|"
+                            r"\.router(?:$|\.)|"
                             r"block_sparse_moe\.gate$)")
     ap.add_argument("--gradient-checkpointing", action="store_true",
                     default=True)
@@ -825,12 +1112,6 @@ def main():
     ap.add_argument("--importance-weighting", action="store_true", default=True)
     ap.add_argument("--no-importance-weighting", action="store_false",
                     dest="importance_weighting")
-    ap.add_argument("--unfuse-moe", action="store_true", default=True,
-                    help="Unfuse MoE expert tensors into per-expert nn.Linear "
-                         "via AutoRound. Needed for any model that uses the "
-                         "transformers 5+ fused-experts pattern (Qwen3.x MoE, "
-                         "Mixtral 5+, etc.). Requires auto-round installed.")
-    ap.add_argument("--no-unfuse-moe", action="store_false", dest="unfuse_moe")
     args = ap.parse_args()
 
     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16,
@@ -843,7 +1124,6 @@ def main():
         requested_device=args.device,
         dtype=dtype,
         device_map=args.device_map,
-        unfuse_moe=args.unfuse_moe,
         gradient_checkpointing=args.gradient_checkpointing,
     )
     print(f"[probe] loaded in {time.time()-t0:.1f}s", flush=True)

@@ -203,10 +203,8 @@ def _stage_text_only(model_path: str) -> str:
 
 
 def _load_live_model(model_path: str, device: str, dtype: torch.dtype,
-                     unfuse_moe: bool = True,
                      device_map: str | None = None) -> nn.Module:
     from transformers import AutoModelForCausalLM
-    from .sensitivity_probe import prepare_model_for_moe_linears
 
     staged = _stage_text_only(model_path)
     load_device_map = device_map if device_map is not None else device
@@ -217,13 +215,6 @@ def _load_live_model(model_path: str, device: str, dtype: torch.dtype,
     model.eval()
     for p in model.parameters():
         p.requires_grad_(False)
-
-    if unfuse_moe:
-        try:
-            prepare_model_for_moe_linears(model)
-        except ImportError:
-            pass
-
     return model
 
 
@@ -301,11 +292,81 @@ def _chunked(seq, size):
         yield seq[i:i + size]
 
 
+def _enumerate_packed_experts(model: nn.Module, target_names: set[str]
+                              ) -> list[tuple[str, nn.Parameter]]:
+    """Find every 3D nn.Parameter that lives directly under a module
+    named like an MoE experts container. Uses the same class-name +
+    param-name filters as sensitivity_probe._is_packed_experts_module
+    so we never accidentally treat e.g. a Conv1d weight as a packed
+    expert tensor.
+
+    Returns [(canonical_name, packed_param), ...] where canonical_name
+    is `<module_qname>.<param_name>` to match the probe's stat keys.
+    Only entries appearing in `target_names` are returned.
+    """
+    from .sensitivity_probe import _is_packed_experts_module, _packed_experts_param_names
+    out = []
+    for qname, mod in model.named_modules():
+        if not _is_packed_experts_module(mod):
+            continue
+        for pn in _packed_experts_param_names(mod):
+            p = getattr(mod, pn)
+            full = f"{qname}.{pn}" if qname else pn
+            if full in target_names:
+                out.append((full, p))
+    return out
+
+
+def _measure_packed_experts(
+    model: nn.Module,
+    target_names: set[str],
+    specs: list[fr.FormatSpec],
+    device: str,
+    dtype: torch.dtype,
+    accum: dict,
+) -> None:
+    """Measure per-format weight_mse for each packed-expert tensor.
+
+    The 3D `[num_experts, out, in]` packed tensor reuses the existing
+    batched codebook RTN path with N = num_experts. We do not measure
+    output_mse for packed experts: the experts module's forward involves
+    token routing, so a clean per-tensor output MSE would require
+    per-expert masked input slices that are awkward to reconstruct
+    offline. The allocator's predicted_dloss formula only consumes
+    weight_mse, so this is a deliberate skip rather than a missing
+    measurement; a zero is recorded for output_mse so downstream code
+    that still inspects the field gets a valid scalar.
+    """
+    dev = torch.device(device)
+    entries = _enumerate_packed_experts(model, target_names)
+    if not entries:
+        return
+    for full_name, packed_param in entries:
+        w = packed_param.detach().to(device=dev, dtype=dtype)
+        for spec in specs:
+            try:
+                w_hat = _batched_quantize(spec, w)
+                weight_mse = float((w - w_hat).float().pow(2).mean().item())
+                _accumulate_result(accum, full_name, spec.name,
+                                   weight_mse, 0.0, 0.0)
+                del w_hat
+            except Exception as e:
+                accum.setdefault(full_name, {})[spec.name] = {"error": str(e)}
+        del w
+        if dev.type == "cuda":
+            torch.cuda.empty_cache()
+
+
 def _batched_codebook_rtn(stacked_w: torch.Tensor, codebook: torch.Tensor,
-                          group_size: int) -> torch.Tensor:
+                          group_size: int, mx_scale: bool = False
+                          ) -> torch.Tensor:
     """Apply the same bucketize-based FP-codebook RTN used by format_registry,
     but on a stacked `(N, out, in)` tensor in one call. No allocation per
-    inner Linear."""
+    inner Linear.
+
+    `mx_scale=True` snaps the per-group scale to the nearest power of two
+    (E8M0), matching the OCP MX serving path.
+    """
     N, out_f, in_f = stacked_w.shape
     w2 = stacked_w.reshape(N, -1, in_f).float()
     if group_size > 0 and group_size < in_f:
@@ -317,6 +378,8 @@ def _batched_codebook_rtn(stacked_w: torch.Tensor, codebook: torch.Tensor,
     cmax = float(cb.abs().max().item())
     max_abs = w2.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8)
     scale = max_abs / cmax
+    if mx_scale:
+        scale = fr._snap_scale_e8m0(scale)
     x = (w2 / scale).contiguous()
 
     # Bucketize returns int64 by default; cast to int32 to halve the index
@@ -377,10 +440,13 @@ _CODEBOOK_NAMES = {
 def _batched_quantize(spec: fr.FormatSpec, stacked_w: torch.Tensor) -> torch.Tensor:
     elt = spec.weight_element_dtype
     if elt in _CODEBOOK_NAMES:
-        cb_name = f"_{elt[-4:]}_codebook" if elt.startswith("fp") else None
-        # Reuse the registry's codebook tables
+        # Reuse the registry's codebook tables. MX-family formats need
+        # E8M0 scale snapping to match the OCP MX serving path; NV/FP
+        # families use real-valued (FP8 / FP32) scales unchanged.
         cb = fr._CODEBOOKS[elt]
-        return _batched_codebook_rtn(stacked_w, cb, spec.group_size)
+        mx_scale = spec.family == "mx"
+        return _batched_codebook_rtn(stacked_w, cb, spec.group_size,
+                                     mx_scale=mx_scale)
     elif elt.startswith("int"):
         return _batched_int_rtn(stacked_w, spec.weight_bits, spec.group_size)
     elif elt == "bfloat16":
@@ -482,12 +548,9 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
 def load_cost_model(model_path: str,
                     device: str,
                     dtype: torch.dtype,
-                    unfuse_moe: bool = True,
                     device_map: str | None = None) -> nn.Module:
     t0 = time.time()
-    model = _load_live_model(model_path, device, dtype,
-                             unfuse_moe=unfuse_moe,
-                             device_map=device_map)
+    model = _load_live_model(model_path, device, dtype, device_map=device_map)
     print(f"[cost] model loaded in {time.time()-t0:.1f}s", flush=True)
     return model
 
@@ -550,6 +613,16 @@ def run_cost_pass(model: nn.Module,
         results = measure_unbatched(model, act_cache, target_names, specs,
                                     device, dtype)
 
+    # Packed-expert tensors aren't visible to the nn.Linear-based path.
+    # Measure them separately. Both paths share the same accumulator
+    # format so finalization is uniform.
+    packed_accum: dict[str, dict] = {}
+    _measure_packed_experts(model, target_names, specs, device, dtype, packed_accum)
+    if packed_accum:
+        results.update(_finalize_results(packed_accum))
+        n_packed = len(packed_accum)
+        print(f"[cost] measured {n_packed} packed-expert tensors", flush=True)
+
     missing_from_results = [n for n in target_names if n not in results]
     if missing_from_results:
         print(f"[cost] WARNING: {len(missing_from_results)} Linears had no "
@@ -598,8 +671,6 @@ def main():
                          "group. 'unbatched' processes one Linear at a time.")
     ap.add_argument("--chunk-size", type=int, default=256,
                     help="Linears per batched chunk. Trades latency for VRAM.")
-    ap.add_argument("--no-unfuse-moe", action="store_false",
-                    dest="unfuse_moe", default=True)
     ap.add_argument("--swap-grow-limit-mb", type=int, default=256,
                     help="Abort if swap used grows by more than this "
                          "(MB) versus watchdog baseline. 0 to disable.")
@@ -626,7 +697,6 @@ def main():
         skip_missing_activations=args.skip_missing_activations,
     )
     model = load_cost_model(args.model, args.device, dtype,
-                            unfuse_moe=args.unfuse_moe,
                             device_map=args.device_map)
 
     if not args.no_watchdog:

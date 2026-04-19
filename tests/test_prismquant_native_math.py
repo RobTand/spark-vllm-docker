@@ -3,13 +3,13 @@ import unittest
 import torch
 import torch.nn as nn
 
-from quantization.dynaquant import format_registry as fr
-from quantization.dynaquant.allocator import build_candidates
-from quantization.dynaquant.calibrate_allocator import install_activation_hooks, select_targets
-from quantization.dynaquant.sensitivity_probe import discover_moe_structure
+from quantization.prismquant import format_registry as fr
+from quantization.prismquant.allocator import build_candidates
+from quantization.prismquant.calibrate_allocator import install_activation_hooks, select_targets
+from quantization.prismquant.sensitivity_probe import discover_moe_structure
 
 
-class TestDynaQuantFormatRegistry(unittest.TestCase):
+class TestPrismQuantFormatRegistry(unittest.TestCase):
     def test_block_formats_have_expected_shape_aware_bits(self):
         shape = (128, 128)
         self.assertAlmostEqual(fr.get_format("NVFP4").effective_bits_for_shape(shape), 4.5)
@@ -38,8 +38,10 @@ class TestDynaQuantFormatRegistry(unittest.TestCase):
             self.assertTrue(torch.equal(x, y), msg=fmt)
 
 
-class TestDynaQuantAllocatorMath(unittest.TestCase):
+class TestPrismQuantAllocatorMath(unittest.TestCase):
     def test_build_candidates_uses_shape_aware_bits(self):
+        # Predicted Δloss = 0.5 · h_trace · weight_mse  (closed-form
+        # diagonal-Fisher term; see allocator.py module docstring eq. 3).
         stats = {
             "layer.weight": {
                 "h_trace": 2.0,
@@ -50,8 +52,8 @@ class TestDynaQuantAllocatorMath(unittest.TestCase):
         }
         costs = {
             "layer.weight": {
-                "FP8_E4M3": {"output_mse": 0.25},
-                "BF16": {"output_mse": 0.0},
+                "FP8_E4M3": {"weight_mse": 0.10, "output_mse": 0.25},
+                "BF16": {"weight_mse": 0.0, "output_mse": 0.0},
             }
         }
         cands = build_candidates(stats, costs, [fr.get_format("FP8_E4M3"), fr.get_format("BF16")])
@@ -64,7 +66,34 @@ class TestDynaQuantAllocatorMath(unittest.TestCase):
             by_fmt["FP8_E4M3"].memory_bytes,
             fr.get_format("FP8_E4M3").memory_bytes_for_shape((5, 7)),
         )
-        self.assertAlmostEqual(by_fmt["FP8_E4M3"].predicted_dloss, 0.5 * 2.0 * 0.25 * 5)
+        self.assertAlmostEqual(by_fmt["FP8_E4M3"].predicted_dloss, 0.5 * 2.0 * 0.10)
+        self.assertAlmostEqual(by_fmt["BF16"].predicted_dloss, 0.0)
+
+    def test_build_candidates_applies_calibrated_gains(self):
+        stats = {
+            "layer.weight": {
+                "h_trace": 2.0,
+                "out_features": 4,
+                "in_features": 4,
+                "n_params": 16,
+            }
+        }
+        costs = {
+            "layer.weight": {
+                "NVFP4": {"weight_mse": 0.10},
+                "MXFP8": {"weight_mse": 0.02},
+            }
+        }
+        # Without calibration: NVFP4 = 0.10, MXFP8 = 0.02 (per-element MSE).
+        # With α_NVFP4=2 the NVFP4 candidate's predicted Δloss should double.
+        cands = build_candidates(
+            stats, costs,
+            [fr.get_format("NVFP4"), fr.get_format("MXFP8")],
+            calibrated_gains={"NVFP4": 2.0, "MXFP8": 1.0},
+        )
+        by_fmt = {c.fmt: c for c in cands["layer.weight"]}
+        self.assertAlmostEqual(by_fmt["NVFP4"].predicted_dloss, 0.5 * 2.0 * 0.10 * 2.0)
+        self.assertAlmostEqual(by_fmt["MXFP8"].predicted_dloss, 0.5 * 2.0 * 0.02 * 1.0)
 
     def test_select_targets_returns_baseline_knee_high(self):
         curve = [

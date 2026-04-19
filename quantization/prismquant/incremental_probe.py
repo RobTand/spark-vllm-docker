@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""incremental_probe.py — run the DynaQuant sensitivity probe in shards.
+"""incremental_probe.py — run the PrismQuant sensitivity probe in shards.
 
 This keeps the live hook state bounded by probing only a subset of transformer
 blocks at a time, then merges the per-shard probe artifacts into one final
@@ -42,6 +42,105 @@ def build_layer_shard_regexes(num_hidden_layers: int,
             body = rf"{re.escape(layer_prefix)}\.(?:{idxs})\."
         regexes.append(body)
     return regexes
+
+
+def build_extended_shard_regexes(
+    model_path: str,
+    layers_per_shard: int,
+    *,
+    include_body: bool = True,
+    include_mtp: bool = True,
+    include_visual: bool = True,
+    include_lm_head: bool = True,
+) -> list[str]:
+    """Extended shard list covering everything quantizable in a
+    multimodal Qwen3.5/3.6 checkpoint:
+
+      - body transformer    (`model.layers.X.*`)         — N shards
+      - MTP block(s)        (`mtp.layers.X.*`)           — 1 shard typically
+      - visual ViT blocks   (`model.visual.blocks.X.*`)  — depth/N shards
+      - lm_head             (`^lm_head$`)                — 1 shard
+    """
+    # Read the ORIGINAL config, not the text-only staged one. Staging
+    # strips `vision_config`, which would make us miss every visual
+    # block. For the staged-body layer count we still want text_config
+    # when present.
+    src_cfg_path = Path(model_path) / "config.json"
+    with open(src_cfg_path) as f:
+        cfg = json.load(f)
+    text_cfg = cfg.get("text_config", cfg)
+    vis_cfg = cfg.get("vision_config", {})
+
+    regexes: list[str] = []
+
+    if include_body:
+        n_body = int(text_cfg.get("num_hidden_layers", cfg.get("num_hidden_layers", 0)))
+        regexes.extend(build_layer_shard_regexes(
+            n_body, layers_per_shard, layer_prefix="model.layers"))
+
+    if include_mtp:
+        # MTP layer count is small (Qwen3.6 = 1). Try common config keys;
+        # fall back to scanning the source safetensors index.
+        n_mtp = int(
+            text_cfg.get("num_nextn_predict_layers")
+            or cfg.get("num_nextn_predict_layers")
+            or text_cfg.get("num_mtp_layers")
+            or cfg.get("num_mtp_layers")
+            or _count_mtp_layers_from_safetensors(model_path)
+            or 0
+        )
+        if n_mtp > 0:
+            regexes.extend(build_layer_shard_regexes(
+                n_mtp, layers_per_shard, layer_prefix="mtp.layers"))
+
+    if include_visual:
+        n_vis = int(vis_cfg.get("depth") or vis_cfg.get("num_hidden_layers") or 0)
+        if n_vis > 0:
+            # Visual blocks share a uniform shape, so a slightly larger
+            # shard per group is fine (memory pressure per shard is
+            # bounded by max-shard size, dominated by the body Linears
+            # not the visual ones).
+            vis_per_shard = max(layers_per_shard, 4)
+            regexes.extend(build_layer_shard_regexes(
+                n_vis, vis_per_shard, layer_prefix="model.visual.blocks"))
+
+    if include_lm_head:
+        # Single Linear at the model root — its own shard.
+        regexes.append(r"^lm_head$")
+
+    return regexes
+
+
+def _count_mtp_layers_from_safetensors(model_path: str) -> int:
+    """Fallback for when the config doesn't carry an MTP layer count:
+    scan the source safetensors index and count `mtp.layers.<N>.` paths."""
+    import os, re as _re
+    src = Path(model_path)
+    idx_path = src / "model.safetensors.index.json"
+    if not idx_path.exists():
+        # Fall back to listing tensors directly.
+        try:
+            from safetensors.torch import safe_open
+            mtp_indices = set()
+            for f in os.listdir(src):
+                if not f.endswith(".safetensors"):
+                    continue
+                with safe_open(str(src / f), framework="pt") as sf:
+                    for k in sf.keys():
+                        m = _re.match(r"^mtp\.layers\.(\d+)\.", k)
+                        if m:
+                            mtp_indices.add(int(m.group(1)))
+            return max(mtp_indices) + 1 if mtp_indices else 0
+        except Exception:
+            return 0
+    with open(idx_path) as f:
+        wm = json.load(f)["weight_map"]
+    mtp_indices = set()
+    for k in wm:
+        m = _re.match(r"^mtp\.layers\.(\d+)\.", k)
+        if m:
+            mtp_indices.add(int(m.group(1)))
+    return max(mtp_indices) + 1 if mtp_indices else 0
 
 
 def _merge_nested_counts(dst: dict, src: dict):
@@ -126,22 +225,44 @@ def main():
     ap.add_argument("--importance-weighting", action="store_true", default=True)
     ap.add_argument("--no-importance-weighting", action="store_false",
                     dest="importance_weighting")
-    ap.add_argument("--unfuse-moe", action="store_true", default=True)
-    ap.add_argument("--no-unfuse-moe", action="store_false", dest="unfuse_moe")
+    ap.add_argument("--include-mtp", action="store_true", default=True,
+                    help="Probe MTP layers (`mtp.layers.X.*`).")
+    ap.add_argument("--no-include-mtp", action="store_false", dest="include_mtp")
+    ap.add_argument("--include-visual", action="store_true", default=True,
+                    help="Probe visual encoder blocks (`model.visual.blocks.X.*`).")
+    ap.add_argument("--no-include-visual", action="store_false", dest="include_visual")
+    ap.add_argument("--include-lm-head", action="store_true", default=True,
+                    help="Probe lm_head (`^lm_head$`).")
+    ap.add_argument("--no-include-lm-head", action="store_false", dest="include_lm_head")
     args = ap.parse_args()
 
+    # Body shard range may be partial; MTP / visual / lm_head are
+    # always all-or-nothing (small enough that splitting them is silly).
     n_layers = load_num_hidden_layers(args.model)
     start = max(0, args.start_layer)
     end = n_layers if args.end_layer is None else min(args.end_layer, n_layers)
     if start >= end:
         raise SystemExit(f"empty layer range: start={start} end={end}")
 
-    all_regexes = build_layer_shard_regexes(n_layers,
-                                            args.layers_per_shard,
-                                            layer_prefix="model.layers")
+    body_regexes = build_layer_shard_regexes(
+        n_layers, args.layers_per_shard, layer_prefix="model.layers")
     first_shard = start // args.layers_per_shard
     last_shard = (end + args.layers_per_shard - 1) // args.layers_per_shard
-    shard_regexes = all_regexes[first_shard:last_shard]
+    shard_regexes = body_regexes[first_shard:last_shard]
+
+    # Append MTP / visual / lm_head shards beyond the body range. These
+    # are unaffected by --start-layer / --end-layer (those are body-only).
+    extra = build_extended_shard_regexes(
+        args.model, args.layers_per_shard,
+        include_body=False,
+        include_mtp=args.include_mtp,
+        include_visual=args.include_visual,
+        include_lm_head=args.include_lm_head,
+    )
+    shard_regexes = shard_regexes + extra
+    print(f"[incremental] shard regexes: {len(shard_regexes)} total "
+          f"(body={len(body_regexes[first_shard:last_shard])}, extras={len(extra)})",
+          flush=True)
 
     work_dir = Path(args.work_dir)
     shard_dir = work_dir / "shards"
@@ -158,7 +279,6 @@ def main():
         requested_device=args.device,
         dtype=dtype,
         device_map=args.device_map,
-        unfuse_moe=args.unfuse_moe,
         gradient_checkpointing=args.gradient_checkpointing,
     )
     calib = load_calibration(tokenizer, args.dataset, args.nsamples, args.seqlen)
@@ -184,7 +304,9 @@ def main():
             load_device_map=load_device_map,
             exec_device=exec_device,
             linear_include=linear_include,
-            linear_exclude=r"(?:^lm_head$|\.lm_head$|mlp\.gate$|mlp\..*gate$|\.router(?:$|\.)|block_sparse_moe\.gate$)",
+            # Routers excluded; `lm_head` intentionally INCLUDED (the
+            # allocator picks its format alongside the body).
+            linear_exclude=r"(?:mlp\.gate$|mlp\..*gate$|\.router(?:$|\.)|block_sparse_moe\.gate$)",
             importance_weighting=args.importance_weighting,
             activation_cache_dir=args.activation_cache_dir,
             output_path=str(shard_path),
