@@ -4,7 +4,9 @@ from quantization.joint_knapsack_optimizer import (
     Config,
     ConfigResult,
     LayerInfo,
+    aggregate_expert_families_for_optimization,
     apply_expert_consensus_to_recipe,
+    expand_recipe_from_aggregates,
     recipe_cost_error,
 )
 
@@ -29,6 +31,46 @@ def _layer(name, sensitivity, cfgs):
 
 
 class TestExpertConsensus(unittest.TestCase):
+    def test_aggregate_expert_families_for_optimization(self):
+        common_cfgs = [
+            ((4, 8, 16), 1.0, 10, 4.5),
+            ((8, 16, 16), 0.2, 18, 9.0),
+        ]
+        lookup_layers = [
+            _layer("model.layers.0.mlp.experts.gate_up_proj", 1.0, common_cfgs),
+            _layer("model.layers.1.mlp.experts.gate_up_proj", 2.0, common_cfgs),
+            _layer("model.layers.0.mlp.experts.down_proj", 1.5, common_cfgs),
+            _layer("model.layers.1.mlp.experts.down_proj", 0.5, common_cfgs),
+            _layer("model.layers.0.self_attn.q_proj.weight", 3.0, common_cfgs),
+        ]
+
+        optimized, aggregate_map = aggregate_expert_families_for_optimization(lookup_layers)
+        names = {layer.name for layer in optimized}
+        self.assertIn("moe_gate_up", names)
+        self.assertIn("moe_down", names)
+        self.assertIn("model.layers.0.self_attn.q_proj.weight", names)
+        self.assertEqual(aggregate_map["moe_gate_up"], [
+            "model.layers.0.mlp.experts.gate_up_proj",
+            "model.layers.1.mlp.experts.gate_up_proj",
+        ])
+        gate_up = next(layer for layer in optimized if layer.name == "moe_gate_up")
+        self.assertEqual(gate_up.sensitivity, 1.0)
+        self.assertEqual(gate_up.n_elements, 8)
+        self.assertEqual(gate_up.pareto_configs[0].memory_bytes, 20)
+        self.assertAlmostEqual(gate_up.pareto_configs[0].mse, 3.0)
+
+        expanded = expand_recipe_from_aggregates(
+            {
+                "moe_gate_up": "w8_s16_g16",
+                "moe_down": "w4_s8_g16",
+                "model.layers.0.self_attn.q_proj.weight": "w4_s8_g16",
+            },
+            aggregate_map,
+        )
+        self.assertEqual(expanded["model.layers.0.mlp.experts.gate_up_proj"], "w8_s16_g16")
+        self.assertEqual(expanded["model.layers.1.mlp.experts.gate_up_proj"], "w8_s16_g16")
+        self.assertEqual(expanded["model.layers.0.mlp.experts.down_proj"], "w4_s8_g16")
+
     def test_consensus_collapses_expert_families(self):
         common_cfgs = [
             ((4, 8, 16), 1.0, 10, 4.5),

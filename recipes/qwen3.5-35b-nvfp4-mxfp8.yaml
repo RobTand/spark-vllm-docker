@@ -1,0 +1,51 @@
+# Recipe: Qwen3.5-35B-A3B Mixed NVFP4+MXFP8
+# AutoScheme-optimized: 386 sensitive layers at MXFP8, remainder at NVFP4
+# Uses compressed-tensors mixed-precision format
+recipe_version: "1"
+name: Qwen3.5-35B-A3B-NVFP4-MXFP8-Mixed
+description: |
+  Mixed precision quantization: NVFP4 (baseline) + MXFP8 (sensitive layers).
+  AutoRound AutoScheme identified 386 layers in transformer layers 29-39
+  (mostly MoE experts, attention, shared experts) that benefit from MXFP8.
+  NVFP4 layers use CUTLASS FP4 kernels, MXFP8 layers use FlashInfer CUTLASS.
+
+model: /root/.cache/huggingface/local-models/Qwen3.5-35B-A3B-NVFP4-MXFP8
+container: vllm-node
+
+mods:
+  - mods/fix-fla-tma-sm12x
+  - mods/compressed-tensors-mxfp8
+
+env:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  TRITON_CACHE_DIR: "/tmp/triton_cache"
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.82
+  max_model_len: 32768
+  max_num_batched_tokens: 8192
+
+command: |
+  vllm serve {model} \
+    --host {host} \
+    --port {port} \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --enable-prefix-caching \
+    --trust-remote-code \
+    --kv-cache-dtype fp8 \
+    --attention-backend flashinfer \
+    --load-format fastsafetensors \
+    -tp {tensor_parallel}
+
+# Compression command (for reference):
+# python quantization/compress_mixed_nvfp4_mxfp8.py \
+#   --model Qwen/Qwen3.5-35B-A3B \
+#   --recipe /tmp/autoround_qwen35_35b_nvfp4_mxfp8_fixed/autoround_textonly_777850a6-w4g16/quantization_config.json \
+#   --output ./Qwen3.5-35B-A3B-NVFP4-MXFP8 \
+#   --mxfp8-flavor W8A8 \
+#   --num-calibration-samples 512

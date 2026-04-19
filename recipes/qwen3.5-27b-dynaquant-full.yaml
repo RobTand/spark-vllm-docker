@@ -1,0 +1,43 @@
+recipe_version: "1"
+name: Qwen3.5-27B-DynaQuant-FullSpectrum
+description: |
+  DynaQuant full-spectrum mixed precision (5-7 bit, avg 5.7 bits).
+  HAWQ sensitivity → water-filling → per-Linear bit assignment.
+  120×5b + 254×6b + 84×7b + 34×8b + 2×4b + 3×(9-10b) = 497 Linears.
+  Fused Triton dequant+GEMV/GEMM kernels. 18.4 GB packed weights.
+
+model: local
+
+container: vllm-node
+
+mods:
+  - mods/fix-qwen3.5-rope-validate
+  - mods/fix-autotune-sm-threshold
+  - mods/dynaquant-inject
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.85
+  max_model_len: 32768
+  max_num_batched_tokens: 8192
+
+env:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  DYNAQUANT_DIR: "/tmp/dynaquant_packed"
+  TRITON_CACHE_DIR: "/tmp/triton_cache"
+
+command: |
+  vllm serve /tmp/dynaquant-27b-ct \
+    --max-model-len {max_model_len} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --port {port} \
+    --host {host} \
+    --enable-prefix-caching \
+    --reasoning-parser qwen3 \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --trust-remote-code \
+    -tp {tensor_parallel} \
+    --kv-cache-dtype fp8 \
+    --attention-backend flashinfer

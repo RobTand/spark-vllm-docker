@@ -1,0 +1,42 @@
+# Recipe: Qwen3-0.6B Mixed NVFP4+MXFP8 (small validation model)
+# Small-scale end-to-end test of the mixed-precision pipeline before
+# attempting larger models. Codex's AutoScheme run produced the checkpoint.
+recipe_version: "1"
+name: Qwen3-0.6B-NVFP4-MXFP8-Mixed
+description: |
+  Mixed NVFP4+MXFP8 validation checkpoint. AutoRound AutoScheme identified
+  25 sensitive attention projections (q/k/v across layers 0-11) that use
+  MXFP8; everything else is NVFP4. Exists to validate vLLM's mixed-precision
+  loading path works end-to-end.
+
+model: /tmp/Qwen3-0.6B-NVFP4-MXFP8-fused
+container: vllm-node
+solo_only: true
+
+mods:
+  - mods/fix-fla-tma-sm12x
+  - mods/compressed-tensors-mxfp8
+
+env:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  TRITON_CACHE_DIR: "/tmp/triton_cache"
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.5
+  max_model_len: 8192
+  max_num_batched_tokens: 4096
+
+command: |
+  vllm serve {model} \
+    --host {host} \
+    --port {port} \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --enable-prefix-caching \
+    --trust-remote-code \
+    --attention-backend flashinfer \
+    -tp {tensor_parallel}

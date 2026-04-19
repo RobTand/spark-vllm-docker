@@ -1,0 +1,125 @@
+--- a/flashinfer/cute_dsl/rmsnorm_fp4quant.py
++++ b/flashinfer/cute_dsl/rmsnorm_fp4quant.py
+@@ -63,6 +63,8 @@ from .fp4_common import (
+     half2_to_float16,
+     bfloat2_to_float16,
+     quantize_and_pack_16,
++    bfloat2_add_one_8,
++    half2_add_one_8,
+     # Reduction utilities
+     row_reduce,
+     # Predicate utility
+@@ -86,6 +88,7 @@ class RMSNormFP4QuantKernel:
+         dtype: cutlass.Numeric,
+         H: int,
+         block_size: int,
++        gemma_style: bool,
+         output_swizzled: bool,
+         is_fp16: bool,
+         sm_version: int | None = None,
+@@ -94,6 +97,7 @@ class RMSNormFP4QuantKernel:
+         self.dtype = dtype
+         self.H = H
+         self.block_size = block_size
++        self.gemma_style = gemma_style
+         self.output_swizzled = output_swizzled
+         self.is_fp16 = is_fp16
+         self.sm_version = sm_version if sm_version is not None else get_sm_version()
+@@ -500,12 +504,18 @@ class RMSNormFP4QuantKernel:
+                         )
+
+                         # Multiply x * w and compute max_abs
++                        # Gemma-style: x * (1 + w) instead of x * w
+                         if cutlass.const_expr(is_fp16):
++                            if cutlass.const_expr(self.gemma_style):
++                                w_h2 = half2_add_one_8(w_h2)
+                             xw_h2 = half2_mul_8(x_h2, w_h2)
+                             max_xw_h2 = half2_max_abs_8(xw_h2)
+                             max_xw = hmax_to_f32(max_xw_h2)
+                             y_f32 = half2_to_float16(xw_h2, rstd)
+                         else:
++                            if cutlass.const_expr(self.gemma_style):
++                                w_h2 = bfloat2_add_one_8(w_h2)
+                             xw_h2 = bfloat2_mul_8(x_h2, w_h2)
+                             max_xw_h2 = bfloat2_max_abs_8(xw_h2)
+                             max_xw = bfloat2_hmax_to_f32(max_xw_h2)
+@@ -562,12 +572,18 @@ class RMSNormFP4QuantKernel:
+                         )
+
+                         # Multiply and compute max_abs for both chunks
++                        # Gemma-style: x * (1 + w) instead of x * w
+                         if cutlass.const_expr(is_fp16):
++                            if cutlass.const_expr(self.gemma_style):
++                                w_h2_c0 = half2_add_one_8(w_h2_c0)
++                                w_h2_c1 = half2_add_one_8(w_h2_c1)
+                             xw_h2_c0 = half2_mul_8(x_h2_c0, w_h2_c0)
+                             xw_h2_c1 = half2_mul_8(x_h2_c1, w_h2_c1)
+                             ...
+                         else:
++                            if cutlass.const_expr(self.gemma_style):
++                                w_h2_c0 = bfloat2_add_one_8(w_h2_c0)
++                                w_h2_c1 = bfloat2_add_one_8(w_h2_c1)
+                             xw_h2_c0 = bfloat2_mul_8(x_h2_c0, w_h2_c0)
+                             xw_h2_c1 = bfloat2_mul_8(x_h2_c1, w_h2_c1)
+                             ...
+@@ -650,6 +666,7 @@ def _get_compiled_kernel(
+     hidden_size: int,
+     block_size: int,
+     is_fp16: bool,
++    gemma_style: bool,
+     sm_version: int,
+     scale_format: str,
+     is_sf_swizzled_layout: bool,
+@@ -664,6 +681,7 @@ def _get_compiled_kernel(
+     kernel_obj = RMSNormFP4QuantKernel(
+         dtype=cutlass_dtype,
+         H=hidden_size,
+         block_size=block_size,
++        gemma_style=gemma_style,
+         output_swizzled=is_sf_swizzled_layout,
+         is_fp16=is_fp16,
+         sm_version=sm_version,
+@@ -770,6 +788,7 @@ def rmsnorm_fp4quant(
+     block_size: int = 16,
+     scale_format: str | None = None,
+     is_sf_swizzled_layout: bool = False,
++    gemma_style: bool = False,
+ ) -> Tuple[torch.Tensor, torch.Tensor]:
+     ...
+     compiled_fn = _get_compiled_kernel(
+         hidden_size=hidden_size,
+         block_size=block_size,
+         is_fp16=is_fp16,
++        gemma_style=gemma_style,
+         sm_version=sm_version,
+         scale_format=actual_scale_format,
+         is_sf_swizzled_layout=is_sf_swizzled_layout,
+     )
+     ...
+
+
++@flashinfer_api
++def gemma_rmsnorm_fp4quant(
++    input: torch.Tensor,
++    weight: torch.Tensor,
++    y_fp4: torch.Tensor | None = None,
++    block_scale: torch.Tensor | None = None,
++    global_scale: torch.Tensor | None = None,
++    eps: float = 1e-6,
++    block_size: int = 16,
++    scale_format: str | None = None,
++    is_sf_swizzled_layout: bool = False,
++) -> Tuple[torch.Tensor, torch.Tensor]:
++    """Fused Gemma-style RMS normalization (x * (1+w)) with FP4 quantization."""
++    return rmsnorm_fp4quant(
++        input=input,
++        weight=weight,
++        y_fp4=y_fp4,
++        block_scale=block_scale,
++        global_scale=global_scale,
++        eps=eps,
++        block_size=block_size,
++        scale_format=scale_format,
++        is_sf_swizzled_layout=is_sf_swizzled_layout,
++        gemma_style=True,
++    )

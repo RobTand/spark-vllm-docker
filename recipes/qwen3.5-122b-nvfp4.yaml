@@ -1,0 +1,52 @@
+# Recipe: Qwen3.5-122B-A10B-NVFP4 (Sehyo)
+# NVFP4 quantization with MTP heads, FlashInfer CUTLASS MoE
+# MTP speculative decoding with k=3
+
+recipe_version: "1"
+name: Qwen3.5-122B-NVFP4
+description: vLLM serving Sehyo/Qwen3.5-122B-A10B-NVFP4
+
+model: Sehyo/Qwen3.5-122B-A10B-NVFP4
+
+container: vllm-node
+
+mods:
+  - mods/fix-qwen3.5-rope-validate
+  - mods/fix-qwen3.5-chat-template
+  - mods/fix-autotune-sm-threshold
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.85
+  max_model_len: 262144
+  max_num_batched_tokens: 8192
+
+env:
+  VLLM_NVFP4_GEMM_BACKEND: "cutlass"
+  VLLM_USE_FLASHINFER_MOE_FP4: 1
+  VLLM_FLASHINFER_MOE_BACKEND: "throughput"
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: 1
+  TORCHINDUCTOR_MAX_AUTOTUNE_GEMM: "1"
+  TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS: "ATEN,TRITON"
+
+command: |
+  vllm serve Sehyo/Qwen3.5-122B-A10B-NVFP4 \
+    --max-model-len {max_model_len} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --port {port} \
+    --host {host} \
+    --enable-prefix-caching \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --reasoning-parser qwen3 \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --trust-remote-code \
+    --chat-template unsloth.jinja \
+    -tp {tensor_parallel} \
+    --max-num-seqs 64 \
+    --kv-cache-dtype fp8 \
+    --attention-backend flashinfer \
+    --speculative-config '{{"method":"mtp","num_speculative_tokens":3}}'

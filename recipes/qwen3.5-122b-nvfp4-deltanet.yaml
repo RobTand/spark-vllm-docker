@@ -1,0 +1,37 @@
+recipe_version: "1"
+name: Qwen3.5-122B-NVFP4-DeltaNet
+description: Fully-quantized 122B with DeltaNet layers included
+
+model: local
+container: vllm-node-tf5
+
+mods:
+  - mods/fix-qwen3.5-rope-validate
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.88
+  max_model_len: 131072
+  max_num_batched_tokens: 8192
+
+env:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+
+command: |
+  vllm serve /root/.cache/huggingface/hub/models--local--Qwen3.5-122B-NVFP4-DeltaNet-Included \
+    --max-model-len {max_model_len} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --port {port} \
+    --host {host} \
+    --enable-prefix-caching \
+    --reasoning-parser qwen3 \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --trust-remote-code \
+    -tp {tensor_parallel} \
+    --kv-cache-dtype fp8 \
+    --attention-backend flashinfer \
+    --served-model-name qwen122b

@@ -9,8 +9,8 @@ container: vllm-node
 cluster_only: false
 solo_only: false
 
-# mods: 
-#   - mods/nemotron-super
+mods:
+  - mods/fix-fla-tma-sm12x
 
 env:
   VLLM_FLASHINFER_ALLREDUCE_BACKEND: trtllm

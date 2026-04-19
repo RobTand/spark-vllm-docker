@@ -45,7 +45,8 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List, Tuple, Optional
+import re
 
 import torch
 import torch.nn as nn
@@ -56,6 +57,20 @@ from build_rtn_cache import (
     load_wikitext_calibration,
     iter_quantizable_tensors,
 )
+
+
+MINIMAX_EXPERT_RE = re.compile(
+    r"^(?P<prefix>.*\.block_sparse_moe\.experts\.)"
+    r"(?P<expert>\d+)"
+    r"(?P<suffix>\.(w[123])\.weight)$"
+)
+
+
+def expert_family_key(name: str) -> Optional[str]:
+    m = MINIMAX_EXPERT_RE.match(name)
+    if m:
+        return f"{m.group('prefix')}*.{m.group(4)}.weight"
+    return None
 
 
 def main():
@@ -83,6 +98,19 @@ def main():
                         help="Process Linears in N chunks per sample. Higher N "
                              "reduces peak gradient memory but multiplies backward "
                              "pass count. Default 1 (all at once).")
+    parser.add_argument("--model-mode", choices=["auto", "text-only", "multimodal"],
+                        default="auto",
+                        help="How to load the model. Use text-only for Qwen3.5 dense checkpoints.")
+    parser.add_argument("--include-regex", type=str, default=None,
+                        help="Only measure quantizable tensors whose full names match this regex.")
+    parser.add_argument("--exclude-regex", type=str, default=None,
+                        help="Skip quantizable tensors whose full names match this regex.")
+    parser.add_argument("--max-experts-per-layer", type=int, default=None,
+                        help="For names like block_sparse_moe.experts.<id>.w[123].weight, "
+                             "measure only the first N experts per layer/projection.")
+    parser.add_argument("--expand-sampled-experts", action="store_true",
+                        help="After measuring sampled experts, propagate the mean sensitivity "
+                             "within each sampled expert family to the unmeasured experts.")
     args = parser.parse_args()
 
     t_start = time.time()
@@ -91,15 +119,27 @@ def main():
     try:
         from transformers import AutoModelForCausalLM, AutoModel, AutoTokenizer
 
-        # Check if the original model is actually VL (has vision/text configs
-        # AND has language_model prefix in tensor names)
+        # Check if the original model is actually multimodal/VL.
+        # Some text-only checkpoints are packaged as conditional-generation
+        # wrappers with a text_config and model.language_model.* tensor names.
+        # Those should still load through the text path.
         with open(Path(args.model) / "config.json") as _f:
             _orig_cfg = json.load(_f)
-        is_vl = ("vision_config" in _orig_cfg or "text_config" in _orig_cfg) and \
-                 any("language_model" in k for k in
-                     (json.load(open(Path(args.model) / "model.safetensors.index.json"))
-                      ["weight_map"] if (Path(args.model) / "model.safetensors.index.json").exists()
-                      else {}))
+        weight_map = (
+            json.load(open(Path(args.model) / "model.safetensors.index.json"))["weight_map"]
+            if (Path(args.model) / "model.safetensors.index.json").exists()
+            else {}
+        )
+        has_visual_cfg = "vision_config" in _orig_cfg
+        has_visual_weights = any(
+            k.startswith("model.visual.") or k.startswith("visual.") or "vision_tower" in k
+            for k in weight_map
+        )
+        is_vl = has_visual_cfg or has_visual_weights
+        if args.model_mode == "text-only":
+            is_vl = False
+        elif args.model_mode == "multimodal":
+            is_vl = True
         device_map = "cpu" if args.cpu else "cuda"
 
         # For disk offloading (large fp8 MoE models), use accelerate auto
@@ -115,7 +155,7 @@ def main():
             load_kwargs["offload_folder"] = args.offload_dir
             load_kwargs["offload_state_dict"] = True
 
-        print(f"[hawq] loading {args.model} (VL={is_vl}, device={device_map}, "
+        print(f"[hawq] loading {args.model} (mode={args.model_mode}, VL={is_vl}, device={device_map}, "
               f"offload={args.offload_dir is not None})", flush=True)
 
         if is_vl:
@@ -164,11 +204,27 @@ def main():
         # embeddings, norms, lm_head).
         for p in model.parameters():
             p.requires_grad_(False)
+        include_re = re.compile(args.include_regex) if args.include_regex else None
+        exclude_re = re.compile(args.exclude_regex) if args.exclude_regex else None
+
+        quantizable_all: List[Tuple[str, nn.Module, str, tuple, int]] = []
         quantizable = []
+        family_seen: Dict[str, int] = {}
         for full_name, mod, attr in iter_quantizable_tensors(model):
             param = getattr(mod, attr)
             if param.numel() < args.skip_small:
                 continue
+            quantizable_all.append((full_name, mod, attr, tuple(param.shape), param.numel()))
+            if include_re and not include_re.search(full_name):
+                continue
+            if exclude_re and exclude_re.search(full_name):
+                continue
+            fam = expert_family_key(full_name)
+            if fam and args.max_experts_per_layer is not None:
+                count = family_seen.get(fam, 0)
+                if count >= args.max_experts_per_layer:
+                    continue
+                family_seen[fam] = count + 1
             # Don't enable here — do it per chunk below
             quantizable.append((full_name, mod, attr, tuple(param.shape), param.numel()))
         print(f"[hawq] {len(quantizable)} quantizable tensors will be measured",
@@ -293,6 +349,38 @@ def main():
                 "w_max_abs": w_max,
                 "w_norm_sq": w_norm,
             }
+
+        if args.expand_sampled_experts and args.max_experts_per_layer is not None:
+            fam_rows: Dict[str, List[dict]] = {}
+            for name, row in sensitivity.items():
+                fam = expert_family_key(name)
+                if fam:
+                    fam_rows.setdefault(fam, []).append(row)
+
+            expanded = 0
+            for name, mod, attr, shape, numel in quantizable_all:
+                if name in sensitivity:
+                    continue
+                fam = expert_family_key(name)
+                if not fam or fam not in fam_rows:
+                    continue
+                rows = fam_rows[fam]
+                h_trace = sum(r["h_trace"] for r in rows) / len(rows)
+                w_max_abs = sum(r["w_max_abs"] for r in rows) / len(rows)
+                w_norm_sq = sum(r["w_norm_sq"] for r in rows) / len(rows)
+                sensitivity[name] = {
+                    "shape": list(shape),
+                    "numel": numel,
+                    "h_trace": h_trace,
+                    "w_max_abs": w_max_abs,
+                    "w_norm_sq": w_norm_sq,
+                    "expanded_from_family": fam,
+                    "n_family_samples": len(rows),
+                }
+                expanded += 1
+            if expanded:
+                print(f"[hawq] expanded sampled expert sensitivities to {expanded} tensors",
+                      flush=True)
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

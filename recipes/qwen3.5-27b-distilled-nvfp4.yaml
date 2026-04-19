@@ -1,0 +1,58 @@
+# Recipe: Qwen3.5-27B Claude 4.6 Opus Reasoning Distilled NVFP4
+# mconcat quant with MTP heads (BF16), mixed NVFP4+FP8 compressed-tensors
+# DGX Spark / SM121 Blackwell
+#
+# Requires vLLM built with TORCH_CUDA_ARCH_LIST=12.1a (not 12.0a)
+# for CUTLASS FP8 scaled_mm kernel compatibility.
+
+recipe_version: "1"
+name: Qwen3.5-27B-Distilled-NVFP4
+description: vLLM serving mconcat/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-NVFP4 with MTP
+
+model: mconcat/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-NVFP4
+
+container: vllm-nvfp4-k64-tf5
+
+build_args:
+  - --tf5
+  - --rebuild-flashinfer
+  - --gpu-arch 12.1a
+
+# Runtime mods — FLA SM121 fix + RoPE fix for transformers 5
+mods:
+  - mods/fix-e2m1-sm121
+  - mods/fix-fla-sm121
+  - mods/fix-qwen3.5-rope
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.85
+  max_model_len: 131072
+  max_num_batched_tokens: 8192
+
+env:
+  VLLM_NVFP4_GEMM_BACKEND: "cutlass"
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  NCCL_P2P_DISABLE: "1"
+  OMP_NUM_THREADS: "6"
+  CUDA_DEVICE_MAX_CONNECTIONS: "32"
+  VLLM_USE_FLASHINFER_SAMPLER: "0"
+  VLLM_WORKER_MULTIPROC_METHOD: "spawn"
+
+command: |
+  vllm serve mconcat/Qwen3.5-27B-Claude-4.6-Opus-Reasoning-Distilled-NVFP4 \
+    --max-model-len {max_model_len} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --port {port} \
+    --host {host} \
+    --no-enable-prefix-caching \
+    --reasoning-parser qwen3 \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --trust-remote-code \
+    -tp {tensor_parallel} \
+    --max-num-seqs 64 \
+    --attention-backend flashinfer \
+    --enforce-eager \
+    --speculative-config '{{"method":"mtp","num_speculative_tokens":3}}'

@@ -1,0 +1,40 @@
+# Recipe: Gemma-4-31B-IT-NVFP4
+# NVIDIA's NVFP4 quantization of Google's Gemma 4 31B-IT
+# Multimodal (text, image, video) with modelopt quantization
+
+recipe_version: "1"
+name: Gemma-4-31B-IT-NVFP4
+description: vLLM serving Gemma 4 31B-IT with NVFP4 quantization via modelopt
+
+model: nvidia/Gemma-4-31B-IT-NVFP4
+container: vllm-node-tf5
+solo_only: true
+
+build_args:
+  - --pre-tf
+
+mods:
+  - mods/fix-gemma4-tool-parser
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.7
+  max_model_len: 131072
+
+command: |
+  vllm serve nvidia/Gemma-4-31B-IT-NVFP4 \
+    --quantization modelopt \
+    --kv-cache-dtype fp8 \
+    --trust-remote-code \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --max-model-len {max_model_len} \
+    --enable-prefix-caching \
+    --host {host} \
+    --port {port} \
+    --load-format fastsafetensors \
+    --enable-auto-tool-choice \
+    --tool-call-parser gemma4 \
+    --reasoning-parser gemma4 \
+    --tensor-parallel-size {tensor_parallel}

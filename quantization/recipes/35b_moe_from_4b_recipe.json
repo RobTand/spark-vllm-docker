@@ -1,0 +1,16 @@
+{
+  "attn.k_proj": 0.88,
+  "attn.q_proj": 0.50,
+  "attn.v_proj": 0.50,
+  "attn.o_proj": 0.12,
+  "other.in_proj_a": 1.00,
+  "other.in_proj_b": 1.00,
+  "other.in_proj_qkv": 0.62,
+  "other.in_proj_z": 0.79,
+  "other.out_proj": 0.54,
+  "shared.gate_proj": 0.41,
+  "shared.up_proj": 0.38,
+  "shared.down_proj": 0.28,
+  "moe.gate_up_proj": 0.40,
+  "moe.down_proj": 0.28
+}

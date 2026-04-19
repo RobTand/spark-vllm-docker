@@ -43,6 +43,8 @@ class NativeBucket:
     scale_mode: str
     codebook: str
     bits_per_weight: float
+    family: str
+    description: str
 
 
 @dataclass
@@ -62,17 +64,82 @@ class LayerStudy:
     buckets: List[BucketResult]
 
 
-BUCKETS: Dict[str, NativeBucket] = {
-    "nvfp4": NativeBucket("nvfp4", group_size=16, scale_mode="fp8_e4m3", codebook="fp4_e2m1", bits_per_weight=4.5),
-    "mxfp4": NativeBucket("mxfp4", group_size=32, scale_mode="e8m0_pow2", codebook="fp4_e2m1", bits_per_weight=4.25),
-    "mxfp6_e2m3": NativeBucket("mxfp6_e2m3", group_size=32, scale_mode="e8m0_pow2", codebook="fp6_e2m3", bits_per_weight=6.25),
-    "mxfp6_e3m2": NativeBucket("mxfp6_e3m2", group_size=32, scale_mode="e8m0_pow2", codebook="fp6_e3m2", bits_per_weight=6.25),
-    "fp8_e4m3": NativeBucket("fp8_e4m3", group_size=1, scale_mode="bf16", codebook="fp8_e4m3", bits_per_weight=8.0),
-    "fp8_e5m2": NativeBucket("fp8_e5m2", group_size=1, scale_mode="bf16", codebook="fp8_e5m2", bits_per_weight=8.0),
-    "mxfp8_e4m3": NativeBucket("mxfp8_e4m3", group_size=32, scale_mode="e8m0_pow2", codebook="fp8_e4m3", bits_per_weight=8.25),
-    "mxfp8_e5m2": NativeBucket("mxfp8_e5m2", group_size=32, scale_mode="e8m0_pow2", codebook="fp8_e5m2", bits_per_weight=8.25),
-    "bf16": NativeBucket("bf16", group_size=1, scale_mode="bf16", codebook="bf16", bits_per_weight=16.0),
+NATIVE_BUCKETS: Dict[str, NativeBucket] = {
+    "nvfp4": NativeBucket(
+        "nvfp4",
+        group_size=16,
+        scale_mode="fp8_e4m3",
+        codebook="fp4_e2m1",
+        bits_per_weight=4.5,
+        family="nv_fp",
+        description="NVFP4 with native 16-value micro-blocks and FP8 E4M3 scaling",
+    ),
+    "mxfp4": NativeBucket(
+        "mxfp4",
+        group_size=32,
+        scale_mode="e8m0_pow2",
+        codebook="fp4_e2m1",
+        bits_per_weight=4.25,
+        family="mx_fp",
+        description="MXFP4 with native 32-value microscaling and E8M0 block scales",
+    ),
+    "mxfp6_e2m3": NativeBucket(
+        "mxfp6_e2m3",
+        group_size=32,
+        scale_mode="e8m0_pow2",
+        codebook="fp6_e2m3",
+        bits_per_weight=6.25,
+        family="mxfp6",
+        description="MXFP6 using the E2M3 element encoding with native 32-value E8M0 microscaling",
+    ),
+    "mxfp6_e3m2": NativeBucket(
+        "mxfp6_e3m2",
+        group_size=32,
+        scale_mode="e8m0_pow2",
+        codebook="fp6_e3m2",
+        bits_per_weight=6.25,
+        family="mxfp6",
+        description="MXFP6 using the E3M2 element encoding with native 32-value E8M0 microscaling",
+    ),
+    "mxfp8_e4m3": NativeBucket(
+        "mxfp8_e4m3",
+        group_size=32,
+        scale_mode="e8m0_pow2",
+        codebook="fp8_e4m3",
+        bits_per_weight=8.25,
+        family="mxfp8",
+        description="MXFP8 using the E4M3 element encoding with native 32-value E8M0 microscaling",
+    ),
+    "mxfp8_e5m2": NativeBucket(
+        "mxfp8_e5m2",
+        group_size=32,
+        scale_mode="e8m0_pow2",
+        codebook="fp8_e5m2",
+        bits_per_weight=8.25,
+        family="mxfp8",
+        description="MXFP8 using the E5M2 element encoding with native 32-value E8M0 microscaling",
+    ),
+    "bf16": NativeBucket(
+        "bf16",
+        group_size=1,
+        scale_mode="bf16",
+        codebook="bf16",
+        bits_per_weight=16.0,
+        family="bf16",
+        description="BF16 passthrough with no block quantization",
+    ),
 }
+
+# Compatibility aliases for older studies and verifier scripts. These resolve to
+# the canonical ladder buckets instead of exposing multiple subformats in the
+# primary optimizer interface.
+BUCKETS: Dict[str, NativeBucket] = {
+    **NATIVE_BUCKETS,
+    "mxfp6": NATIVE_BUCKETS["mxfp6_e2m3"],
+    "mxfp8": NATIVE_BUCKETS["mxfp8_e4m3"],
+}
+
+DEFAULT_NATIVE_BUCKET_ORDER = ["nvfp4", "mxfp4", "mxfp6_e2m3", "mxfp6_e3m2", "mxfp8_e4m3", "mxfp8_e5m2", "bf16"]
 
 
 def build_float_codebook(exp_bits: int, mant_bits: int) -> torch.Tensor:
@@ -255,6 +322,28 @@ def build_frontier(results: List[BucketResult]) -> List[BucketResult]:
     return keep
 
 
+def bucket_manifest(bucket_names: List[str]) -> List[Dict[str, object]]:
+    seen = set()
+    out: List[Dict[str, object]] = []
+    for name in bucket_names:
+        bucket = BUCKETS[name]
+        if bucket.name in seen:
+            continue
+        seen.add(bucket.name)
+        out.append(
+            {
+                "name": bucket.name,
+                "family": bucket.family,
+                "group_size": bucket.group_size,
+                "scale_mode": bucket.scale_mode,
+                "codebook": bucket.codebook,
+                "bits_per_weight": bucket.bits_per_weight,
+                "description": bucket.description,
+            }
+        )
+    return out
+
+
 def water_fill(layers: List[LayerStudy]) -> List[Dict]:
     lookup = {layer.name: layer for layer in layers}
     state = {layer.name: 0 for layer in layers}
@@ -397,7 +486,7 @@ def main():
     parser.add_argument("--baseline", default="nvfp4")
     parser.add_argument(
         "--buckets",
-        default="nvfp4,mxfp4,mxfp6_e2m3,mxfp6_e3m2,fp8_e4m3,fp8_e5m2,mxfp8_e4m3,mxfp8_e5m2,bf16",
+        default=",".join(DEFAULT_NATIVE_BUCKET_ORDER),
     )
     args = parser.parse_args()
 
@@ -441,6 +530,7 @@ def main():
     out = {
         "model": str(model_path),
         "buckets": bucket_names,
+        "bucket_manifest": bucket_manifest(bucket_names),
         "n_layers": len(layers),
         "pareto_curve": pareto,
         "promotion_curve": promo,

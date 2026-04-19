@@ -146,6 +146,24 @@ class LayerInfo:
     members: List[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class NativeBucket:
+    name: str
+    w_bits: int
+    s_bits: int
+    g_size: int
+    scale_mode: str
+
+
+NATIVE_BUCKET_CATALOG: Dict[str, NativeBucket] = {
+    "nvfp4": NativeBucket("nvfp4", 4, 8, 16, "fp8_e4m3"),
+    "mxfp4": NativeBucket("mxfp4", 4, 8, 32, "e8m0_pow2"),
+    "mxfp6": NativeBucket("mxfp6", 6, 8, 32, "e8m0_pow2"),
+    "mxfp8": NativeBucket("mxfp8", 8, 8, 32, "e8m0_pow2"),
+    "bf16": NativeBucket("bf16", 16, 16, 16, "bf16"),
+}
+
+
 # Default search space: wide weight search, narrow scale search, moderate groups.
 DEFAULT_W_BITS_RANGE = list(range(3, 17))
 DEFAULT_S_BITS_RANGE = [8, 16]

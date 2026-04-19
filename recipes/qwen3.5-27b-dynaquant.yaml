@@ -1,0 +1,41 @@
+recipe_version: "1"
+name: Qwen3.5-27B-DynaQuant
+description: |
+  DynaQuant full-spectrum mixed-precision quantization (avg 5.7 bits).
+  HAWQ-V3 sensitivity → water-filling allocation → per-Linear bit assignment.
+  283×6b + 98×5b + 90×7b + 22×8b + 2×9b + 1×4b = 496 Linears.
+  Stored as bf16-simulated round-trip (actual packed format in progress).
+  PPL: +0.59% vs bf16. Downstream (arc_easy, piqa): tied with bf16.
+
+model: local
+
+container: vllm-node
+
+mods:
+  - mods/fix-qwen3.5-rope-validate
+  - mods/fix-autotune-sm-threshold
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.85
+  max_model_len: 32768
+  max_num_batched_tokens: 8192
+
+env:
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+
+command: |
+  vllm serve /tmp/qwen35-27b-fullspectrum-knee \
+    --max-model-len {max_model_len} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --port {port} \
+    --host {host} \
+    --enable-prefix-caching \
+    --reasoning-parser qwen3 \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --trust-remote-code \
+    -tp {tensor_parallel} \
+    --kv-cache-dtype fp8 \
+    --attention-backend flashinfer
