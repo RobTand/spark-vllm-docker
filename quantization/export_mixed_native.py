@@ -33,6 +33,29 @@ from typing import Iterable
 import torch
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+try:
+    import transformers.modeling_utils as _tf_modeling_utils
+    if not hasattr(_tf_modeling_utils, "TORCH_INIT_FUNCTIONS"):
+        _tf_modeling_utils.TORCH_INIT_FUNCTIONS = {
+            name: getattr(torch.nn.init, name)
+            for name in (
+                "uniform_",
+                "normal_",
+                "trunc_normal_",
+                "constant_",
+                "xavier_uniform_",
+                "xavier_normal_",
+                "kaiming_uniform_",
+                "kaiming_normal_",
+                "orthogonal_",
+                "sparse_",
+            )
+            if hasattr(torch.nn.init, name)
+        }
+except Exception:
+    pass
+
 from llmcompressor import oneshot
 from llmcompressor.modifiers.quantization import QuantizationModifier
 
