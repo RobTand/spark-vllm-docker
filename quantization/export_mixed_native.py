@@ -447,7 +447,7 @@ def build_config_groups(
     ignore: Iterable[str],
     mxfp8_flavor: str,
     fp8_flavor: str,
-) -> tuple[dict[str, dict], list[str]]:
+) -> tuple[dict[str, dict], list[str], str | None]:
     ignored = set(ignore)
     by_format: dict[str, list[str]] = {}
     bf16_ignore = []
@@ -460,12 +460,32 @@ def build_config_groups(
         by_format.setdefault(fmt, []).append(name)
 
     config_groups: dict[str, dict] = {}
-    ordered_formats = sorted(by_format, key=lambda fmt: FORMAT_RANK[fmt], reverse=True)
-    for idx, fmt in enumerate(ordered_formats):
+    default_format = None
+    if by_format:
+        default_format = min(by_format, key=lambda fmt: FORMAT_RANK[fmt])
+
+    ordered_formats = sorted(
+        (fmt for fmt in by_format if fmt != default_format),
+        key=lambda fmt: FORMAT_RANK[fmt],
+        reverse=True,
+    )
+    idx = 0
+    for fmt in ordered_formats:
         scheme = scheme_for_format(fmt, mxfp8_flavor=mxfp8_flavor, fp8_flavor=fp8_flavor)
         scheme["targets"] = [explicit_regex(name) for name in sorted(by_format[fmt])]
         config_groups[f"group_{idx}"] = scheme
-    return config_groups, sorted(set(bf16_ignore) | set(ignored))
+        idx += 1
+
+    if default_format is not None:
+        scheme = scheme_for_format(
+            default_format,
+            mxfp8_flavor=mxfp8_flavor,
+            fp8_flavor=fp8_flavor,
+        )
+        scheme["targets"] = ["Linear"]
+        config_groups[f"group_{idx}"] = scheme
+
+    return config_groups, sorted(set(bf16_ignore) | set(ignored)), default_format
 
 
 def preprocess_dataset(ds, tokenizer, max_seq_length: int):
@@ -578,7 +598,7 @@ def main():
         snap_legacy=args.snap_legacy_configs,
         allow_mxfp4=args.allow_mxfp4,
     )
-    config_groups, ignore = build_config_groups(
+    config_groups, ignore, default_format = build_config_groups(
         assignment,
         ignore=args.ignore,
         mxfp8_flavor=args.mxfp8_flavor,
@@ -590,6 +610,7 @@ def main():
         "source_recipe": args.recipe,
         "curve": args.curve,
         "step": args.step,
+        "default_format": default_format,
         "formats": dict(sorted(Counter(assignment.values()).items())),
         "n_targets": {group: len(cfg.get("targets", [])) for group, cfg in config_groups.items()},
         "ignore": ignore,
