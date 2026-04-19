@@ -23,7 +23,6 @@ Model-agnostic:
 from __future__ import annotations
 
 import argparse
-import gc
 import json
 import pickle
 import random
@@ -307,8 +306,7 @@ def read_top_k(model: nn.Module, default: int = 2) -> int:
 class RouterTracker:
     def __init__(self, model: nn.Module, routers: list[str], top_k: int):
         self.top_k = top_k
-        self.counts: dict[str, dict[str, float]] = defaultdict(
-            lambda: defaultdict(float))
+        self.counts_t: dict[str, torch.Tensor] = {}
         self.total_tokens: dict[str, int] = defaultdict(int)
         self._handles = []
         for rq in routers:
@@ -316,6 +314,16 @@ class RouterTracker:
                 mod = model.get_submodule(rq)
             except AttributeError:
                 continue
+            n_experts = None
+            if isinstance(mod, nn.Linear):
+                n_experts = mod.out_features
+            else:
+                weight = getattr(mod, "weight", None)
+                if isinstance(weight, torch.Tensor) and weight.ndim >= 1:
+                    n_experts = int(weight.shape[0])
+            if not isinstance(n_experts, int) or n_experts <= 0:
+                continue
+            self.counts_t[rq] = torch.zeros(n_experts, dtype=torch.float64)
             self._handles.append(mod.register_forward_hook(self._make_hook(rq)))
 
     def _make_hook(self, router_qname: str):
@@ -325,17 +333,13 @@ class RouterTracker:
             k = min(self.top_k, flat.size(-1))
             topk_v, topk_i = flat.topk(k, dim=-1)
             probs = F.softmax(topk_v, dim=-1)
-            n_experts = scores.size(-1)
-            weighted = torch.zeros(n_experts, device=flat.device,
-                                   dtype=torch.float32)
-            weighted.scatter_add_(
-                0, topk_i.reshape(-1), probs.reshape(-1).to(torch.float32))
+            weighted = torch.bincount(
+                topk_i.reshape(-1),
+                weights=probs.reshape(-1).to(torch.float64),
+                minlength=int(scores.size(-1)),
+            )
             self.total_tokens[router_qname] += flat.size(0)
-            cpu_w = weighted.cpu()
-            for eid in range(n_experts):
-                v = float(cpu_w[eid].item())
-                if v > 0.0:
-                    self.counts[router_qname][str(eid)] += v
+            self.counts_t[router_qname].add_(weighted.cpu())
         return hook
 
     def remove_hooks(self):
@@ -347,7 +351,24 @@ class RouterTracker:
         total = self.total_tokens.get(router_qname, 0)
         if total == 0:
             return 0.0
-        return self.counts[router_qname][eid] / total
+        counts = self.counts_t.get(router_qname)
+        if counts is None:
+            return 0.0
+        idx = int(eid)
+        if idx < 0 or idx >= counts.numel():
+            return 0.0
+        return float(counts[idx].item()) / total
+
+    @property
+    def counts(self) -> dict[str, dict[str, float]]:
+        out: dict[str, dict[str, float]] = {}
+        for router, counts in self.counts_t.items():
+            nz = torch.nonzero(counts > 0, as_tuple=False).reshape(-1)
+            out[router] = {
+                str(int(i)): float(counts[int(i)].item())
+                for i in nz.tolist()
+            }
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -398,11 +419,11 @@ class FisherAccumulator:
             if self.cache_dir is not None:
                 need = self.input_rows - self._rows_got[name]
                 if need > 0:
-                    flat = x.detach().reshape(-1, x.size(-1)).cpu()
+                    flat = x.detach().reshape(-1, x.size(-1))
                     if flat.size(0) > need:
-                        idx = torch.randperm(flat.size(0))[:need]
-                        flat = flat[idx]
-                    self._input_snaps[name].append(flat)
+                        idx = torch.randperm(flat.size(0), device=flat.device)[:need]
+                        flat = flat.index_select(0, idx)
+                    self._input_snaps[name].append(flat.to("cpu"))
                     self._rows_got[name] += flat.size(0)
         return hook
 
@@ -737,9 +758,6 @@ def run_probe_pass(model: nn.Module,
 
         del out, loss, ids, embed, logits
         acc._saved_inputs.clear()
-        if exec_device.type == "cuda":
-            torch.cuda.empty_cache()
-        gc.collect()
 
     acc.finalize(tracker)
     acc.remove_hooks()
