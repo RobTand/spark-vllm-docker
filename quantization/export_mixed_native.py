@@ -33,6 +33,7 @@ from collections import Counter
 from copy import deepcopy
 from pathlib import Path
 from typing import Iterable
+from types import MethodType
 
 import torch
 from datasets import load_dataset
@@ -549,6 +550,18 @@ def preserve_tokenizer_files(source_model: str, output_dir: Path):
             shutil.copy2(src, output_dir / name)
 
 
+def ensure_transformers_compat(model):
+    """Patch small API drifts that llmcompressor still assumes."""
+    if not hasattr(model, "_get_no_split_modules") and hasattr(model, "_no_split_modules"):
+        no_split = getattr(model, "_no_split_modules")
+
+        def _get_no_split_modules(self, device_map="auto"):
+            return list(no_split) if no_split is not None else []
+
+        model._get_no_split_modules = MethodType(_get_no_split_modules, model)
+    return model
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Export a DynaQuant mixed native recipe to compressed-tensors."
@@ -639,6 +652,7 @@ def main():
             trust_remote_code=True,
             local_files_only=local_model,
         )
+        ensure_transformers_compat(model)
         tokenizer = AutoTokenizer.from_pretrained(
             staged,
             trust_remote_code=True,
