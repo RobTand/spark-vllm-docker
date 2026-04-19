@@ -153,13 +153,15 @@ def _stage_text_only(model_path: str) -> str:
 
 
 def _load_live_model(model_path: str, device: str, dtype: torch.dtype,
-                     unfuse_moe: bool = True) -> nn.Module:
+                     unfuse_moe: bool = True,
+                     device_map: str | None = None) -> nn.Module:
     from transformers import AutoModelForCausalLM
     from .sensitivity_probe import prepare_model_for_moe_linears
 
     staged = _stage_text_only(model_path)
+    load_device_map = device_map if device_map is not None else device
     model = AutoModelForCausalLM.from_pretrained(
-        staged, torch_dtype=dtype, device_map=device,
+        staged, torch_dtype=dtype, device_map=load_device_map,
         low_cpu_mem_usage=False, trust_remote_code=True,
     )
     model.eval()
@@ -431,6 +433,8 @@ def main():
     ap.add_argument("--activation-cache-dir", required=True)
     ap.add_argument("--output", required=True)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--device-map", default=None,
+                    help="HF from_pretrained device_map. Defaults to --device.")
     ap.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     ap.add_argument("--formats", default="",
                     help="Comma-separated format names. Empty = all registered.")
@@ -494,7 +498,8 @@ def main():
 
     t0 = time.time()
     model = _load_live_model(args.model, args.device, dtype,
-                             unfuse_moe=args.unfuse_moe)
+                             unfuse_moe=args.unfuse_moe,
+                             device_map=args.device_map)
     print(f"[cost] model loaded in {time.time()-t0:.1f}s", flush=True)
 
     if not args.no_watchdog:
