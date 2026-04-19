@@ -423,6 +423,100 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
     return results
 
 
+def load_cost_model(model_path: str,
+                    device: str,
+                    dtype: torch.dtype,
+                    unfuse_moe: bool = True,
+                    device_map: str | None = None) -> nn.Module:
+    t0 = time.time()
+    model = _load_live_model(model_path, device, dtype,
+                             unfuse_moe=unfuse_moe,
+                             device_map=device_map)
+    print(f"[cost] model loaded in {time.time()-t0:.1f}s", flush=True)
+    return model
+
+
+def prepare_cost_context(probe_path: str,
+                         activation_cache_dir: str,
+                         formats_csv: str,
+                         skip_missing_activations: bool):
+    with open(probe_path, "rb") as f:
+        probe = pickle.load(f)
+    stats = probe["stats"]
+    print(f"[cost] loaded probe stats for {len(stats)} Linears")
+
+    cache = Path(activation_cache_dir)
+    if not cache.exists():
+        raise SystemExit(f"activation cache {cache} does not exist")
+
+    if formats_csv:
+        fmt_names = [s.strip() for s in formats_csv.split(",") if s.strip()]
+    else:
+        fmt_names = [s.name for s in fr.list_formats()]
+    specs = [fr.get_format(n) for n in fmt_names]
+    print(f"[cost] measuring {len(specs)} formats: {[s.name for s in specs]}")
+
+    act_cache = ActivationIndex(cache, stats.keys())
+    print(f"[cost] activation cache (lazy index): "
+          f"{len(act_cache)} Linears mapped", flush=True)
+
+    target_names = set(stats.keys())
+    missing_act = [n for n in target_names if n not in act_cache]
+    if missing_act and not skip_missing_activations:
+        raise SystemExit(f"{len(missing_act)} Linears missing activation; "
+                         f"pass --skip-missing-activations to proceed.")
+
+    return probe, stats, act_cache, target_names, missing_act, fmt_names, specs
+
+
+def run_cost_pass(model: nn.Module,
+                  act_cache: "ActivationIndex",
+                  target_names: set[str],
+                  missing_act: list[str],
+                  specs: list[fr.FormatSpec],
+                  model_name: str,
+                  probe_path: str,
+                  device: str,
+                  dtype: torch.dtype,
+                  mode: str,
+                  chunk_size: int,
+                  output_path: str):
+    chosen_mode = mode
+    if chosen_mode == "auto":
+        chosen_mode = "batched" if device.startswith("cuda") else "unbatched"
+    print(f"[cost] mode: {chosen_mode}")
+
+    if chosen_mode == "batched":
+        results = measure_batched_gpu(model, act_cache, target_names, specs,
+                                      device, dtype,
+                                      chunk_size=chunk_size)
+    else:
+        results = measure_unbatched(model, act_cache, target_names, specs,
+                                    device, dtype)
+
+    missing_from_results = [n for n in target_names if n not in results]
+    if missing_from_results:
+        print(f"[cost] WARNING: {len(missing_from_results)} Linears had no "
+              f"measurement output (cache miss or skipped)")
+
+    out_path = Path(output_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "wb") as f:
+        pickle.dump({
+            "costs": results,
+            "formats": [s.name for s in specs],
+            "meta": {
+                "model": model_name,
+                "probe": probe_path,
+                "n_linears": len(results),
+                "missing_activations": missing_act,
+                "mode": chosen_mode,
+            },
+        }, f)
+    print(f"[cost] wrote {out_path} ({len(results)} Linears)")
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -469,76 +563,33 @@ def main():
     if args.threads > 0:
         torch.set_num_threads(args.threads)
 
-    with open(args.probe, "rb") as f:
-        probe = pickle.load(f)
-    stats = probe["stats"]
-    print(f"[cost] loaded probe stats for {len(stats)} Linears")
-
-    cache = Path(args.activation_cache_dir)
-    if not cache.exists():
-        raise SystemExit(f"activation cache {cache} does not exist")
-
-    if args.formats:
-        fmt_names = [s.strip() for s in args.formats.split(",") if s.strip()]
-    else:
-        fmt_names = [s.name for s in fr.list_formats()]
-    specs = [fr.get_format(n) for n in fmt_names]
-    print(f"[cost] measuring {len(specs)} formats: "
-          f"{[s.name for s in specs]}")
-
-    act_cache = ActivationIndex(cache, stats.keys())
-    print(f"[cost] activation cache (lazy index): "
-          f"{len(act_cache)} Linears mapped", flush=True)
-
-    target_names = set(stats.keys())
-    missing_act = [n for n in target_names if n not in act_cache]
-    if missing_act and not args.skip_missing_activations:
-        raise SystemExit(f"{len(missing_act)} Linears missing activation; "
-                         f"pass --skip-missing-activations to proceed.")
-
-    t0 = time.time()
-    model = _load_live_model(args.model, args.device, dtype,
-                             unfuse_moe=args.unfuse_moe,
-                             device_map=args.device_map)
-    print(f"[cost] model loaded in {time.time()-t0:.1f}s", flush=True)
+    _, _, act_cache, target_names, missing_act, _, specs = prepare_cost_context(
+        probe_path=args.probe,
+        activation_cache_dir=args.activation_cache_dir,
+        formats_csv=args.formats,
+        skip_missing_activations=args.skip_missing_activations,
+    )
+    model = load_cost_model(args.model, args.device, dtype,
+                            unfuse_moe=args.unfuse_moe,
+                            device_map=args.device_map)
 
     if not args.no_watchdog:
         start_mem_watchdog(swap_grow_limit_mb=args.swap_grow_limit_mb,
                            min_mem_available_mb=args.min_mem_available_mb)
-
-    mode = args.mode
-    if mode == "auto":
-        mode = "batched" if args.device.startswith("cuda") else "unbatched"
-    print(f"[cost] mode: {mode}")
-
-    if mode == "batched":
-        results = measure_batched_gpu(model, act_cache, target_names, specs,
-                                      args.device, dtype,
-                                      chunk_size=args.chunk_size)
-    else:
-        results = measure_unbatched(model, act_cache, target_names, specs,
-                                    args.device, dtype)
-
-    missing_from_results = [n for n in target_names if n not in results]
-    if missing_from_results:
-        print(f"[cost] WARNING: {len(missing_from_results)} Linears had no "
-              f"measurement output (cache miss or skipped)")
-
-    out_path = Path(args.output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "wb") as f:
-        pickle.dump({
-            "costs": results,
-            "formats": fmt_names,
-            "meta": {
-                "model": args.model,
-                "probe": args.probe,
-                "n_linears": len(results),
-                "missing_activations": missing_act,
-                "mode": mode,
-            },
-        }, f)
-    print(f"[cost] wrote {out_path} ({len(results)} Linears)")
+    run_cost_pass(
+        model=model,
+        act_cache=act_cache,
+        target_names=target_names,
+        missing_act=missing_act,
+        specs=specs,
+        model_name=args.model,
+        probe_path=args.probe,
+        device=args.device,
+        dtype=dtype,
+        mode=args.mode,
+        chunk_size=args.chunk_size,
+        output_path=args.output,
+    )
 
 
 if __name__ == "__main__":
