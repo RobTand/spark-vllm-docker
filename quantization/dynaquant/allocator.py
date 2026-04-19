@@ -171,18 +171,19 @@ def build_candidates(stats: dict, costs: dict, formats: list[fr.FormatSpec]
     return out
 
 
-def _moe_layer_key(name: str) -> str | None:
-    """Return the MoE-experts-group key for this Linear, or None if it
-    isn't an expert Linear.
+def _moe_group_and_projection(name: str) -> tuple[str, str] | None:
+    """Return `(experts_group_path, projection_suffix)` for expert leaves.
 
-    Two leaves belong to the same group iff they live under the same
-    `<prefix>.experts.<eid>.*` ancestor. The group key is that
-    `<prefix>.experts` path — all expert Linears beneath it share one
-    serving-side fused tensor per projection.
+    Supports both common layouts:
+      - `<prefix>.experts.<eid>.<projection>`
+      - `<prefix>.experts.<projection>.<eid>` (Qwen3.5/3.6 packed experts)
     """
-    m = re.search(r"^(.+\.experts)\.\d+\.", name)
+    m = re.search(r"^(.+\.experts)\.\d+\.(.+)$", name)
     if m:
-        return m.group(1)
+        return m.group(1), m.group(2)
+    m = re.search(r"^(.+\.experts)\.(gate_up_proj|down_proj)\.\d+$", name)
+    if m:
+        return m.group(1), m.group(2)
     return None
 
 
@@ -213,17 +214,11 @@ def aggregate_moe_candidates(
     expert_leaves: dict[tuple[str, str], list[str]] = {}
     non_expert_names: list[str] = []
     for name in stats:
-        grp = _moe_layer_key(name)
-        if grp is None:
+        grp_proj = _moe_group_and_projection(name)
+        if grp_proj is None:
             non_expert_names.append(name)
             continue
-        # projection suffix is everything after `.experts.<eid>.`
-        suf = name[len(grp):]
-        m = re.match(r"\.\d+\.(.+)$", suf)
-        if not m:
-            non_expert_names.append(name)
-            continue
-        projection = m.group(1)
+        grp, projection = grp_proj
         expert_leaves.setdefault((grp, projection), []).append(name)
 
     stats_ext = {n: stats[n] for n in non_expert_names}
@@ -267,18 +262,32 @@ def aggregate_moe_candidates(
         # Instead we sum predicted Δloss across members per format.
         super_cost = {}
         for spec in formats:
-            missing = any(spec.name not in costs.get(m_, {})
-                          or "error" in costs.get(m_, {}).get(spec.name, {})
-                          for m_ in members)
-            if missing:
+            available_members = [
+                m_ for m_ in members
+                if spec.name in costs.get(m_, {})
+                and "error" not in costs.get(m_, {}).get(spec.name, {})
+            ]
+            if not available_members:
                 super_cost[spec.name] = {"error": "partial"}
                 continue
+            mean_output_mse = sum(
+                costs[m_][spec.name]["output_mse"] for m_ in available_members
+            ) / len(available_members)
+            mean_weight_mse = sum(
+                costs[m_][spec.name]["weight_mse"] * stats[m_]["n_params"]
+                for m_ in available_members
+            ) / max(sum(stats[m_]["n_params"] for m_ in available_members), 1)
             # sum of per-expert predicted Δloss, rescaled so the allocator's
             # formula (0.5 * h_trace * output_mse * d_out) reproduces it
             sum_pred = 0.0
             sum_weight_mse = 0.0
             for m_ in members:
-                c = costs[m_][spec.name]
+                c = costs.get(m_, {}).get(spec.name)
+                if c is None or "error" in c:
+                    c = {
+                        "weight_mse": mean_weight_mse,
+                        "output_mse": mean_output_mse,
+                    }
                 h_i = stats[m_]["h_trace"]
                 d_i = stats[m_]["out_features"]
                 sum_pred += 0.5 * h_i * c["output_mse"] * d_i
