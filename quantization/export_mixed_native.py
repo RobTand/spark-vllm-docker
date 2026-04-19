@@ -22,9 +22,13 @@ The intent is to keep vLLM changes minimal:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import os
 import shutil
 import sys
+import threading
+import time
 from collections import Counter
 from copy import deepcopy
 from pathlib import Path
@@ -216,6 +220,62 @@ FP8_DYNAMIC_SCHEME = {
         "dynamic": True,
     },
 }
+
+
+def _read_proc_io() -> dict[str, int]:
+    out: dict[str, int] = {}
+    try:
+        with open("/proc/self/io") as f:
+            for line in f:
+                key, value = line.split(":")
+                out[key.strip()] = int(value.strip())
+    except OSError:
+        pass
+    return out
+
+
+def _dir_usage(path: Path) -> tuple[int, int]:
+    total_bytes = 0
+    total_files = 0
+    if not path.exists():
+        return total_bytes, total_files
+    for child in path.rglob("*"):
+        if child.is_file():
+            total_files += 1
+            try:
+                total_bytes += child.stat().st_size
+            except OSError:
+                pass
+    return total_bytes, total_files
+
+
+@contextlib.contextmanager
+def phase_heartbeat(label: str, output_dir: Path, interval_s: int = 30):
+    stop = threading.Event()
+    start = time.time()
+    io0 = _read_proc_io()
+
+    def _run():
+        while not stop.wait(interval_s):
+            io_now = _read_proc_io()
+            out_bytes, out_files = _dir_usage(output_dir)
+            read_gb = (io_now.get("read_bytes", 0) - io0.get("read_bytes", 0)) / (1024 ** 3)
+            write_gb = (io_now.get("write_bytes", 0) - io0.get("write_bytes", 0)) / (1024 ** 3)
+            elapsed = time.time() - start
+            print(
+                f"[export] heartbeat phase={label!r} elapsed={elapsed:.0f}s "
+                f"io_read={read_gb:.2f}GB io_write={write_gb:.2f}GB "
+                f"output_files={out_files} output_bytes={out_bytes / (1024 ** 3):.2f}GB",
+                flush=True,
+            )
+
+    thread = threading.Thread(target=_run, name=f"heartbeat-{label}", daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join(timeout=1.0)
 
 
 def parse_config_string(config: str) -> tuple[int, int, int]:
@@ -569,21 +629,24 @@ def main():
             args.num_calibration_samples,
         )
         ds = preprocess_dataset(ds, tokenizer, args.max_seq_length)
+        print(f"[export] calibration rows: {len(ds)}", flush=True)
 
         recipe = QuantizationModifier(config_groups=config_groups, ignore=ignore)
         print("[export] running oneshot compression...", flush=True)
-        oneshot(
-            model=model,
-            dataset=ds,
-            recipe=recipe,
-            max_seq_length=args.max_seq_length,
-            num_calibration_samples=args.num_calibration_samples,
-            processor=tokenizer,
-        )
+        with phase_heartbeat("oneshot", output_dir):
+            oneshot(
+                model=model,
+                dataset=ds,
+                recipe=recipe,
+                max_seq_length=args.max_seq_length,
+                num_calibration_samples=args.num_calibration_samples,
+                processor=tokenizer,
+            )
 
         print("[export] saving compressed checkpoint...", flush=True)
-        model.save_pretrained(args.output, save_compressed=True)
-        tokenizer.save_pretrained(args.output)
+        with phase_heartbeat("save", output_dir):
+            model.save_pretrained(args.output, save_compressed=True)
+            tokenizer.save_pretrained(args.output)
         preserve_tokenizer_files(args.model, output_dir)
 
         config_path = output_dir / "config.json"
