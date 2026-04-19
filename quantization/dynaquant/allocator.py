@@ -187,9 +187,24 @@ def _moe_group_and_projection(name: str) -> tuple[str, str] | None:
     return None
 
 
+def _aggregate_candidate_memory_bits(
+    members: list[str],
+    spec: fr.FormatSpec,
+    stats: dict,
+) -> tuple[int, float]:
+    total_params = sum(stats[m]["n_params"] for m in members)
+    total_bytes = 0
+    for m in members:
+        shape = _shape_from_stats(stats[m])
+        total_bytes += spec.memory_bytes_for_shape(shape)
+    bits_per_param = 8.0 * total_bytes / max(total_params, 1)
+    return total_bytes, bits_per_param
+
+
 def aggregate_moe_candidates(
     stats: dict, costs: dict, formats: list[fr.FormatSpec],
     candidates: dict[str, list[Candidate]],
+    granularity: str = "projection",
 ) -> tuple[dict, dict, dict]:
     """Aggregate per-expert Linears into per-layer MoE super-candidates.
 
@@ -219,7 +234,10 @@ def aggregate_moe_candidates(
             non_expert_names.append(name)
             continue
         grp, projection = grp_proj
-        expert_leaves.setdefault((grp, projection), []).append(name)
+        if granularity == "layer":
+            expert_leaves.setdefault((grp, "__all__"), []).append(name)
+        else:
+            expert_leaves.setdefault((grp, projection), []).append(name)
 
     stats_ext = {n: stats[n] for n in non_expert_names}
     costs_ext = {n: costs.get(n, {}) for n in non_expert_names}
@@ -245,13 +263,14 @@ def aggregate_moe_candidates(
             "w_max_abs": max(stats[m_]["w_max_abs"] for m_ in members),
             "w_norm_sq": sum(stats[m_]["w_norm_sq"] for m_ in members),
             "n_params": n_params,
-            "in_features": stats[members[0]]["in_features"],
-            "out_features": d_out,
+            "in_features": 1,
+            "out_features": 1,
             "n_tokens_seen": sum(stats[m_].get("n_tokens_seen", 0) for m_ in members),
             "route_prob": None,  # aggregation washes out per-expert route prob
             "router_path": None,
             "expert_id": None,
             "_fused_members": members,
+            "_memory_bytes_by_format": {},
         }
 
         # Aggregate per-format cost = mean weight_mse (weighted by params)
@@ -293,10 +312,12 @@ def aggregate_moe_candidates(
                 sum_pred += 0.5 * h_i * c["output_mse"] * d_i
                 sum_weight_mse += c["weight_mse"] * stats[m_]["n_params"]
             # Invert to an "effective output_mse" so the allocator's
-            # predicted_dloss = 0.5 * sum_h * effective_mse * d_out matches
-            # the true summed Δloss.
-            if sum_h > 0 and d_out > 0:
-                eff_mse = sum_pred / (0.5 * sum_h * d_out)
+            # predicted_dloss = 0.5 * sum_h * effective_mse * out_features
+            # matches the true summed Δloss. We use out_features=1 for the
+            # synthetic packed-MoE unit so mixed projection shapes collapse
+            # cleanly into one serving unit.
+            if sum_h > 0:
+                eff_mse = sum_pred / (0.5 * sum_h)
             else:
                 eff_mse = 0.0
             super_cost[spec.name] = {
@@ -312,17 +333,15 @@ def aggregate_moe_candidates(
             entry = super_cost.get(spec.name)
             if entry is None or "error" in entry:
                 continue
-            predicted = 0.5 * sum_h * entry["output_mse"] * d_out
+            predicted = 0.5 * sum_h * entry["output_mse"]
+            memory_bytes, bits_per_param = _aggregate_candidate_memory_bits(
+                members, spec, stats
+            )
+            stats_ext[super_name]["_memory_bytes_by_format"][spec.name] = memory_bytes
             cands.append(Candidate(
                 fmt=spec.name,
-                bits_per_param=spec.effective_bits_for_shape((
-                    stats_ext[super_name]["out_features"],
-                    stats_ext[super_name]["in_features"],
-                )),
-                memory_bytes=spec.memory_bytes_for_shape((
-                    stats_ext[super_name]["out_features"],
-                    stats_ext[super_name]["in_features"],
-                )),
+                bits_per_param=bits_per_param,
+                memory_bytes=memory_bytes,
                 predicted_dloss=max(predicted, 0.0),
             ))
         if cands:
@@ -464,9 +483,38 @@ def compute_achieved(stats: dict, assignment: dict[str, str],
     total_params = sum(stats[n]["n_params"] for n in assignment)
     total_bits = 0.0
     for n in assignment:
-        shape = _shape_from_stats(stats[n])
-        total_bits += format_specs[assignment[n]].effective_bits_for_shape(shape) * stats[n]["n_params"]
+        memory_map = stats[n].get("_memory_bytes_by_format")
+        if memory_map is not None and assignment[n] in memory_map:
+            total_bits += 8.0 * memory_map[assignment[n]]
+        else:
+            shape = _shape_from_stats(stats[n])
+            total_bits += (
+                format_specs[assignment[n]].effective_bits_for_shape(shape)
+                * stats[n]["n_params"]
+            )
     return total_bits / max(total_params, 1), 0.0  # dloss recomputed separately
+
+
+def _allowed_format(target_profile: str, name: str, fmt: str) -> bool:
+    if target_profile == "research":
+        return True
+    if target_profile == "vllm_qwen3_5_packed_moe":
+        if ".mlp.experts" in name:
+            return fmt in {"NVFP4", "FP8_E4M3", "FP8_E5M2", "BF16", "MXFP4"}
+        return True
+    raise ValueError(f"Unknown target profile: {target_profile}")
+
+
+def filter_candidates_for_profile(
+    candidates: dict[str, list[Candidate]],
+    target_profile: str,
+) -> dict[str, list[Candidate]]:
+    out = {}
+    for name, cands in candidates.items():
+        kept = [c for c in cands if _allowed_format(target_profile, name, c.fmt)]
+        if kept:
+            out[name] = kept
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -505,6 +553,13 @@ def main():
                          "TensorRT-LLM). 'expert' allows per-expert mixing but "
                          "forces slower sequential serving and is noise-floor "
                          "limited at typical calibration budgets.")
+    ap.add_argument("--target-profile",
+                    choices=["research", "vllm_qwen3_5_packed_moe"],
+                    default="research",
+                    help="Serving/backend constraint profile. "
+                         "'vllm_qwen3_5_packed_moe' collapses Qwen3.5/3.6 MoE "
+                         "to legal packed serving units and restricts MoE "
+                         "formats to the existing vLLM path.")
     args = ap.parse_args()
 
     if args.threads > 0:
@@ -564,11 +619,18 @@ def main():
     candidates = build_candidates(stats, costs, specs_sorted)
     print(f"[alloc] candidates built for {len(candidates)} Linears")
 
-    if args.expert_granularity == "layer":
+    if args.target_profile == "vllm_qwen3_5_packed_moe":
         stats, costs, candidates = aggregate_moe_candidates(
-            stats, costs, specs_sorted, candidates)
+            stats, costs, specs_sorted, candidates, granularity="layer")
+        moe_groups = sum(1 for n in candidates if ".__fused__." in n)
+        print(f"[alloc] packed-MoE serving aggregation: {moe_groups} fused MoE blocks")
+    elif args.expert_granularity == "layer":
+        stats, costs, candidates = aggregate_moe_candidates(
+            stats, costs, specs_sorted, candidates, granularity="projection")
         moe_groups = sum(1 for n in candidates if ".__fused__." in n)
         print(f"[alloc] MoE aggregation: {moe_groups} fused-expert super-Linears")
+
+    candidates = filter_candidates_for_profile(candidates, args.target_profile)
 
     # Pareto sweep
     targets = [float(x) for x in args.pareto_targets.split(",")]
