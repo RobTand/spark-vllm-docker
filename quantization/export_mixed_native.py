@@ -562,6 +562,31 @@ def ensure_transformers_compat(model):
     return model
 
 
+def validate_export_artifact(output_dir: Path):
+    """Fail fast if the saved checkpoint clearly fell back to dense tensors."""
+    index_path = output_dir / "model.safetensors.index.json"
+    if not index_path.exists():
+        return
+
+    with open(index_path) as f:
+        index = json.load(f)
+
+    weight_map = index.get("weight_map", {})
+    dense_packed_moe = sorted(
+        name
+        for name in weight_map
+        if ".mlp.experts.gate_up_proj" in name or ".mlp.experts.down_proj" in name
+    )
+    if not dense_packed_moe:
+        return
+
+    examples = ", ".join(dense_packed_moe[:4])
+    raise RuntimeError(
+        "Packed MoE experts were saved as dense tensors instead of a compressed "
+        f"format. Example weights: {examples}"
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Export a DynaQuant mixed native recipe to compressed-tensors."
@@ -691,6 +716,8 @@ def main():
             qconfig = config.get("quantization_config", {})
             print("[export] output format:", qconfig.get("format"), flush=True)
             print("[export] output groups:", list(qconfig.get("config_groups", {}).keys()), flush=True)
+
+        validate_export_artifact(output_dir)
 
         print("[export] sample generation...", flush=True)
         try:
