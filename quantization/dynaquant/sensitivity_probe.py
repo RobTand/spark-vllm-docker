@@ -28,7 +28,6 @@ import json
 import pickle
 import random
 import re
-import sys
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -600,6 +599,179 @@ def per_token_ce(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     return ce.view(shift_labels.size())
 
 
+def load_probe_model_and_tokenizer(model_path: str,
+                                   requested_device: str,
+                                   dtype: torch.dtype,
+                                   device_map: str | None = None,
+                                   unfuse_moe: bool = True,
+                                   gradient_checkpointing: bool = True):
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    staged = stage_text_only(model_path)
+    tokenizer = AutoTokenizer.from_pretrained(staged, trust_remote_code=True)
+    load_device_map = device_map if device_map is not None else requested_device
+    model = AutoModelForCausalLM.from_pretrained(
+        staged, torch_dtype=dtype, device_map=load_device_map,
+        low_cpu_mem_usage=False, trust_remote_code=True,
+    )
+    model.eval()
+
+    if unfuse_moe:
+        try:
+            target_dev = prepare_model_for_moe_linears(model)
+            if target_dev is not None:
+                print(f"[probe] unfused MoE experts into per-expert linears "
+                      f"(all on {target_dev})", flush=True)
+            else:
+                print("[probe] MoE unfuse made no changes; continuing with "
+                      "packed experts.", flush=True)
+        except ImportError:
+            print("[probe] AutoRound not available; skipping MoE unfuse. "
+                  "Per-expert sensitivity will not be measured.", flush=True)
+        except Exception as e:
+            print(f"[probe] MoE unfuse failed ({e}); continuing with "
+                  "fused experts.", flush=True)
+
+    exec_device = resolve_execution_device(model, requested_device)
+    print(f"[probe] execution device: {exec_device} "
+          f"(load device_map={load_device_map})", flush=True)
+
+    for p in model.parameters():
+        p.requires_grad_(False)
+    if gradient_checkpointing:
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False})
+
+    return staged, tokenizer, model, exec_device, load_device_map
+
+
+def run_probe_pass(model: nn.Module,
+                   tokenizer,
+                   calib: torch.Tensor,
+                   model_name: str,
+                   dataset_name: str,
+                   seqlen: int,
+                   dtype_name: str,
+                   requested_device: str,
+                   load_device_map,
+                   exec_device: torch.device,
+                   linear_include: str,
+                   linear_exclude: str,
+                   importance_weighting: bool,
+                   activation_cache_dir: str | None,
+                   output_path: str):
+    inc = re.compile(linear_include)
+    exc = re.compile(linear_exclude)
+    tracked = [n for n, m in model.named_modules()
+               if isinstance(m, nn.Linear)
+               and inc.search(n) and not exc.search(n)]
+    print(f"[probe] tracking {len(tracked)} Linear layers", flush=True)
+
+    expert_info_all = discover_moe_structure(model)
+    expert_info = {k: v for k, v in expert_info_all.items() if k in tracked}
+    top_k = read_top_k(model, default=2)
+    routers = sorted({r for r, _ in expert_info.values()})
+    print(f"[probe] MoE: {len(expert_info)} expert linears, "
+          f"{len(routers)} routers, top_k={top_k}", flush=True)
+    if len(expert_info) == 0:
+        diag_count = 0
+        for pname, pmod in model.named_modules():
+            for attr in ("experts", "block_sparse_moe_experts",
+                         "moe_experts", "expert_layer"):
+                child = getattr(pmod, attr, None)
+                if child is None or not isinstance(child, nn.Module):
+                    continue
+                kids = list(child.named_children())
+                numkids = [k for k, _ in kids if k.isdigit()]
+                print(f"[probe/diag] parent={pname!r} attr={attr!r} "
+                      f"container_cls={type(child).__name__} "
+                      f"n_children={len(kids)} n_numeric_children={len(numkids)}"
+                      f" first_children={[k for k,_ in kids[:5]]}",
+                      flush=True)
+                diag_count += 1
+                if diag_count >= 3:
+                    break
+            if diag_count >= 3:
+                break
+
+    tracker = RouterTracker(model, routers, top_k) if routers else None
+    cache_dir = Path(activation_cache_dir) if activation_cache_dir else None
+    acc = FisherAccumulator(model, tracked, expert_info, cache_dir)
+
+    print(f"[probe] calibration shape: {calib.shape}", flush=True)
+
+    model.train()
+    t_fwd = t_bwd = 0.0
+    for i in range(calib.size(0)):
+        ids = calib[i:i+1].to(exec_device)
+        t0 = time.time()
+        with torch.no_grad():
+            embed = model.get_input_embeddings()(ids)
+        embed.requires_grad_(True)
+        out = model(inputs_embeds=embed, labels=ids)
+        logits = out.logits
+        t_fwd += time.time() - t0
+
+        t0 = time.time()
+        if importance_weighting:
+            with torch.no_grad():
+                tok = per_token_ce(logits.detach(), ids)
+                mean = float(tok.mean().item())
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = ids[..., 1:].contiguous()
+            lp = F.log_softmax(
+                shift_logits.reshape(-1, shift_logits.size(-1)), dim=-1)
+            gather = -lp.gather(1, shift_labels.reshape(-1, 1)).squeeze(1)
+            w = (tok.reshape(-1) / max(mean, 1e-6)).clamp(0.25, 4.0)
+            loss = (gather * w).mean()
+        else:
+            loss = out.loss
+        loss.backward()
+        t_bwd += time.time() - t0
+
+        if (i + 1) % 4 == 0 or i == 0:
+            print(f"[probe] sample {i+1}/{calib.size(0)} "
+                  f"loss={float(loss.item()):.3f} "
+                  f"fwd_avg={t_fwd/(i+1):.2f}s bwd_avg={t_bwd/(i+1):.2f}s",
+                  flush=True)
+
+        del out, loss, ids, embed, logits
+        acc._saved_inputs.clear()
+        if exec_device.type == "cuda":
+            torch.cuda.empty_cache()
+        gc.collect()
+
+    acc.finalize(tracker)
+    acc.remove_hooks()
+    if tracker is not None:
+        tracker.remove_hooks()
+
+    out_path = Path(output_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "wb") as f:
+        pickle.dump({
+            "stats": acc.stats,
+            "router_counts": dict(tracker.counts) if tracker else {},
+            "router_totals": dict(tracker.total_tokens) if tracker else {},
+            "expert_info": expert_info,
+            "meta": {
+                "model": model_name,
+                "dataset": dataset_name,
+                "nsamples": calib.size(0),
+                "seqlen": seqlen,
+                "dtype": dtype_name,
+                "device_map": str(load_device_map),
+                "execution_device": str(exec_device),
+                "top_k": top_k,
+                "importance_weighting": importance_weighting,
+                "activation_cache_dir": str(cache_dir) if cache_dir else None,
+                "linear_include": linear_include,
+                "linear_exclude": linear_exclude,
+            },
+        }, f)
+    print(f"[probe] wrote {out_path}", flush=True)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -643,170 +815,39 @@ def main():
     ap.add_argument("--no-unfuse-moe", action="store_false", dest="unfuse_moe")
     args = ap.parse_args()
 
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    staged = stage_text_only(args.model)
     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16,
              "fp32": torch.float32}[args.dtype]
-    tokenizer = AutoTokenizer.from_pretrained(staged, trust_remote_code=True)
 
     print(f"[probe] loading {args.model}", flush=True)
     t0 = time.time()
-    load_device_map = args.device_map if args.device_map is not None else args.device
-    model = AutoModelForCausalLM.from_pretrained(
-        staged, torch_dtype=dtype, device_map=load_device_map,
-        low_cpu_mem_usage=False, trust_remote_code=True,
+    _, tokenizer, model, exec_device, load_device_map = load_probe_model_and_tokenizer(
+        args.model,
+        requested_device=args.device,
+        dtype=dtype,
+        device_map=args.device_map,
+        unfuse_moe=args.unfuse_moe,
+        gradient_checkpointing=args.gradient_checkpointing,
     )
-    model.eval()
-
-    # Optional: unfuse MoE experts into per-expert nn.Linear layers.
-    # Modern transformers (5.0+) pack MoE experts into single nn.Parameter
-    # tensors like (num_experts, out_dim, in_dim) and apply them via
-    # nn.functional.linear inline — there are no per-expert nn.Linear
-    # modules for us to hook.  AutoRound's prepare_model_for_moe_quantization
-    # unfuses them into a ModuleList of Linears, which is what our probe
-    # and allocator expect. Fall back gracefully (with a warning) if
-    # AutoRound isn't installed, so DynaQuant remains usable for dense
-    # models without a hard AutoRound dependency.
-    if args.unfuse_moe:
-        try:
-            target_dev = prepare_model_for_moe_linears(model)
-            if target_dev is not None:
-                print(f"[probe] unfused MoE experts into per-expert linears "
-                      f"(all on {target_dev})", flush=True)
-            else:
-                print("[probe] MoE unfuse made no changes; continuing with "
-                      "packed experts.", flush=True)
-        except ImportError:
-            print("[probe] AutoRound not available; skipping MoE unfuse. "
-                  "Per-expert sensitivity will not be measured.", flush=True)
-        except Exception as e:
-            print(f"[probe] MoE unfuse failed ({e}); continuing with "
-                  "fused experts.", flush=True)
-
-    exec_device = resolve_execution_device(model, args.device)
-    print(f"[probe] execution device: {exec_device} "
-          f"(load device_map={load_device_map})", flush=True)
-
-    for p in model.parameters():
-        p.requires_grad_(False)
-    if args.gradient_checkpointing:
-        model.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={"use_reentrant": False})
     print(f"[probe] loaded in {time.time()-t0:.1f}s", flush=True)
 
-    inc = re.compile(args.linear_include)
-    exc = re.compile(args.linear_exclude)
-    tracked = [n for n, m in model.named_modules()
-               if isinstance(m, nn.Linear)
-               and inc.search(n) and not exc.search(n)]
-    print(f"[probe] tracking {len(tracked)} Linear layers", flush=True)
-
-    expert_info = discover_moe_structure(model)
-    top_k = read_top_k(model, default=2)
-    routers = sorted({r for r, _ in expert_info.values()})
-    print(f"[probe] MoE: {len(expert_info)} expert linears, "
-          f"{len(routers)} routers, top_k={top_k}", flush=True)
-    if len(expert_info) == 0:
-        # Diagnostic: log what the walker saw, to help figure out why
-        # discovery failed. Prints the first couple of modules that LOOK
-        # like they should qualify (have an `experts` attribute) and why
-        # they were rejected.
-        diag_count = 0
-        for pname, pmod in model.named_modules():
-            for attr in ("experts", "block_sparse_moe_experts",
-                         "moe_experts", "expert_layer"):
-                child = getattr(pmod, attr, None)
-                if child is None or not isinstance(child, nn.Module):
-                    continue
-                kids = list(child.named_children())
-                numkids = [k for k, _ in kids if k.isdigit()]
-                print(f"[probe/diag] parent={pname!r} attr={attr!r} "
-                      f"container_cls={type(child).__name__} "
-                      f"n_children={len(kids)} n_numeric_children={len(numkids)}"
-                      f" first_children={[k for k,_ in kids[:5]]}",
-                      flush=True)
-                diag_count += 1
-                if diag_count >= 3:
-                    break
-            if diag_count >= 3:
-                break
-
-    tracker = RouterTracker(model, routers, top_k) if routers else None
-    cache_dir = Path(args.activation_cache_dir) if args.activation_cache_dir else None
-    acc = FisherAccumulator(model, tracked, expert_info, cache_dir)
-
     calib = load_calibration(tokenizer, args.dataset, args.nsamples, args.seqlen)
-    print(f"[probe] calibration shape: {calib.shape}", flush=True)
-
-    model.train()
-    t_fwd = t_bwd = 0.0
-    for i in range(calib.size(0)):
-        ids = calib[i:i+1].to(exec_device)
-        t0 = time.time()
-        with torch.no_grad():
-            embed = model.get_input_embeddings()(ids)
-        embed.requires_grad_(True)
-        out = model(inputs_embeds=embed, labels=ids)
-        logits = out.logits
-        t_fwd += time.time() - t0
-
-        t0 = time.time()
-        if args.importance_weighting:
-            with torch.no_grad():
-                tok = per_token_ce(logits.detach(), ids)
-                mean = float(tok.mean().item())
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = ids[..., 1:].contiguous()
-            lp = F.log_softmax(
-                shift_logits.reshape(-1, shift_logits.size(-1)), dim=-1)
-            gather = -lp.gather(1, shift_labels.reshape(-1, 1)).squeeze(1)
-            w = (tok.reshape(-1) / max(mean, 1e-6)).clamp(0.25, 4.0)
-            loss = (gather * w).mean()
-        else:
-            loss = out.loss
-        loss.backward()
-        t_bwd += time.time() - t0
-
-        if (i + 1) % 4 == 0 or i == 0:
-            print(f"[probe] sample {i+1}/{calib.size(0)} "
-                  f"loss={float(loss.item()):.3f} "
-                  f"fwd_avg={t_fwd/(i+1):.2f}s bwd_avg={t_bwd/(i+1):.2f}s",
-                  flush=True)
-
-        del out, loss, ids, embed, logits
-        acc._saved_inputs.clear()
-        if exec_device.type == "cuda":
-            torch.cuda.empty_cache()
-        gc.collect()
-
-    acc.finalize(tracker)
-    acc.remove_hooks()
-    if tracker is not None:
-        tracker.remove_hooks()
-
-    out_path = Path(args.output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "wb") as f:
-        pickle.dump({
-            "stats": acc.stats,
-            "router_counts": dict(tracker.counts) if tracker else {},
-            "router_totals": dict(tracker.total_tokens) if tracker else {},
-            "expert_info": expert_info,
-            "meta": {
-                "model": args.model,
-                "dataset": args.dataset,
-                "nsamples": calib.size(0),
-                "seqlen": args.seqlen,
-                "dtype": args.dtype,
-                "device_map": str(load_device_map),
-                "execution_device": str(exec_device),
-                "top_k": top_k,
-                "importance_weighting": args.importance_weighting,
-                "activation_cache_dir": str(cache_dir) if cache_dir else None,
-            },
-        }, f)
-    print(f"[probe] wrote {out_path}", flush=True)
+    run_probe_pass(
+        model=model,
+        tokenizer=tokenizer,
+        calib=calib,
+        model_name=args.model,
+        dataset_name=args.dataset,
+        seqlen=args.seqlen,
+        dtype_name=args.dtype,
+        requested_device=args.device,
+        load_device_map=load_device_map,
+        exec_device=exec_device,
+        linear_include=args.linear_include,
+        linear_exclude=args.linear_exclude,
+        importance_weighting=args.importance_weighting,
+        activation_cache_dir=args.activation_cache_dir,
+        output_path=args.output,
+    )
 
 
 if __name__ == "__main__":

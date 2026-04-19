@@ -14,15 +14,19 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import pickle
 import re
-import subprocess
-import sys
 from collections import defaultdict
 from pathlib import Path
 
-from .sensitivity_probe import stage_text_only
+import torch
+
+from .sensitivity_probe import (
+    load_calibration,
+    load_probe_model_and_tokenizer,
+    run_probe_pass,
+    stage_text_only,
+)
 
 
 def build_layer_shard_regexes(num_hidden_layers: int,
@@ -146,47 +150,47 @@ def main():
     log_dir.mkdir(parents=True, exist_ok=True)
     Path(args.activation_cache_dir).mkdir(parents=True, exist_ok=True)
 
-    shard_paths: list[Path] = []
+    # Persistent runner: load once, calibrate once, sweep shard regexes.
+    dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[args.dtype]
+    print(f"[incremental] loading model once for {len(shard_regexes)} shards", flush=True)
+    _, tokenizer, model, exec_device, load_device_map = load_probe_model_and_tokenizer(
+        args.model,
+        requested_device=args.device,
+        dtype=dtype,
+        device_map=args.device_map,
+        unfuse_moe=args.unfuse_moe,
+        gradient_checkpointing=args.gradient_checkpointing,
+    )
+    calib = load_calibration(tokenizer, args.dataset, args.nsamples, args.seqlen)
+    print(f"[incremental] calibration ready: {tuple(calib.shape)}", flush=True)
+
+    shard_paths = []
     for shard_idx, linear_include in enumerate(shard_regexes):
         shard_path = shard_dir / f"probe_shard_{shard_idx:03d}.pkl"
-        shard_log = log_dir / f"probe_shard_{shard_idx:03d}.log"
         shard_paths.append(shard_path)
         if shard_path.exists():
             print(f"[incremental] reuse shard {shard_idx}: {shard_path}", flush=True)
             continue
-
-        cmd = [
-            sys.executable, "-m", "quantization.dynaquant.sensitivity_probe",
-            "--model", args.model,
-            "--dataset", args.dataset,
-            "--nsamples", str(args.nsamples),
-            "--seqlen", str(args.seqlen),
-            "--device", args.device,
-            "--dtype", args.dtype,
-            "--activation-cache-dir", args.activation_cache_dir,
-            "--output", str(shard_path),
-            "--linear-include", linear_include,
-        ]
-        if args.device_map is not None:
-            cmd.extend(["--device-map", args.device_map])
-        if args.gradient_checkpointing:
-            cmd.append("--gradient-checkpointing")
-        else:
-            cmd.append("--no-gradient-checkpointing")
-        if args.importance_weighting:
-            cmd.append("--importance-weighting")
-        else:
-            cmd.append("--no-importance-weighting")
-        if args.unfuse_moe:
-            cmd.append("--unfuse-moe")
-        else:
-            cmd.append("--no-unfuse-moe")
-
         print(f"[incremental] shard {shard_idx}: include={linear_include}", flush=True)
-        with open(shard_log, "w") as lf:
-            proc = subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT)
-        if proc.returncode != 0:
-            raise SystemExit(f"probe shard {shard_idx} failed, see {shard_log}")
+        run_probe_pass(
+            model=model,
+            tokenizer=tokenizer,
+            calib=calib,
+            model_name=args.model,
+            dataset_name=args.dataset,
+            seqlen=args.seqlen,
+            dtype_name=args.dtype,
+            requested_device=args.device,
+            load_device_map=load_device_map,
+            exec_device=exec_device,
+            linear_include=linear_include,
+            linear_exclude=r"(?:^lm_head$|\.lm_head$|mlp\.gate$|mlp\..*gate$|\.router(?:$|\.)|block_sparse_moe\.gate$)",
+            importance_weighting=args.importance_weighting,
+            activation_cache_dir=args.activation_cache_dir,
+            output_path=str(shard_path),
+        )
+        if exec_device.type == "cuda":
+            torch.cuda.empty_cache()
 
     merge_probe_pickles(shard_paths, Path(args.output))
     print(f"[incremental] wrote merged probe to {args.output}", flush=True)
