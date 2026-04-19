@@ -215,6 +215,20 @@ def snap_bits_to_native(bits: int, *, allow_mxfp4: bool = True) -> str:
 
 
 def canonicalize_format(value, *, snap_legacy: bool, allow_mxfp4: bool) -> str:
+    if isinstance(value, dict):
+        data_type = value.get("data_type")
+        bits = value.get("bits")
+        if data_type == "nv_fp" and bits == 4:
+            return "NVFP4"
+        if data_type == "mx_fp" and bits == 4:
+            return "MXFP4" if allow_mxfp4 else "NVFP4"
+        if data_type == "mx_fp" and bits == 8:
+            return "MXFP8"
+        if data_type == "float" and bits == 8:
+            return "FP8"
+        if data_type == "float" and bits == 16:
+            return "BF16"
+        raise ValueError(f"unsupported layer-config dict value: {value!r}")
     if isinstance(value, int):
         return snap_bits_to_native(value, allow_mxfp4=allow_mxfp4)
     if isinstance(value, float) and value.is_integer():
@@ -251,7 +265,7 @@ def load_entry(recipe_path: str, curve: str, step: str) -> dict:
     if "recipe" in data and isinstance(data["recipe"], dict):
         return data["recipe"]
 
-    if all(isinstance(v, str) for v in data.values()):
+    if all(isinstance(v, (str, dict)) for v in data.values()):
         return data
 
     curve_key = "promotion_curve" if curve == "promotion" else "pareto_curve"
