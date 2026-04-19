@@ -38,6 +38,56 @@ import torch.nn as nn
 from . import format_registry as fr
 
 
+def canonical_linear_name(name: str) -> str:
+    """Map live module names onto the probe's canonical naming.
+
+    Qwen3.5/3.6 MoE can unfuse into per-expert:
+      experts.<eid>.gate_proj / up_proj / down_proj
+    while the probe/cost pipeline historically keys those as:
+      experts.gate_up_proj.<eid> / experts.down_proj.<eid>
+    """
+    m = re.match(r"^(.+\.mlp\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)$", name)
+    if not m:
+        return name
+    prefix, expert_id, proj = m.groups()
+    if proj in {"gate_proj", "up_proj"}:
+        return f"{prefix}.gate_up_proj.{expert_id}"
+    return f"{prefix}.down_proj.{expert_id}"
+
+
+def _accumulate_result(bucket: dict, name: str, fmt: str,
+                       weight_mse: float, output_mse: float,
+                       rel_output_mse: float):
+    per_name = bucket.setdefault(name, {})
+    acc = per_name.setdefault(fmt, {
+        "_count": 0,
+        "_weight_mse_sum": 0.0,
+        "_output_mse_sum": 0.0,
+        "_rel_output_mse_sum": 0.0,
+    })
+    acc["_count"] += 1
+    acc["_weight_mse_sum"] += weight_mse
+    acc["_output_mse_sum"] += output_mse
+    acc["_rel_output_mse_sum"] += rel_output_mse
+
+
+def _finalize_results(bucket: dict[str, dict]) -> dict[str, dict]:
+    out = {}
+    for name, per_name in bucket.items():
+        out[name] = {}
+        for fmt, acc in per_name.items():
+            if "error" in acc:
+                out[name][fmt] = acc
+                continue
+            n = max(int(acc.pop("_count", 1)), 1)
+            out[name][fmt] = {
+                "weight_mse": acc.pop("_weight_mse_sum") / n,
+                "output_mse": acc.pop("_output_mse_sum") / n,
+                "rel_output_mse": acc.pop("_rel_output_mse_sum") / n,
+            }
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Activation cache — lazy path index
 # ---------------------------------------------------------------------------
@@ -183,23 +233,23 @@ def measure_unbatched(model: nn.Module, act_cache: "ActivationIndex",
     """One-Linear-at-a-time measurement. Simple, safe, slow on small ops
     running through unified memory but robust when batching isn't an option.
     """
-    results: dict[str, dict[str, dict]] = {}
+    accum: dict[str, dict[str, dict]] = {}
     processed = 0
     tstart = time.time()
     target_list = list(target_names)
     n_total = len(target_list)
 
     for name, mod in model.named_modules():
-        if not isinstance(mod, nn.Linear) or name not in target_names:
+        canonical_name = canonical_linear_name(name)
+        if not isinstance(mod, nn.Linear) or canonical_name not in target_names:
             continue
-        if name not in act_cache:
+        if canonical_name not in act_cache:
             continue
         W = mod.weight.detach()
-        X = act_cache.load(name).to(W.dtype).to(W.device)
+        X = act_cache.load(canonical_name).to(W.dtype).to(W.device)
         y_ref = X @ W.T
         ref_energy = float(y_ref.float().pow(2).mean().item())
 
-        per_format = {}
         for spec in specs:
             try:
                 W_hat = spec.quantize_dequantize(W.clone())
@@ -207,20 +257,22 @@ def measure_unbatched(model: nn.Module, act_cache: "ActivationIndex",
                 weight_mse = float((W - W_hat).pow(2).mean().item())
                 y_q = X_hat @ W_hat.T
                 output_mse = float((y_ref - y_q).float().pow(2).mean().item())
-                per_format[spec.name] = {
-                    "weight_mse": weight_mse,
-                    "output_mse": output_mse,
-                    "rel_output_mse": output_mse / max(ref_energy, 1e-12),
-                }
+                _accumulate_result(
+                    accum,
+                    canonical_name,
+                    spec.name,
+                    weight_mse,
+                    output_mse,
+                    output_mse / max(ref_energy, 1e-12),
+                )
             except Exception as e:
-                per_format[spec.name] = {"error": str(e)}
-        results[name] = per_format
+                accum.setdefault(canonical_name, {})[spec.name] = {"error": str(e)}
         processed += 1
         if processed % 128 == 0:
             elapsed = time.time() - tstart
             eta = elapsed / processed * (n_total - processed)
             print(f"[cost] {processed}/{n_total} eta={eta:.0f}s", flush=True)
-    return results
+    return _finalize_results(accum)
 
 
 # ---------------------------------------------------------------------------
@@ -236,10 +288,11 @@ def _group_by_shape(model: nn.Module, target_names: set[str]
     """
     groups: dict[tuple[int, int], list[tuple[str, nn.Linear]]] = {}
     for name, mod in model.named_modules():
-        if not isinstance(mod, nn.Linear) or name not in target_names:
+        canonical_name = canonical_linear_name(name)
+        if not isinstance(mod, nn.Linear) or canonical_name not in target_names:
             continue
         key = (mod.in_features, mod.out_features)
-        groups.setdefault(key, []).append((name, mod))
+        groups.setdefault(key, []).append((canonical_name, mod))
     return groups
 
 
@@ -359,7 +412,7 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
     print(f"[cost] batched: {len(groups)} shape groups, "
           f"{total_linears} Linears total", flush=True)
 
-    results: dict[str, dict[str, dict]] = {}
+    accum: dict[str, dict[str, dict]] = {}
     processed = 0
     tstart = time.time()
 
@@ -398,17 +451,20 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                     rel_mse = output_mse / ref_energy.clamp_min(1e-12)
                     # Unpack per-item into results dict
                     for i, name in enumerate(names):
-                        results.setdefault(name, {})[spec.name] = {
-                            "weight_mse": float(weight_mse[i].item()),
-                            "output_mse": float(output_mse[i].item()),
-                            "rel_output_mse": float(rel_mse[i].item()),
-                        }
+                        _accumulate_result(
+                            accum,
+                            name,
+                            spec.name,
+                            float(weight_mse[i].item()),
+                            float(output_mse[i].item()),
+                            float(rel_mse[i].item()),
+                        )
                     del W_hat, X_hat, y_q, weight_mse, output_mse, rel_mse
                     if dev.type == "cuda":
                         torch.cuda.empty_cache()
                 except Exception as e:
                     for name in names:
-                        results.setdefault(name, {})[spec.name] = {"error": str(e)}
+                        accum.setdefault(name, {})[spec.name] = {"error": str(e)}
 
             del W, X, y_ref, ref_energy
             if dev.type == "cuda":
@@ -420,7 +476,7 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
                 print(f"[cost] {processed}/{total_linears} "
                       f"eta={eta:.0f}s  ({N} per chunk × {len(specs)} formats)",
                       flush=True)
-    return results
+    return _finalize_results(accum)
 
 
 def load_cost_model(model_path: str,
