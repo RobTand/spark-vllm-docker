@@ -3,7 +3,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from quantization.prismquant.incremental_measure_quant_cost import merge_cost_pickles
+from quantization.prismquant.incremental_measure_quant_cost import (
+    cost_shard_is_reusable,
+    merge_cost_pickles,
+)
 
 
 class TestIncrementalMeasureQuantCost(unittest.TestCase):
@@ -32,6 +35,45 @@ class TestIncrementalMeasureQuantCost(unittest.TestCase):
             self.assertEqual(set(merged["costs"]), {"layer.0", "layer.1"})
             self.assertEqual(merged["formats"], ["NVFP4"])
             self.assertEqual(merged["meta"]["n_shards"], 2)
+
+    def test_cost_shard_reuse_requires_matching_incremental_meta(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            shard = td / "cost_shard.pkl"
+            with open(shard, "wb") as f:
+                pickle.dump({
+                    "costs": {"layer.0": {"NVFP4": {"output_mse": 1.0}}},
+                    "formats": ["NVFP4", "MXFP8"],
+                    "meta": {
+                        "model": "toy-model",
+                        "probe": str(td / "probe_subset_000.pkl"),
+                        "mode": "auto",
+                        "incremental_shard": {
+                            "activation_cache_dir": str(td / "act"),
+                            "linear_include": r"model\\.layers\\.0\\.",
+                            "chunk_size": 256,
+                            "h_detail_dir": None,
+                            "shard_idx": 0,
+                        },
+                    },
+                }, f)
+
+            expected = {
+                "model": "toy-model",
+                "probe": str(td / "probe_subset_000.pkl"),
+                "activation_cache_dir": str(td / "act"),
+                "linear_include": r"model\\.layers\\.0\\.",
+                "mode": "auto",
+                "chunk_size": 256,
+                "h_detail_dir": None,
+                "shard_idx": 0,
+                "formats": ["NVFP4", "MXFP8"],
+            }
+            self.assertTrue(cost_shard_is_reusable(shard, expected))
+
+            stale = dict(expected)
+            stale["formats"] = ["NVFP4"]
+            self.assertFalse(cost_shard_is_reusable(shard, stale))
 
 
 if __name__ == "__main__":
