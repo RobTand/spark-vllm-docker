@@ -619,6 +619,23 @@ def main():
     extra_ignore: list[str] = []
     seen_recipe = {n for n in assignment}
     src_dir = Path(args.model)
+    # Per-expert siblings map to a fused packed parent at recipe level.
+    # If the parent IS quantized, the per-expert source keys are already
+    # covered and must NOT be added to `extra_ignore` — otherwise vLLM's
+    # compressed-tensors loader marks the FusedMoE layer as un-quantized
+    # and the NVFP4 scale params (w2_input_global_scale, ...) never get
+    # registered, crashing at weight-load.
+    _per_expert_re = re.compile(
+        r"^(?P<prefix>.+\.experts)\.\d+\.(?P<proj>gate|up|down)_proj$")
+
+    def _per_expert_parent(base: str) -> str | None:
+        m = _per_expert_re.match(base)
+        if not m:
+            return None
+        proj = m.group("proj")
+        parent = "gate_up_proj" if proj in ("gate", "up") else "down_proj"
+        return f"{m.group('prefix')}.{parent}"
+
     if src_dir.exists():
         from safetensors import safe_open as _safe_open
         import os as _os
@@ -634,6 +651,9 @@ def main():
                                    if base.startswith("model.language_model.")
                                    else base)
                     if recipe_name in seen_recipe:
+                        continue
+                    parent = _per_expert_parent(recipe_name)
+                    if parent is not None and parent in seen_recipe:
                         continue
                     try:
                         shape = list(sf.get_slice(k).get_shape())
