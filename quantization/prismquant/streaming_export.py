@@ -101,9 +101,15 @@ def _init_rotary_inplace(base_model: nn.Module, device: torch.device,
 _FUSED_SIBLINGS = {
     "q_proj": "qkv", "k_proj": "qkv", "v_proj": "qkv",
     "gate_proj": "gate_up", "up_proj": "gate_up",
-    # Linear-attn siblings on Qwen3.5 DeltaNet: in_proj_{qkv,z,a,b}
-    # feed the same activation. Keep them independent (not in a fused
-    # group) — matches the probe's per-Linear treatment.
+    # Qwen3.5/3.6 DeltaNet linear-attention pairs. vLLM fuses
+    # `in_proj_qkv + in_proj_z → in_proj_qkvz` and
+    # `in_proj_b + in_proj_a → in_proj_ba` at load time; the fused
+    # packed Linear needs ONE shared NVFP4 `weight_global_scale`.
+    # Omitting these triggers vLLM's
+    # `compressed_tensors_w4a4_nvfp4.py:97` warning about reduced
+    # accuracy from mismatched parallel-layer scales.
+    "in_proj_qkv": "qkvz", "in_proj_z": "qkvz",
+    "in_proj_b": "ba", "in_proj_a": "ba",
 }
 
 
