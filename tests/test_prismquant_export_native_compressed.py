@@ -6,28 +6,47 @@ that has to stay in sync with vLLM's compressed-tensors loader.
 """
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 import torch
 
+from quantization.prismquant.allocator import promote_fused
 from quantization.prismquant.export_native_compressed import (
     DEFAULT_INPUT_GLOBAL_SCALE,
     FLOAT_TO_E2M1,
     FP8_E4M3_MAX,
     NVFP4_MAX,
     PER_EXPERT_MOE_REGEX,
+    _compute_layer_joint_nvfp4,
     _quantize_2d,
     _quantize_3d_packed,
     _round_to_codebook,
     _to_vllm_internal_name,
+    compute_extra_ignore,
+    validate_mtp_assignment_coverage,
     build_quantization_config,
     canonicalize_format,
     pack_fp4_indices,
     quantize_dequantize_fp8_dynamic,
     quantize_dequantize_fp8_dynamic_packed,
+    quantize_dequantize_mxfp8,
+    quantize_dequantize_mxfp8_packed,
     quantize_dequantize_nvfp4,
     quantize_dequantize_nvfp4_packed,
 )
+from quantization.prismquant.model_profiles.qwen3_5 import Qwen3_5Profile
+
+
+class _IdentityProfile:
+    """Minimal profile stub for tests that only need `live_to_recipe_name`
+    to be identity. Avoids pulling in the full ModelProfile ABC and its
+    abstract methods."""
+
+    def live_to_recipe_name(self, live_qname: str) -> str:
+        return live_qname
 
 
 def _nvfp4_dequantize(weight_packed, weight_scale_fp8, weight_global_scale_divisor):
@@ -115,6 +134,25 @@ class TestRoundTrip(unittest.TestCase):
         self.assertEqual(tuple(w.shape), (E, M, N))
         self.assertEqual(tuple(s.shape), (E, M, 1))
 
+    def test_mxfp8_2d_grouped_scale(self):
+        W = torch.randn(32, 64) * 0.1
+        w, s = quantize_dequantize_mxfp8(W)
+        self.assertEqual(w.dtype, torch.float8_e4m3fn)
+        self.assertEqual(s.dtype, torch.uint8)
+        self.assertEqual(tuple(s.shape), (32, 2))
+        scales = torch.pow(2.0, s.to(torch.float32) - 127.0)
+        dequant = w.float() * scales.repeat_interleave(32, dim=1)
+        mse = (W - dequant).pow(2).mean().item()
+        self.assertLess(mse, 2e-4)
+
+    def test_mxfp8_packed_3d(self):
+        E, M, N = 4, 32, 64
+        P = torch.randn(E, M, N) * 0.1
+        w, s = quantize_dequantize_mxfp8_packed(P)
+        self.assertEqual(tuple(w.shape), (E, M, N))
+        self.assertEqual(tuple(s.shape), (E, M, 2))
+        self.assertEqual(s.dtype, torch.uint8)
+
 
 class TestPackBits(unittest.TestCase):
     def test_round_to_codebook_signed(self):
@@ -184,6 +222,7 @@ class TestVLLMInternalNaming(unittest.TestCase):
 
 class TestBuildQuantizationConfig(unittest.TestCase):
     def test_minimal_two_format_assignment(self):
+        profile = Qwen3_5Profile()
         # Lots of NVFP4, fewer MXFP8 → NVFP4 becomes the catch-all
         # bucket (largest count) and gets the per-expert pattern.
         assignment = {
@@ -193,7 +232,7 @@ class TestBuildQuantizationConfig(unittest.TestCase):
         for i in range(5):  # 5 NVFP4 entries
             assignment[f"model.layers.{i}.mlp.experts.down_proj"] = "NVFP4"
         qc = build_quantization_config(
-            assignment, bf16_passthrough={"lm_head"},
+            assignment, bf16_passthrough={"lm_head"}, profile=profile,
         )
         self.assertEqual(qc["quant_method"], "compressed-tensors")
         self.assertEqual(qc["format"], "mixed-precision")
@@ -218,6 +257,7 @@ class TestBuildQuantizationConfig(unittest.TestCase):
         self.assertEqual(nvfp4["format"], "nvfp4-pack-quantized")
 
     def test_ignore_uses_vllm_internal_naming(self):
+        profile = Qwen3_5Profile()
         assignment = {
             "model.layers.0.mlp.gate_proj": "NVFP4",
             "model.layers.0.mlp.shared_expert_gate": "BF16",
@@ -225,6 +265,7 @@ class TestBuildQuantizationConfig(unittest.TestCase):
         qc = build_quantization_config(
             assignment, bf16_passthrough={"lm_head"},
             extra_ignore=["model.layers.0.mlp.gate"],
+            profile=profile,
         )
         ignore = qc["ignore"]
         self.assertIn("language_model.lm_head", ignore)
@@ -238,7 +279,9 @@ class TestBuildQuantizationConfig(unittest.TestCase):
         # fused-layer match path and was the bug that produced wrong
         # scheme allocation. Make sure we don't reintroduce it.
         assignment = {"model.layers.0.mlp.gate_proj": "NVFP4"}
-        qc = build_quantization_config(assignment, bf16_passthrough=set())
+        qc = build_quantization_config(
+            assignment, bf16_passthrough=set(), profile=Qwen3_5Profile()
+        )
         for group in qc["config_groups"].values():
             for t in group["targets"]:
                 self.assertNotEqual(t, "Linear",
@@ -263,14 +306,12 @@ class TestQuantize2DDispatch(unittest.TestCase):
         self.assertAlmostEqual(
             out["input_global_scale"].item(), DEFAULT_INPUT_GLOBAL_SCALE)
 
-    def test_mxfp8_emits_fp8_dense(self):
-        # Routed through CompressedTensorsW8A8Fp8 — wants a `weight`
-        # tensor in fp8_e4m3fn + per-channel `weight_scale`.
-        W = torch.randn(8, 16) * 0.1
+    def test_mxfp8_emits_grouped_dense(self):
+        W = torch.randn(8, 32) * 0.1
         out = _quantize_2d(W, "MXFP8")
         self.assertIn("weight", out)
         self.assertEqual(out["weight"].dtype, torch.float8_e4m3fn)
-        self.assertEqual(out["weight_scale"].dtype, torch.float32)
+        self.assertEqual(out["weight_scale"].dtype, torch.uint8)
         self.assertEqual(tuple(out["weight_scale"].shape), (8, 1))
 
 
@@ -360,6 +401,263 @@ class TestPackedExpertSplit(unittest.TestCase):
         out = _quantize_3d_packed(P, "NVFP4")
         self.assertEqual(out["weight_packed"].shape[0], E)
         self.assertEqual(out["weight_global_scale"].shape, torch.Size([E]))
+
+
+class TestQwen35ProfileFallback(unittest.TestCase):
+    def _cpu_only_profile(self):
+        profile = Qwen3_5Profile()
+        profile._vllm_cls = None
+        profile._vllm_cls_loaded = True
+        profile._fused_matcher = None
+        return profile
+
+    def test_fused_sibling_group_has_cpu_only_fallback(self):
+        profile = self._cpu_only_profile()
+
+        self.assertEqual(
+            profile.fused_sibling_group(
+                "model.layers.25.linear_attn.in_proj_qkv"
+            ),
+            "model.layers.25.linear_attn.in_proj_qkvz",
+        )
+        self.assertEqual(
+            profile.fused_sibling_group(
+                "model.layers.25.linear_attn.in_proj_z"
+            ),
+            "model.layers.25.linear_attn.in_proj_qkvz",
+        )
+        self.assertEqual(
+            profile.fused_sibling_group(
+                "model.layers.25.linear_attn.in_proj_a"
+            ),
+            "model.layers.25.linear_attn.in_proj_ba",
+        )
+        self.assertEqual(
+            profile.fused_sibling_group(
+                "model.layers.25.self_attn.q_proj"
+            ),
+            "model.layers.25.self_attn.qkv_proj",
+        )
+
+    def test_promote_fused_keeps_linear_attn_qkvz_coherent_without_vllm(self):
+        profile = self._cpu_only_profile()
+        assignment = {
+            "model.layers.25.linear_attn.in_proj_qkv": "MXFP8",
+            "model.layers.25.linear_attn.in_proj_z": "NVFP4",
+            "model.layers.25.linear_attn.in_proj_a": "NVFP4",
+            "model.layers.25.linear_attn.in_proj_b": "NVFP4",
+        }
+
+        promoted = promote_fused(
+            assignment,
+            {"BF16": 0, "NVFP4": 1, "MXFP8": 2},
+            profile=profile,
+        )
+
+        self.assertEqual(promoted["model.layers.25.linear_attn.in_proj_qkv"], "MXFP8")
+        self.assertEqual(promoted["model.layers.25.linear_attn.in_proj_z"], "MXFP8")
+        self.assertEqual(promoted["model.layers.25.linear_attn.in_proj_a"], "NVFP4")
+        self.assertEqual(promoted["model.layers.25.linear_attn.in_proj_b"], "NVFP4")
+
+
+class TestMtpCoverageValidation(unittest.TestCase):
+    class _Profile:
+        def has_mtp(self):
+            return True
+
+    def test_validate_mtp_assignment_coverage_raises_when_recipe_omits_mtp(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            with open(td / "model.safetensors.index.json", "w") as f:
+                json.dump({"weight_map": {"mtp.fc.weight": "model-00001.safetensors"}}, f)
+
+            with self.assertRaisesRegex(RuntimeError, "contains no mtp"):
+                validate_mtp_assignment_coverage(
+                    str(td),
+                    {"model.layers.0.self_attn.q_proj": "NVFP4"},
+                    self._Profile(),
+                )
+
+    def test_validate_mtp_assignment_coverage_accepts_recipe_with_mtp(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            with open(td / "model.safetensors.index.json", "w") as f:
+                json.dump({"weight_map": {"mtp.fc.weight": "model-00001.safetensors"}}, f)
+
+            validate_mtp_assignment_coverage(
+                str(td),
+                {"mtp.fc": "BF16"},
+                self._Profile(),
+            )
+
+
+class TestDeltaNetFusedSiblingJointScale(unittest.TestCase):
+    """Regression for commit e2e0091: Qwen3.6 DeltaNet linear-attention
+    fuses `in_proj_qkv + in_proj_z → in_proj_qkvz` (and `in_proj_b +
+    in_proj_a → in_proj_ba`) at vLLM load time. The fused packed
+    Linear needs a SHARED NVFP4 `weight_global_scale` across those
+    siblings. `_compute_layer_joint_nvfp4` is the per-layer helper
+    that computes it; if it ever drifts back to per-Linear scales,
+    vLLM warns about reduced accuracy from mismatched parallel-layer
+    scales."""
+
+    def _build_hybrid_layer(self) -> torch.nn.Module:
+        """Two DeltaNet siblings inside a `linear_attn` module stub."""
+        class TinyLinearAttn(torch.nn.Module):
+            def __init__(s):
+                super().__init__()
+                s.in_proj_qkv = torch.nn.Linear(64, 48, bias=False)
+                s.in_proj_z = torch.nn.Linear(64, 16, bias=False)
+
+        class TinyLayer(torch.nn.Module):
+            def __init__(s):
+                super().__init__()
+                s.linear_attn = TinyLinearAttn()
+
+        return TinyLayer()
+
+    def test_deltanet_siblings_share_single_joint_scale(self):
+        torch.manual_seed(0)
+        layer = self._build_hybrid_layer()
+        # Give `in_proj_qkv` a larger max-abs so the joint scale is
+        # determined by it, not by `in_proj_z`.
+        with torch.no_grad():
+            layer.linear_attn.in_proj_qkv.weight.mul_(10.0)
+
+        assignment = {
+            "model.layers.0.linear_attn.in_proj_qkv": "NVFP4",
+            "model.layers.0.linear_attn.in_proj_z": "NVFP4",
+        }
+        joint = _compute_layer_joint_nvfp4(
+            layer, "model.layers.0", assignment, _IdentityProfile())
+
+        # Both siblings must map to NVFP4 and share ONE scale tensor.
+        self.assertEqual(
+            set(joint),
+            {
+                "model.layers.0.linear_attn.in_proj_qkv",
+                "model.layers.0.linear_attn.in_proj_z",
+            },
+        )
+        scale_qkv = joint["model.layers.0.linear_attn.in_proj_qkv"]
+        scale_z = joint["model.layers.0.linear_attn.in_proj_z"]
+        # Exact equality — the helper reuses one tensor across the
+        # fused group.
+        self.assertEqual(scale_qkv.item(), scale_z.item())
+
+        # The shared scale must equal the max of the per-sibling
+        # natural scales (commit e2e0091 regression).
+        from quantization.prismquant.export_native_compressed import (
+            compute_nvfp4_global_real,
+        )
+        nat_qkv = compute_nvfp4_global_real(
+            layer.linear_attn.in_proj_qkv.weight.float(), group_size=16)
+        nat_z = compute_nvfp4_global_real(
+            layer.linear_attn.in_proj_z.weight.float(), group_size=16)
+        self.assertAlmostEqual(
+            scale_qkv.item(), max(nat_qkv.item(), nat_z.item()),
+            places=5,
+        )
+
+    def test_mixed_format_siblings_do_not_emit_joint_scale(self):
+        """If only one sibling is NVFP4 (and the other MXFP8/BF16),
+        there's no fused packed Linear to share a scale across — the
+        helper must skip the group."""
+        torch.manual_seed(0)
+        layer = self._build_hybrid_layer()
+        assignment = {
+            "model.layers.0.linear_attn.in_proj_qkv": "NVFP4",
+            "model.layers.0.linear_attn.in_proj_z": "MXFP8",
+        }
+        joint = _compute_layer_joint_nvfp4(
+            layer, "model.layers.0", assignment, _IdentityProfile())
+        self.assertEqual(joint, {},
+                         "mixed-format sibling group must not emit a joint scale")
+
+
+class TestComputeExtraIgnorePerExpertSiblings(unittest.TestCase):
+    """Regression for commit dab2473: per-expert MoE source tensors
+    (e.g. `model.layers.0.mlp.experts.3.gate_proj`) are covered by the
+    packed parent (`...mlp.experts.gate_up_proj`) at compressed-tensors
+    load time. If the helper accidentally adds them to `extra_ignore`,
+    vLLM marks the FusedMoE layer as un-quantized, the NVFP4 scale
+    params never get registered, and load crashes."""
+
+    def test_per_expert_siblings_excluded_when_parent_quantized(self):
+        # Assignment includes the packed parent — both per-expert
+        # source keys must be omitted from extra_ignore.
+        assignment = {
+            "model.layers.0.mlp.experts.gate_up_proj": "NVFP4",
+            "model.layers.0.mlp.experts.down_proj": "NVFP4",
+        }
+        source_iter = [
+            # Per-expert source tensors (2D) — must NOT appear in extra_ignore.
+            ("model.layers.0.mlp.experts.0.gate_proj.weight", [512, 1024]),
+            ("model.layers.0.mlp.experts.0.up_proj.weight", [512, 1024]),
+            ("model.layers.0.mlp.experts.0.down_proj.weight", [1024, 512]),
+            ("model.layers.0.mlp.experts.3.gate_proj.weight", [512, 1024]),
+            ("model.layers.0.mlp.experts.3.up_proj.weight", [512, 1024]),
+            ("model.layers.0.mlp.experts.3.down_proj.weight", [1024, 512]),
+            # An unrelated 2D Linear the recipe doesn't cover — this
+            # SHOULD end up in extra_ignore.
+            ("model.visual.merger.weight", [768, 768]),
+            # A non-2D tensor — always skipped regardless of coverage.
+            ("model.layers.0.mlp.gate.weight", [128]),
+        ]
+        extra = compute_extra_ignore(source_iter, assignment)
+
+        for name in [
+            "model.layers.0.mlp.experts.0.gate_proj",
+            "model.layers.0.mlp.experts.0.up_proj",
+            "model.layers.0.mlp.experts.0.down_proj",
+            "model.layers.0.mlp.experts.3.gate_proj",
+            "model.layers.0.mlp.experts.3.up_proj",
+            "model.layers.0.mlp.experts.3.down_proj",
+        ]:
+            self.assertNotIn(
+                name, extra,
+                f"per-expert sibling {name} must not be in extra_ignore "
+                "when the packed parent is in the assignment "
+                "(regression for commit dab2473)",
+            )
+        self.assertIn("model.visual.merger", extra)
+
+    def test_per_expert_siblings_included_when_parent_missing(self):
+        """Sanity: without the parent in the assignment, per-expert
+        tensors DO end up in extra_ignore (they would be un-quantized
+        on the vLLM side, so compressed-tensors needs to skip them)."""
+        assignment: dict[str, str] = {
+            # intentionally missing the packed parents
+        }
+        source_iter = [
+            ("model.layers.0.mlp.experts.0.gate_proj.weight", [512, 1024]),
+            ("model.layers.0.mlp.experts.0.down_proj.weight", [1024, 512]),
+        ]
+        extra = compute_extra_ignore(source_iter, assignment)
+        self.assertIn("model.layers.0.mlp.experts.0.gate_proj", extra)
+        self.assertIn("model.layers.0.mlp.experts.0.down_proj", extra)
+
+    def test_language_model_prefix_remap(self):
+        """Multimodal checkpoints prefix body tensors with
+        `model.language_model.*` on disk but the recipe uses
+        `model.*` — the helper must remap before the coverage check."""
+        assignment = {
+            # recipe-side name (no language_model. infix)
+            "model.layers.0.self_attn.q_proj": "NVFP4",
+        }
+        source_iter = [
+            # disk-side name with language_model. infix
+            ("model.language_model.layers.0.self_attn.q_proj.weight",
+             [1024, 1024]),
+            # unrelated 2D the recipe doesn't cover
+            ("model.language_model.layers.0.mlp.shared_expert_gate.weight",
+             [32, 1024]),
+        ]
+        extra = compute_extra_ignore(source_iter, assignment)
+        self.assertNotIn(
+            "model.language_model.layers.0.self_attn.q_proj", extra)
+        self.assertIn(
+            "model.language_model.layers.0.mlp.shared_expert_gate", extra)
 
 
 if __name__ == "__main__":

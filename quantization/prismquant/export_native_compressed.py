@@ -1426,6 +1426,65 @@ def _canonicalize_assignment(raw: dict) -> dict[str, str]:
     return out
 
 
+# Per-expert siblings map to a fused packed parent at recipe level.
+# If the parent IS quantized, the per-expert source keys are already
+# covered and must NOT be added to `extra_ignore` — otherwise vLLM's
+# compressed-tensors loader marks the FusedMoE layer as un-quantized
+# and the NVFP4 scale params (w2_input_global_scale, ...) never get
+# registered, crashing at weight-load.
+_PER_EXPERT_RE = re.compile(
+    r"^(?P<prefix>.+\.experts)\.\d+\.(?P<proj>gate|up|down)_proj$")
+
+
+def _per_expert_parent(base: str) -> str | None:
+    """Map a per-expert source tensor base like
+    `model.layers.0.mlp.experts.3.gate_proj` to its packed parent
+    `model.layers.0.mlp.experts.gate_up_proj` / `.down_proj`, or None
+    if `base` is not a per-expert tensor."""
+    m = _PER_EXPERT_RE.match(base)
+    if not m:
+        return None
+    proj = m.group("proj")
+    parent = "gate_up_proj" if proj in ("gate", "up") else "down_proj"
+    return f"{m.group('prefix')}.{parent}"
+
+
+def compute_extra_ignore(source_shape_iter, assignment: dict[str, str]
+                         ) -> list[str]:
+    """Return the list of 2D `.weight` basenames that must be added to
+    the compressed-tensors `ignore` set because the recipe doesn't cover
+    them.
+
+    `source_shape_iter` yields `(ckpt_key, shape)` for every tensor in
+    the source checkpoint (or None for shape when unknown — treated as
+    non-2D and skipped). `assignment` maps recipe names to formats.
+
+    Per-expert source keys (e.g. `...experts.3.gate_proj.weight`) are
+    NOT added to `extra_ignore` when their packed parent is in the
+    assignment — the parent's emitted compressed-tensors scheme already
+    covers them at vLLM load time, and adding the per-expert name to
+    `ignore` would mark the FusedMoE layer as un-quantized.
+    """
+    extra_ignore: list[str] = []
+    seen_recipe = set(assignment)
+    for ckpt_key, shape in source_shape_iter:
+        if not ckpt_key.endswith(".weight"):
+            continue
+        base = ckpt_key[:-7]
+        recipe_name = ("model." + base[len("model.language_model."):]
+                       if base.startswith("model.language_model.")
+                       else base)
+        if recipe_name in seen_recipe:
+            continue
+        parent = _per_expert_parent(recipe_name)
+        if parent is not None and parent in seen_recipe:
+            continue
+        if shape is None or len(shape) != 2:
+            continue
+        extra_ignore.append(base)
+    return extra_ignore
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", required=True,
@@ -1563,27 +1622,11 @@ def main():
     # instantiates during model-construction time. Without an explicit
     # ignore entry, compressed-tensors' `find_matched_target` raises
     # `ValueError: Unable to find matching target for visual.merger.*`.
-    extra_ignore: list[str] = []
-    seen_recipe = {n for n in assignment}
     src_dir = Path(args.model)
-    # Per-expert siblings map to a fused packed parent at recipe level.
-    # If the parent IS quantized, the per-expert source keys are already
-    # covered and must NOT be added to `extra_ignore` — otherwise vLLM's
-    # compressed-tensors loader marks the FusedMoE layer as un-quantized
-    # and the NVFP4 scale params (w2_input_global_scale, ...) never get
-    # registered, crashing at weight-load.
-    _per_expert_re = re.compile(
-        r"^(?P<prefix>.+\.experts)\.\d+\.(?P<proj>gate|up|down)_proj$")
 
-    def _per_expert_parent(base: str) -> str | None:
-        m = _per_expert_re.match(base)
-        if not m:
-            return None
-        proj = m.group("proj")
-        parent = "gate_up_proj" if proj in ("gate", "up") else "down_proj"
-        return f"{m.group('prefix')}.{parent}"
-
-    if src_dir.exists():
+    def _source_shape_iter():
+        if not src_dir.exists():
+            return
         from safetensors import safe_open
         import os as _os
         for f in sorted(_os.listdir(src_dir)):
@@ -1591,24 +1634,13 @@ def main():
                 continue
             with safe_open(str(src_dir / f), framework="pt") as sf:
                 for k in sf.keys():
-                    if not k.endswith(".weight"):
-                        continue
-                    base = k[:-7]
-                    recipe_name = ("model." + base[len("model.language_model."):]
-                                   if base.startswith("model.language_model.")
-                                   else base)
-                    if recipe_name in seen_recipe:
-                        continue
-                    parent = _per_expert_parent(recipe_name)
-                    if parent is not None and parent in seen_recipe:
-                        continue
                     try:
                         shape = list(sf.get_slice(k).get_shape())
                     except Exception:
-                        shape = []
-                    if len(shape) != 2:
-                        continue
-                    extra_ignore.append(base)
+                        shape = None
+                    yield k, shape
+
+    extra_ignore = compute_extra_ignore(_source_shape_iter(), assignment)
     print(f"[export-stream] extra ignore (unmapped Linears): "
           f"{len(extra_ignore)}", flush=True)
 
