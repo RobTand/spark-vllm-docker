@@ -146,21 +146,24 @@ def stage_text_only(model_path: str) -> str:
 
 
 class _GradNormCapture(torch.autograd.Function):
-    """Identity in forward; in backward, accumulates per-expert
-    per-output-channel squared-gradient into `channel_accumulator` and
-    the scalar Frobenius-norm sum into `scalar_accumulator`, then
-    returns None for the weight gradient — which tells autograd to NOT
-    accumulate to the leaf parameter's .grad.
+    """Identity in forward; in backward, accumulates packed-expert Fisher
+    statistics at up to three granularities and returns None for the
+    weight gradient — which tells autograd to NOT accumulate to the leaf
+    parameter's .grad.
 
-    Used to capture the per-token empirical Fisher diagonal trace and
-    per-channel diagonal of a packed expert tensor (e.g. Qwen3.6's
-    `gate_up_proj` of shape `[E, 2*I, H]`) without ever storing a
-    full-size .grad on the leaf.
-
-    Storage: scalar is a float. Channel-diag is a [E, M] tensor — 256
-    experts × 1024 out rows × 4 B ≈ 1 MB per packed param, well below
-    the 2 GB full-resolution per-weight alternative that would be
-    infeasible at 35B scale.
+    Three accumulators, all optional:
+      - `scalar_accumulator`: scalar Frobenius-norm of per-weight grad^2
+        (the classic `h_trace`). Always cheap. ~1 float per packed param.
+      - `channel_accumulator`: per-expert per-output-channel diagonal
+        [E, M] — the `sum over in-features of grad^2`. ~1 MB per packed
+        param at 256 experts × 1024 out rows.
+      - `full_accumulator`: full per-weight Fisher [E, M, N] accumulated
+        in fp32 on CPU. ~5 GB per packed param at 256 experts ×
+        1024 × 1536. Chunked by expert so GPU peak stays ~20 MB per
+        expert rather than materializing the whole squared tensor at
+        once. Enables full per-weight predicted-dloss at inference-
+        model-export time: the extra cost is one-time and well worth
+        the fidelity for models that will be served many times.
 
     Why return None? With 40 MoE layers × 2 packed params × ~5 GB of
     bf16 grads = 400 GB if .grad were retained per leaf. By returning
@@ -171,16 +174,18 @@ class _GradNormCapture(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, weight, name, scalar_accumulator, channel_accumulator):
+    def forward(ctx, weight, name, scalar_accumulator, channel_accumulator,
+                full_accumulator):
         ctx.name = name
         ctx.scalar_acc = scalar_accumulator
         ctx.channel_acc = channel_accumulator
+        ctx.full_acc = full_accumulator
         return weight
 
     @staticmethod
     def backward(ctx, grad_output):
         if grad_output is None:
-            return None, None, None, None
+            return None, None, None, None, None
         g = grad_output.detach()
         # Scalar Frobenius-norm squared — streamed to avoid materializing
         # the full squared tensor for very large packed params.
@@ -193,19 +198,45 @@ class _GradNormCapture(torch.autograd.Function):
         # Per-expert per-output-channel diagonal: reduce along the
         # in-feature axis (the last dim). For a [E, M, N] packed param,
         # result is [E, M]. Accumulated across backward samples.
-        if g.dim() == 3:
-            per_ch = g.float().pow(2).sum(dim=-1)      # [E, M]
-        elif g.dim() == 2:
-            per_ch = g.float().pow(2).sum(dim=-1, keepdim=False)  # [out]
-        else:
-            per_ch = None
-        if per_ch is not None:
-            cur = ctx.channel_acc.get(ctx.name)
-            if cur is None:
-                ctx.channel_acc[ctx.name] = per_ch.cpu()
+        if ctx.channel_acc is not None:
+            if g.dim() == 3:
+                per_ch = g.float().pow(2).sum(dim=-1)      # [E, M]
+            elif g.dim() == 2:
+                per_ch = g.float().pow(2).sum(dim=-1, keepdim=False)
             else:
-                cur.add_(per_ch.cpu())
-        return None, None, None, None
+                per_ch = None
+            if per_ch is not None:
+                cur = ctx.channel_acc.get(ctx.name)
+                if cur is None:
+                    ctx.channel_acc[ctx.name] = per_ch.cpu()
+                else:
+                    cur.add_(per_ch.cpu())
+        # Full per-weight Fisher: chunk along the expert dim so CPU peak
+        # stays bounded even on 128-256 expert packed params. Upcast +
+        # square happen on CPU per-chunk (bf16 transfer is cheaper than
+        # fp32 transfer, and the transient fp32 lives for exactly one
+        # chunk before being added into the persistent accumulator).
+        # Chunk size 16 gives ~1-2 GB CPU transient at 3000-column width
+        # — scales cleanly to 256+ experts at 397B+ without retuning.
+        if ctx.full_acc is not None and g.dim() >= 2:
+            name = ctx.name
+            cur = ctx.full_acc.get(name)
+            if cur is None:
+                cur = torch.zeros(*g.shape, dtype=torch.float32,
+                                  device="cpu")
+                ctx.full_acc[name] = cur
+            if g.dim() == 3:
+                E = g.size(0)
+                chunk_e = max(1, min(16, E))
+                for e in range(0, E, chunk_e):
+                    g_c = g[e:e + chunk_e].cpu()
+                    cur[e:e + chunk_e].add_(g_c.float().pow(2))
+                    del g_c
+            else:
+                g_c = g.cpu()
+                cur.add_(g_c.float().pow(2))
+                del g_c
+        return None, None, None, None, None
 
 
 _PACKED_EXPERT_PARAM_NAMES = {
@@ -253,12 +284,14 @@ def _packed_experts_param_names(module: nn.Module) -> list[str]:
 
 _PRISMQUANT_PATCH_SENTINEL = "_prismquant_packed_expert_patch"
 _PRISMQUANT_CHANNEL_SENTINEL = "_prismquant_packed_expert_channel_patch"
+_PRISMQUANT_FULL_SENTINEL = "_prismquant_packed_expert_full_patch"
 
 
 def install_packed_expert_hooks(
     model: nn.Module,
     accumulator: dict,
     channel_accumulator: dict | None = None,
+    full_accumulator: dict | None = None,
 ) -> dict[str, dict]:
     """Patch every packed-experts module's forward so its 3D parameters
     route through `_GradNormCapture` before each use.
@@ -306,6 +339,7 @@ def install_packed_expert_hooks(
             # Update the live accumulator binding for this module's patch.
             setattr(module, _PRISMQUANT_PATCH_SENTINEL, accumulator)
             setattr(module, _PRISMQUANT_CHANNEL_SENTINEL, channel_accumulator)
+            setattr(module, _PRISMQUANT_FULL_SENTINEL, full_accumulator)
             # Still report metadata so callers can refresh their stats dict.
             for pn in param_names:
                 p_existing = module._parameters.get(pn)
@@ -313,11 +347,17 @@ def install_packed_expert_hooks(
                     continue
                 shape = tuple(p_existing.shape)
                 full_name = f"{qname}.{pn}" if qname else pn
+                if p_existing.is_meta:
+                    w_max_abs = None
+                    w_norm_sq = None
+                else:
+                    w_max_abs = float(p_existing.detach().abs().max().item())
+                    w_norm_sq = float(p_existing.detach().pow(2).sum().item())
                 meta[full_name] = {
                     "h_trace_raw": 0.0,
                     "h_w2_sum_raw": 0.0,
-                    "w_max_abs": float(p_existing.detach().abs().max().item()),
-                    "w_norm_sq": float(p_existing.detach().pow(2).sum().item()),
+                    "w_max_abs": w_max_abs,
+                    "w_norm_sq": w_norm_sq,
                     "n_params": int(p_existing.numel()),
                     "in_features": int(shape[2]),
                     "out_features": int(shape[1]),
@@ -348,11 +388,22 @@ def install_packed_expert_hooks(
             out_features = int(shape[1])
             in_features = int(shape[2])
             n_params = int(p.numel())
+            # When the model is loaded with accelerate's disk offload
+            # (`device_map="auto"` on hardware too small to fit the full
+            # model), packed params start out on the meta device and are
+            # materialized lazily at forward time. Defer the max-abs /
+            # norm-sq scalar statistics until they can be measured.
+            if p.is_meta:
+                w_max_abs = None
+                w_norm_sq = None
+            else:
+                w_max_abs = float(p.detach().abs().max().item())
+                w_norm_sq = float(p.detach().pow(2).sum().item())
             meta[full_name] = {
                 "h_trace_raw": 0.0,
                 "h_w2_sum_raw": 0.0,  # not measured for packed; kept for schema
-                "w_max_abs": float(p.detach().abs().max().item()),
-                "w_norm_sq": float(p.detach().pow(2).sum().item()),
+                "w_max_abs": w_max_abs,
+                "w_norm_sq": w_norm_sq,
                 "n_params": n_params,
                 "in_features": in_features,
                 "out_features": out_features,
@@ -383,25 +434,22 @@ def install_packed_expert_hooks(
         # indirectly each invocation via getattr.
         setattr(mod_ref, _PRISMQUANT_PATCH_SENTINEL, accumulator)
         setattr(mod_ref, _PRISMQUANT_CHANNEL_SENTINEL, channel_accumulator)
+        setattr(mod_ref, _PRISMQUANT_FULL_SENTINEL, full_accumulator)
 
         def patched_forward(*args, _ns=ns, _full=full_names, _orig=original_forward,
                             _mod=mod_ref, **kwargs):
             acc = getattr(_mod, _PRISMQUANT_PATCH_SENTINEL, None)
             ch_acc = getattr(_mod, _PRISMQUANT_CHANNEL_SENTINEL, None)
+            fu_acc = getattr(_mod, _PRISMQUANT_FULL_SENTINEL, None)
             if acc is None:
                 # Should not happen, but degrade gracefully.
                 return _orig(*args, **kwargs)
-            if ch_acc is None:
-                # Provide a scratch dict we can throw away if the caller
-                # didn't opt in to per-channel accumulation, so the
-                # autograd Function signature stays uniform.
-                ch_acc = {}
             saved_params = {}
             wrapped = {}
             for pn, fn in zip(_ns, _full):
                 saved_params[pn] = _mod._parameters.pop(pn)
                 wrapped[pn] = _GradNormCapture.apply(
-                    saved_params[pn], fn, acc, ch_acc)
+                    saved_params[pn], fn, acc, ch_acc, fu_acc)
                 _mod.__dict__[pn] = wrapped[pn]
             try:
                 return _orig(*args, **kwargs)
@@ -688,11 +736,21 @@ class FisherAccumulator:
                 continue
             w = mod.weight
             router_qname, eid = expert_info.get(name, (None, None))
+            # Weights loaded under accelerate disk offload start on the
+            # meta device and materialize lazily during forward. Defer
+            # the scalar weight statistics and the H-full accumulator
+            # allocation until `_make_fwd`/`_make_bwd` sees a real tensor.
+            if w.is_meta:
+                w_max_abs = None
+                w_norm_sq = None
+            else:
+                w_max_abs = float(w.detach().abs().max().item())
+                w_norm_sq = float(w.detach().pow(2).sum().item())
             self.stats[name] = {
                 "h_trace_raw": 0.0,
                 "h_w2_sum_raw": 0.0,
-                "w_max_abs": float(w.detach().abs().max().item()),
-                "w_norm_sq": float(w.detach().pow(2).sum().item()),
+                "w_max_abs": w_max_abs,
+                "w_norm_sq": w_norm_sq,
                 "n_params": int(w.numel()),
                 "in_features": mod.in_features,
                 "out_features": mod.out_features,
@@ -701,11 +759,16 @@ class FisherAccumulator:
                 "router_path": router_qname,
                 "expert_id": eid,
             }
-            # GPU fp32 accumulator: transferred to CPU fp64 at finalize.
-            self._h_full[name] = torch.zeros(
-                mod.out_features, mod.in_features,
-                dtype=torch.float32, device=w.device,
-            )
+            if w.is_meta:
+                # Leave the accumulator slot empty; `_make_bwd` will
+                # allocate it the first time a real-device gradient
+                # flows through this Linear.
+                self._h_full[name] = None
+            else:
+                self._h_full[name] = torch.zeros(
+                    mod.out_features, mod.in_features,
+                    dtype=torch.float32, device=w.device,
+                )
             self._fwd_handles.append(
                 mod.register_forward_hook(self._make_fwd(name)))
             self._bwd_handles.append(
@@ -764,6 +827,15 @@ class FisherAccumulator:
         def hook(module, inp, out):
             x = inp[0] if isinstance(inp, tuple) else inp
             self._saved_inputs[name] = x.detach()
+            # Fill in deferred weight stats for disk-offloaded Linears
+            # the first time a real tensor becomes available.
+            stats = self.stats.get(name)
+            if stats is not None and stats.get("w_max_abs") is None:
+                w = module.weight
+                if w is not None and not w.is_meta:
+                    wd = w.detach()
+                    stats["w_max_abs"] = float(wd.abs().max().item())
+                    stats["w_norm_sq"] = float(wd.pow(2).sum().item())
             if self.cache_dir is not None:
                 need = self.input_rows - self._rows_got[name]
                 if need > 0:
@@ -789,12 +861,28 @@ class FisherAccumulator:
             # `predicted_dloss = 0.5 · <H_full, MSE_W_full>` cost model
             # that replaces the scalar `h_trace · mse_scalar` proxy.
             acc = self._h_full.get(name)
-            if acc is not None:
-                acc.add_(grad_w_sq.float())
+            if acc is None:
+                # Deferred allocation for disk-offloaded Linears: size
+                # from the current gradient, on CPU so offloaded layers
+                # don't pin GPU memory per-Linear.
+                acc = torch.zeros(
+                    grad_w.shape[0], grad_w.shape[1],
+                    dtype=torch.float32, device="cpu",
+                )
+                self._h_full[name] = acc
+            acc.add_(grad_w_sq.float().to(acc.device))
             self.stats[name]["h_trace_raw"] += float(grad_w_sq.sum().item())
-            w = mod_ref.weight.detach()
-            self.stats[name]["h_w2_sum_raw"] += float(
-                (grad_w_sq * w.pow(2)).sum().item())
+            # h_w2_sum is a weight-aware scalar proxy used only as a
+            # fallback when full per-weight Fisher isn't available.
+            # Accelerate offloads the weight back to meta after forward,
+            # so during backward it may not be materialized. Skip the
+            # proxy when meta; the full H in self._h_full already
+            # captures the same information at higher fidelity.
+            w = mod_ref.weight
+            if w is not None and not w.is_meta:
+                wd = w.detach()
+                self.stats[name]["h_w2_sum_raw"] += float(
+                    (grad_w_sq * wd.pow(2)).sum().item())
             self.stats[name]["n_tokens_seen"] += x2.size(0)
         return hook
 
@@ -1057,17 +1145,29 @@ def load_probe_model_and_tokenizer(model_path: str,
                                    requested_device: str,
                                    dtype: torch.dtype,
                                    device_map: str | None = None,
-                                   gradient_checkpointing: bool = True):
+                                   gradient_checkpointing: bool = True,
+                                   offload_folder: str | None = None):
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     staged = stage_text_only(model_path)
     tokenizer = AutoTokenizer.from_pretrained(staged, trust_remote_code=True)
     load_device_map = device_map if device_map is not None else requested_device
 
-    model = AutoModelForCausalLM.from_pretrained(
-        staged, torch_dtype=dtype, device_map=load_device_map,
-        low_cpu_mem_usage=False, trust_remote_code=True,
-    )
+    from_pretrained_kwargs = {
+        "torch_dtype": dtype,
+        "device_map": load_device_map,
+        "low_cpu_mem_usage": False,
+        "trust_remote_code": True,
+    }
+    if offload_folder is not None:
+        import os as _os
+        _os.makedirs(offload_folder, exist_ok=True)
+        from_pretrained_kwargs["offload_folder"] = offload_folder
+        from_pretrained_kwargs["offload_buffers"] = True
+        # low_cpu_mem_usage is forced True internally when device_map is set;
+        # disable the explicit override to let HF pick whatever's correct.
+        from_pretrained_kwargs.pop("low_cpu_mem_usage", None)
+    model = AutoModelForCausalLM.from_pretrained(staged, **from_pretrained_kwargs)
     model.eval()
 
     # Packed MoE experts (e.g. Qwen3.5/3.6's 3D `gate_up_proj` /
@@ -1242,6 +1342,11 @@ def main():
                     help="HF from_pretrained device_map. Defaults to --device. "
                          "Use 'auto' to allow CPU/GPU model sharding while still "
                          "running the probe on the embedding device.")
+    ap.add_argument("--offload-folder", default=None,
+                    help="Directory accelerate may use to spill weights to "
+                         "disk under `device_map=auto` when the model is "
+                         "larger than RAM. Required for models that exceed "
+                         "total available memory (e.g. Qwen3.5-122B on Spark).")
     ap.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
     ap.add_argument("--output", required=True,
                     help="Pickle with per-Linear stats")
@@ -1277,6 +1382,7 @@ def main():
         dtype=dtype,
         device_map=args.device_map,
         gradient_checkpointing=args.gradient_checkpointing,
+        offload_folder=args.offload_folder,
     )
     print(f"[probe] loaded in {time.time()-t0:.1f}s", flush=True)
 

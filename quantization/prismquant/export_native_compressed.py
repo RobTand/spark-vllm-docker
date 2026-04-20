@@ -926,6 +926,70 @@ def build_quantization_config(
                     ignore.append(vllm_name)
                     bf16_name_set.add(vllm_name)
 
+    # Fused-linear target emission. vLLM's model-loading time fuses
+    # siblings from `packed_modules_mapping` into a single packed Linear
+    # (e.g. Qwen3.5 DeltaNet's `in_proj_qkv + in_proj_z → in_proj_qkvz`,
+    # standard `q_proj + k_proj + v_proj → qkv_proj`). Scheme dispatch
+    # keys off the FUSED module's prefix, so our config must list that
+    # fused name alongside the siblings. When all expected siblings
+    # share one format, emit the fused name into that format's target
+    # list; when all land in ignore, emit the fused name into ignore.
+    # Mixed-format fused groups are blocked upstream by the allocator's
+    # `fused_sibling_group` pre-pass — but we defensively skip emitting
+    # a fused target in that case rather than guess.
+    if packed_mapping:
+        # Map leaf sibling → fused-name, using packed_mapping that vLLM
+        # reads at load time.
+        leaf_to_fused = {s: fused for fused, sibs in packed_mapping.items()
+                         for s in sibs}
+
+        # Build parent-path → {leaf: (fmt|IGNORE, vllm_name)} for every
+        # live entry (assignment + extra_ignore + bf16_passthrough).
+        def _parent_leaf(vname: str):
+            parts = vname.rsplit(".", 1)
+            if len(parts) != 2:
+                return None, vname
+            return parts[0], parts[1]
+
+        # (parent, leaf) → (fmt or "IGNORE")
+        leaf_state: dict[tuple[str, str], str] = {}
+        for fmt, names in by_fmt.items():
+            for vname in names:
+                parent, leaf = _parent_leaf(vname)
+                if parent is None:
+                    continue
+                leaf_state[(parent, leaf)] = fmt
+        ignore_set = set(ignore)
+        for vname in ignore_set:
+            parent, leaf = _parent_leaf(vname)
+            if parent is None:
+                continue
+            leaf_state.setdefault((parent, leaf), "IGNORE")
+
+        # For each (parent, fused) pair where all siblings are present
+        # and share a state, emit the fused-name target.
+        fused_emitted: set[str] = set()
+        parents = {p for (p, _) in leaf_state}
+        for parent in parents:
+            for fused_name, sibs in packed_mapping.items():
+                # Skip degenerate fused definitions (single-sibling).
+                if len(sibs) < 2:
+                    continue
+                states = [leaf_state.get((parent, s)) for s in sibs]
+                if any(s is None for s in states):
+                    continue  # not all siblings present → skip
+                if len(set(states)) != 1:
+                    continue  # mixed formats → caller's bug; don't emit
+                state = states[0]
+                fused_vllm_name = f"{parent}.{fused_name}"
+                if fused_vllm_name in fused_emitted:
+                    continue
+                fused_emitted.add(fused_vllm_name)
+                if state == "IGNORE":
+                    ignore.append(fused_vllm_name)
+                else:
+                    by_fmt.setdefault(state, []).append(fused_vllm_name)
+
     if not by_fmt:
         return {}
 

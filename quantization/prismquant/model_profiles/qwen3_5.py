@@ -207,6 +207,14 @@ class Qwen3_5Profile(ModelProfile):
             "vision_start_token_id", "vision_end_token_id",
         )
 
+    def stage_text_only_promote_inner_model_type(self) -> bool:
+        # Qwen3.5-122B-A10B ships `Qwen3_5MoeForConditionalGeneration`
+        # with an empty top-level `hidden_size` — all body dims live in
+        # `text_config`. Qwen3.6-35B-A3B duplicates keys at both levels
+        # so promotion is idempotent there. Flip True unconditionally
+        # so either variant loads as the text-only inner class.
+        return True
+
     # ------------------------------------------------------------
     # Shard prefixes
     # ------------------------------------------------------------

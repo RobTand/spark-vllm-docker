@@ -137,7 +137,15 @@ def promote_fused(assignment: dict[str, str],
     belong to the same fused group. The profile default-derives its
     groups from vLLM's `packed_modules_mapping`, so arch-specific
     knowledge about fused tensors lives in one place (vLLM's model
-    class) rather than in PrismQuant's allocator."""
+    class) rather than in PrismQuant's allocator.
+
+    Raises `AssertionError` if the post-promotion assignment still has
+    a fused group with inconsistent formats — that's a bug (either in
+    promotion logic or profile sibling-detection) that silently
+    produces unservable quantized artifacts (vLLM can't dispatch a
+    single scheme to a fused Linear whose siblings disagree). We trade
+    a loud crash at allocation time for a quiet failure at serving
+    time."""
     if profile is None:
         from .model_profiles import DefaultProfile
         profile = DefaultProfile()
@@ -153,6 +161,21 @@ def promote_fused(assignment: dict[str, str],
         for m in members_present:
             if format_rank[out[m]] < best:
                 out[m] = best_fmt
+
+    # Post-condition verification: no fused group may have mixed fmts
+    # after promotion. Any violation is an upstream bug (e.g. profile
+    # fused_sibling_group returning inconsistent keys for siblings).
+    for group_key, members in groups.items():
+        if len(members) < 2:
+            continue
+        fmts = {out[m] for m in members}
+        if len(fmts) > 1:
+            detail = ", ".join(f"{m}={out[m]}" for m in members)
+            raise AssertionError(
+                f"promote_fused post-check failed for group {group_key!r}: "
+                f"siblings have mixed formats after promotion — {detail}. "
+                f"This produces an unservable artifact (vLLM dispatches "
+                f"one scheme per fused Linear).")
     return out
 
 
