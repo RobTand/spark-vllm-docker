@@ -2,6 +2,14 @@
 """export_native_compressed.py — materialize a PrismQuant recipe as a
 standard `compressed-tensors` checkpoint that vLLM serves natively.
 
+This is the unified export path. Decoder layers are streamed from
+safetensors one at a time: the model skeleton is built on meta via
+`init_empty_weights`, head + embed + norm + lm_head + rotary stay
+resident, and each decoder layer flows disk → quantize → emit → unload.
+Small models pay the no-op cost of a LayerCache large enough to keep
+everything resident; big models (Qwen3.5-122B at 244 GB BF16) fit
+through the same path on a 121 GB host.
+
 Reads the per-tensor format assignment produced by `allocator.py`
 (layer_config.json) and emits a directory containing:
 
@@ -50,15 +58,15 @@ import math
 import re
 import shutil
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from copy import deepcopy
 from pathlib import Path
 from typing import Iterable
 
 import torch
 import torch.nn as nn
+from accelerate import init_empty_weights
 from safetensors.torch import save_file
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from .model_profiles.qwen3_5 import Qwen3_5Profile
 
@@ -548,30 +556,418 @@ def _quantize_3d_packed(packed: torch.Tensor, fmt: str) -> dict[str, torch.Tenso
     raise ValueError(f"unsupported format for packed-MoE: {fmt}")
 
 
-def materialize_tensors(
+# ---------------------------------------------------------------------------
+# Fused-sibling joint NVFP4 scale (per-layer scope, used by the streaming
+# materializer below). The whole-model variant `_compute_nvfp4_joint_global`
+# lives above and is kept for the MTP path + unit tests.
+# ---------------------------------------------------------------------------
+_FUSED_SIBLINGS = {
+    "q_proj": "qkv", "k_proj": "qkv", "v_proj": "qkv",
+    "gate_proj": "gate_up", "up_proj": "gate_up",
+    # Qwen3.5/3.6 DeltaNet linear-attention pairs. vLLM fuses
+    # `in_proj_qkv + in_proj_z → in_proj_qkvz` and
+    # `in_proj_b + in_proj_a → in_proj_ba` at load time; the fused
+    # packed Linear needs ONE shared NVFP4 `weight_global_scale`.
+    # Omitting these triggers vLLM's
+    # `compressed_tensors_w4a4_nvfp4.py:97` warning about reduced
+    # accuracy from mismatched parallel-layer scales.
+    "in_proj_qkv": "qkvz", "in_proj_z": "qkvz",
+    "in_proj_b": "ba", "in_proj_a": "ba",
+}
+
+
+def _compute_layer_joint_nvfp4(layer_mod: nn.Module,
+                               layer_qname: str,
+                               assignment: dict[str, str],
+                               profile,
+                               ) -> dict[str, torch.Tensor]:
+    """Return {recipe_key -> joint global scale} for NVFP4 fused-sibling
+    groups inside this decoder layer. Only keys assigned NVFP4 get an
+    override entry; the rest compute per-Linear scales at quantize time.
+
+    Semantically equivalent to a scoped `_compute_nvfp4_joint_global`
+    across just this layer's modules."""
+    groups: dict[tuple[str, str], list[tuple[str, nn.Linear]]] = defaultdict(list)
+    for sub_name, mod in layer_mod.named_modules():
+        if not isinstance(mod, nn.Linear):
+            continue
+        last = sub_name.rsplit(".", 1)[-1]
+        fam = _FUSED_SIBLINGS.get(last)
+        if fam is None:
+            continue
+        parent = sub_name.rsplit(".", 1)[0] if "." in sub_name else ""
+        groups[(parent, fam)].append((sub_name, mod))
+
+    out: dict[str, torch.Tensor] = {}
+    for (_, _), members in groups.items():
+        fqn_fmt = []
+        for sub_name, mod in members:
+            full = f"{layer_qname}.{sub_name}" if sub_name else layer_qname
+            recipe_key = profile.live_to_recipe_name(full)
+            fmt = assignment.get(recipe_key)
+            fqn_fmt.append((full, recipe_key, fmt, mod))
+        fmts = {f for _, _, f, _ in fqn_fmt}
+        if fmts != {"NVFP4"}:
+            continue
+        candidates = []
+        for _, _, _, mod in fqn_fmt:
+            w = mod.weight.detach().float()
+            candidates.append(compute_nvfp4_global_real(w, group_size=16))
+        joint = torch.stack(candidates).max()
+        for full, recipe_key, _, _ in fqn_fmt:
+            out[recipe_key] = joint
+    return out
+
+
+def _init_rotary_inplace(base_model: nn.Module, device: torch.device,
+                         dtype: torch.dtype) -> None:
+    """After init_empty_weights, rotary modules exist but their
+    `inv_freq` buffers are on meta. Re-run the module's own rope init
+    (which is deterministic from config) so `inv_freq` lives on the
+    exec device with correct values — matching what `from_pretrained`
+    would have produced."""
+    from .layer_streaming import _get_rotary
+    rotary = _get_rotary(base_model)
+    if rotary is None:
+        return
+    cfg = getattr(rotary, "config", None)
+    if cfg is None:
+        return
+    try:
+        rope_init_fn = rotary.compute_default_rope_parameters
+    except AttributeError:
+        return
+    inv_freq, attention_scaling = rope_init_fn(cfg, device)
+    rotary.register_buffer("inv_freq", inv_freq.to(dtype=torch.float32,
+                                                   device=device),
+                           persistent=False)
+    if hasattr(rotary, "original_inv_freq"):
+        rotary.register_buffer(
+            "original_inv_freq",
+            inv_freq.to(dtype=torch.float32, device=device).clone(),
+            persistent=False)
+    rotary.attention_scaling = attention_scaling
+
+
+def materialize_tensors_streaming(
+    model_path: str,
+    assignment: dict[str, str],
+    *,
+    profile,
+    bf16_passthrough: set[str],
+    dtype: torch.dtype = torch.bfloat16,
+    device: torch.device = torch.device("cuda"),
+    offload_folder: str | None = None,
+) -> tuple[dict[str, torch.Tensor], dict]:
+    """Stream decoder layers through quantize → emit → unload. Never
+    holds the full model in memory. Small models still exercise this
+    path — the LayerCache just keeps everything resident, so load/
+    unload degenerates to a no-op.
+
+    Output: `(out_tensors, hist)` matching the shape the monolithic
+    materialize used to return, ready for `write_sharded_safetensors`."""
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    from .layer_streaming import (
+        _build_install_resolver,
+        _build_weight_map,
+        _fast_install,
+        _get_layer_list,
+        _head_prefixes,
+        _materialize,
+        _read_layer_to_device,
+        _resolve_base_prefix,
+        _unload,
+    )
+    from .sensitivity_probe import stage_text_only
+
+    # ----- 1. Meta skeleton + manual head materialization -----
+    # Pure `init_empty_weights` path — avoids accelerate's
+    # `from_pretrained` which would write ~244 GB of offload files to
+    # disk on Qwen3.5-122B before we ever read them. Instead we:
+    #   (a) build the full skeleton on meta (0 bytes),
+    #   (b) read head/embed/norm/lm_head tensors directly from the
+    #       source safetensors and install on the exec device,
+    #   (c) re-run rotary's init_fn to populate `inv_freq` (not in
+    #       state_dict — computed from config),
+    #   (d) leave decoder layers on meta until the per-layer loop
+    #       streams them in.
+    staged = stage_text_only(model_path)
+    config = AutoConfig.from_pretrained(staged, trust_remote_code=True)
+    with init_empty_weights():
+        model = AutoModelForCausalLM.from_config(
+            config, trust_remote_code=True)
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
+    base_model, layers = _get_layer_list(model)
+    base_prefix = _resolve_base_prefix(model, base_model)
+    num_layers = len(layers)
+    layers_prefix = f"{base_prefix}.layers." if base_prefix else "layers."
+
+    weight_shard, weight_ckpt = _build_weight_map(model_path)
+
+    # Materialize head (embed + norm + lm_head). These are in the
+    # safetensors and get populated via `set_module_tensor_to_device`.
+    print(f"[export-stream] base_prefix={base_prefix!r}  layers={num_layers}",
+          flush=True)
+    t0 = time.time()
+    head_pfxs = _head_prefixes(None, base_prefix)
+    loaded_n = _materialize(model, head_pfxs, weight_shard, weight_ckpt,
+                            device, dtype)
+
+    # Rotary's `inv_freq` isn't in the state_dict — compute from config.
+    _init_rotary_inplace(base_model, device, dtype)
+    print(f"[export-stream] head materialized ({loaded_n} tensors, rotary "
+          f"re-init) in {time.time()-t0:.1f}s", flush=True)
+
+    out: dict[str, torch.Tensor] = {}
+    hist: Counter = Counter()
+    unmapped_keys: list[str] = []
+
+    # ----- 2. Head / embed / norm / lm_head / rotary passthrough -----
+    # These are resident on `device` already. Emit as BF16 passthrough
+    # UNLESS `lm_head` (or similar) is explicitly in the assignment.
+    t_head = time.time()
+
+    def _emit_head_param(full_qname: str, param: nn.Parameter):
+        recipe_key = profile.live_to_recipe_name(full_qname)
+        fmt = assignment.get(recipe_key)
+        if fmt is not None and fmt != "BF16":
+            joint = None
+            compressed = _quantize_2d(
+                param.detach().float(), fmt,
+                nvfp4_global_real_override=joint,
+            )
+            for suffix, t in compressed.items():
+                base_name = (full_qname[:-len(".weight")]
+                             if full_qname.endswith(".weight")
+                             else full_qname)
+                out_key = (base_name
+                           if suffix == "weight"
+                           else f"{base_name}.{suffix}")
+                out[out_key] = t.cpu()
+            hist[("head", fmt)] += 1
+        else:
+            out[full_qname] = param.detach().to(torch.bfloat16).cpu()
+            hist[("head_passthrough", "BF16")] += 1
+
+    for name, p in model.named_parameters():
+        if p.is_meta:
+            continue  # only head/embed/norm/lm_head resident here
+        _emit_head_param(name, p)
+
+    for mod_name, mod in model.named_modules():
+        non_persistent = getattr(mod, "_non_persistent_buffers_set", set())
+        for buf_name, buf in mod.named_buffers(recurse=False):
+            if buf_name in non_persistent:
+                continue
+            if buf.is_meta:
+                continue
+            full = f"{mod_name}.{buf_name}" if mod_name else buf_name
+            if full in out:
+                continue
+            out[full] = buf.detach().to(torch.bfloat16).cpu()
+            hist[("head_buffer", "BF16")] += 1
+    print(f"[export-stream] head+embed+norm+lm_head passthrough: "
+          f"{time.time()-t_head:.1f}s  keys={len(out)}", flush=True)
+
+    # ----- 3. Per-layer streaming quantize loop -----
+    t_layers = time.time()
+    for L in range(num_layers):
+        layer_t0 = time.time()
+        layer_qname = f"{layers_prefix}{L}".rstrip(".")
+        if layer_qname.endswith("."):
+            layer_qname = layer_qname[:-1]
+
+        # 3a. Load layer from safetensors (direct to device).
+        load_t0 = time.time()
+        tensors = _read_layer_to_device(
+            f"{layers_prefix}{L}.", weight_shard, weight_ckpt, dtype, device)
+        resolver = _build_install_resolver(model, layer_qname)
+        _fast_install(resolver, tensors, device, model=model)
+        load_s = time.time() - load_t0
+
+        layer_mod = model.get_submodule(layer_qname)
+
+        # 3b. Joint NVFP4 scales across fused siblings in this layer.
+        joint_globals = _compute_layer_joint_nvfp4(
+            layer_mod, layer_qname, assignment, profile)
+
+        # 3c. Emit Linears.
+        covered: set[str] = set()
+        linear_count = 0
+        for sub_name, mod in layer_mod.named_modules():
+            if not isinstance(mod, nn.Linear):
+                continue
+            linear_count += 1
+            full = f"{layer_qname}.{sub_name}"
+            recipe_key = profile.live_to_recipe_name(full)
+            fmt = assignment.get(recipe_key)
+            if fmt is None:
+                # No assignment → BF16 passthrough.
+                if not mod.weight.is_meta:
+                    out[f"{full}.weight"] = mod.weight.detach().to(torch.bfloat16).cpu()
+                    if mod.bias is not None and not mod.bias.is_meta:
+                        out[f"{full}.bias"] = mod.bias.detach().to(torch.bfloat16).cpu()
+                    hist[("linear", "BF16")] += 1
+                    covered.add(full)
+                continue
+
+            if fmt == "BF16" or recipe_key in bf16_passthrough:
+                out[f"{full}.weight"] = mod.weight.detach().to(torch.bfloat16).cpu()
+                if mod.bias is not None:
+                    out[f"{full}.bias"] = mod.bias.detach().to(torch.bfloat16).cpu()
+                hist[("linear", "BF16")] += 1
+                covered.add(full)
+                continue
+
+            override = joint_globals.get(recipe_key) if fmt == "NVFP4" else None
+            compressed = _quantize_2d(
+                mod.weight.detach().float(), fmt,
+                nvfp4_global_real_override=override,
+            )
+            for suffix, t in compressed.items():
+                out[f"{full}.{suffix}"] = t.cpu()
+            if mod.bias is not None:
+                out[f"{full}.bias"] = mod.bias.detach().to(torch.bfloat16).cpu()
+            hist[("linear", fmt)] += 1
+            covered.add(full)
+
+        # 3d. Emit packed MoE experts, scoped to this layer.
+        packed_count = 0
+        for sub_name, mod in layer_mod.named_modules():
+            if not _is_packed_experts_module(mod):
+                continue
+            packed_count += 1
+            for pn in _packed_experts_param_names(mod):
+                experts_qname = (f"{layer_qname}.{sub_name}"
+                                 if sub_name else layer_qname)
+                full = f"{experts_qname}.{pn}"
+                recipe_key = profile.live_to_recipe_name(full)
+                fmt = assignment.get(recipe_key)
+                if fmt is None:
+                    unmapped_keys.append(full)
+                    continue
+                packed_param = getattr(mod, pn).detach().float()
+                E, M, N = packed_param.shape
+                if pn == "gate_up_proj":
+                    half = M // 2
+                    proj_split = [
+                        ("gate_proj", packed_param[:, :half, :]),
+                        ("up_proj",   packed_param[:, half:, :]),
+                    ]
+                else:
+                    proj_split = [(pn, packed_param)]
+
+                is_bf16 = fmt == "BF16" or full in bf16_passthrough
+                disk_qname = profile.on_disk_expert_qname(experts_qname)
+                should_split = profile.split_packed_experts_for_format(fmt)
+
+                if not should_split:
+                    out[f"{disk_qname}.{pn}"] = packed_param.to(torch.bfloat16).cpu()
+                    covered.add(full)
+                    hist[("packed_moe", "BF16" if is_bf16 else fmt)] += 1
+                    del packed_param
+                    continue
+
+                # Per-expert joint global scale when NVFP4 splits gate+up.
+                per_expert_joint: list[torch.Tensor | None] = [None] * E
+                if fmt == "NVFP4" and len(proj_split) > 1:
+                    for e in range(E):
+                        cands = [
+                            compute_nvfp4_global_real(sp[e].float(),
+                                                      group_size=16)
+                            for _, sp in proj_split
+                        ]
+                        per_expert_joint[e] = torch.stack(cands).max()
+
+                for proj_name, sub_packed in proj_split:
+                    E_p, Mp, Np = sub_packed.shape
+                    for e in range(E_p):
+                        expert_2d = sub_packed[e]
+                        base = f"{disk_qname}.{e}.{proj_name}"
+                        if is_bf16:
+                            out[f"{base}.weight"] = expert_2d.to(torch.bfloat16).cpu()
+                        else:
+                            compressed = _quantize_2d(
+                                expert_2d, fmt,
+                                nvfp4_global_real_override=per_expert_joint[e],
+                            )
+                            for suffix, t in compressed.items():
+                                key = (base
+                                       if suffix == "weight"
+                                       else f"{base}.{suffix}")
+                                out[key] = t.cpu()
+                covered.add(full)
+                hist[("packed_moe_per_expert", "BF16" if is_bf16 else fmt)] += 1
+                del packed_param, proj_split
+
+        # 3e. Remaining layer-scoped params (norms, conv1d, biases on
+        # passthrough-only modules) and persistent buffers.
+        for sub_name, param in layer_mod.named_parameters():
+            full = f"{layer_qname}.{sub_name}"
+            if full in out:
+                continue
+            if any(full.startswith(c + ".") or full == c for c in covered):
+                continue
+            if param.is_meta:
+                continue
+            out[full] = param.detach().to(torch.bfloat16).cpu()
+            hist[("layer_passthrough", "BF16")] += 1
+        for mod_name, mod in layer_mod.named_modules():
+            non_persistent = getattr(mod, "_non_persistent_buffers_set", set())
+            for buf_name, buf in mod.named_buffers(recurse=False):
+                if buf_name in non_persistent:
+                    continue
+                full_modpath = (f"{layer_qname}.{mod_name}"
+                                if mod_name else layer_qname)
+                full = f"{full_modpath}.{buf_name}"
+                if full in out or buf.is_meta:
+                    continue
+                out[full] = buf.detach().to(torch.bfloat16).cpu()
+                hist[("layer_buffer", "BF16")] += 1
+
+        # 3f. Unload.
+        _unload(model, [f"{layers_prefix}{L}."])
+        del tensors, resolver, joint_globals
+        # Aggressive GPU cleanup — we've already `.cpu()`'d every
+        # quantized output into `out`, so the per-layer GPU working
+        # set (fp32 weight copies, grouped/packed intermediates) can
+        # be released immediately. Keeps per-layer peak bounded.
+        if device.type == "cuda":
+            torch.cuda.synchronize()  # ensure outputs are CPU-resident
+            torch.cuda.empty_cache()
+        if L % 4 == 0:
+            gc.collect()
+        if L % 4 == 0 or L == num_layers - 1:
+            elapsed = time.time() - layer_t0
+            print(f"[export-stream] layer {L:02d}  linears={linear_count} "
+                  f"packed={packed_count}  load={load_s:.2f}s  "
+                  f"total={elapsed:.2f}s  out_keys={len(out)}", flush=True)
+
+    print(f"[export-stream] layer sweep: {time.time()-t_layers:.1f}s",
+          flush=True)
+
+    if unmapped_keys:
+        print(f"[export-stream] WARN {len(unmapped_keys)} unmapped assignment "
+              f"keys — first 5: {unmapped_keys[:5]}", flush=True)
+
+    return out, dict(hist)
+
+
+def _materialize_tensors_inmemory(
     model: nn.Module,
     assignment: dict[str, str],
     *,
     bf16_passthrough: set[str],
     profile: "ModelProfile | None" = None,
 ) -> tuple[dict[str, torch.Tensor], dict]:
-    """Walk the model and produce the dict of on-disk tensors plus a
-    histogram of (kind, format) counts.
-
-    `assignment` keys are stripped of any trailing `.weight`. They
-    identify either:
-      - a Linear module's qualified name (-> Linear.weight quantized)
-      - a packed-experts parameter qualified name
-        (e.g. `model.layers.0.mlp.experts.gate_up_proj`)
-
-    `profile.live_to_recipe_name` maps live HF-module qnames (which
-    may be `model.language_model.layers.X.*` for multimodal classes)
-    to the recipe naming the allocator emitted (flat
-    `model.layers.X.*` from the text-only probe).
-
-    Anything not in `assignment` is written verbatim as a passthrough
-    tensor (norms, embeddings, lm_head, biases, conv1d weights, etc.).
-    """
+    """Whole-model quantizer used for small auxiliary modules (notably the
+    MTP wrapper) that fit in RAM. The main decoder export path uses the
+    streaming materializer above; this helper exists because MTP is
+    built standalone from safetensors and its root module is orders of
+    magnitude smaller than the decoder body."""
     from .model_profiles import DefaultProfile
     profile = profile or DefaultProfile()
     remap = profile.live_to_recipe_name
@@ -580,17 +976,13 @@ def materialize_tensors(
     hist = Counter()
     covered: set[str] = set()
 
-    # Pre-pass: compute joint NVFP4 global_scale per fused-sibling group
-    # so q/k/v (or gate/up, etc.) share one weight_global_scale slot.
-    # vLLM warns + degrades accuracy when sibling scales disagree.
+    # Pre-pass: joint NVFP4 global_scale per fused-sibling group so
+    # q/k/v (or gate/up, etc.) share one weight_global_scale slot.
     nvfp4_joint_global = _compute_nvfp4_joint_global(model, assignment)
 
-    # 1. Linear modules
     for qname, mod in model.named_modules():
         if not isinstance(mod, nn.Linear):
             continue
-        # Allocator recipe uses text-only-probe naming. Multimodal
-        # classes give live qnames with a `language_model.` infix.
         fmt_key = remap(qname)
         fmt = assignment.get(fmt_key)
         if fmt is None:
@@ -614,26 +1006,18 @@ def materialize_tensors(
         covered.add(qname)
         hist[("linear", fmt)] += 1
 
-    # 2. Packed-expert parameters — emit per-expert per-projection
-    # tensors so vLLM's qwen3_5 loader can match each via its standard
-    # `(gate_up_proj, gate_proj, 0)` and `(gate_up_proj, up_proj, 1)`
-    # stacked_params_mapping path. The packed `gate_up_proj` is split
-    # along its row dim (gate first, up second) into two separate
-    # `gate_proj` / `up_proj` per-expert tensors.
     for qname, mod in model.named_modules():
         if not _is_packed_experts_module(mod):
             continue
         for pn in _packed_experts_param_names(mod):
             full_name = f"{qname}.{pn}" if qname else pn
-            # Recipe naming is text-only; live may have language_model infix.
             recipe_key = remap(full_name)
             fmt = assignment.get(recipe_key)
             if fmt is None:
                 continue
-            packed_param = getattr(mod, pn).detach().float()  # [E, M, N]
+            packed_param = getattr(mod, pn).detach().float()
             E, M, N = packed_param.shape
             if pn == "gate_up_proj":
-                # Split rows: gate = packed[..., 0:M//2, :], up = [..., M//2:M, :]
                 half = M // 2
                 proj_split = [
                     ("gate_proj", packed_param[:, :half, :]),
@@ -646,30 +1030,14 @@ def materialize_tensors(
 
             is_bf16 = fmt == "BF16" or full_name in bf16_passthrough
             disk_qname = profile.on_disk_expert_qname(qname)
-            # Profile chooses per-expert split vs packed 3D per-format.
-            # See `ModelProfile.split_packed_experts_for_format` for why:
-            # quantized formats universally want per-expert splits (with
-            # compressed suffixes), while BF16 varies by vLLM loader
-            # (Gemma 4's explodes 3D internally, Qwen 3.5/3.6's fused-
-            # expert path accepts either). Default = split for non-BF16,
-            # keep packed for BF16 — matches every vLLM loader we've
-            # tested against.
             should_split = profile.split_packed_experts_for_format(fmt)
 
             if not should_split:
-                # Emit a single 3D packed tensor. vLLM's
-                # architecture-specific load_weights will handle
-                # remapping and exploding into per-expert shards.
                 out[f"{disk_qname}.{pn}"] = packed_param.to(torch.bfloat16).cpu()
                 covered.add(full_name)
                 hist[("packed_moe", "BF16" if is_bf16 else fmt)] += 1
                 continue
 
-            # When `gate_up_proj` was split into gate+up, the two
-            # per-expert siblings need to share their global_scale so
-            # vLLM's `w13_weight_global_scale[expert, w13_num_shards=2]`
-            # holds two consistent values per expert. Pre-compute the
-            # max across siblings per-expert, then pass into both calls.
             per_expert_joint: list[torch.Tensor | None] = [None] * E
             if fmt == "NVFP4" and len(proj_split) > 1:
                 for e in range(E):
@@ -681,14 +1049,11 @@ def materialize_tensors(
                     per_expert_joint[e] = torch.stack(candidates).max()
 
             for proj_name, sub_packed in proj_split:
-                # sub_packed shape [E, M_proj, N]
                 E_p, Mp, Np = sub_packed.shape
                 for e in range(E_p):
-                    expert_2d = sub_packed[e]  # [Mp, N]
+                    expert_2d = sub_packed[e]
                     base = f"{disk_qname}.{e}.{proj_name}"
                     if is_bf16:
-                        # BF16 but profile opted in to split (e.g. Qwen
-                        # 3.5/3.6 variant). Single `.weight` tensor.
                         out[f"{base}.weight"] = expert_2d.to(torch.bfloat16).cpu()
                     else:
                         compressed = _quantize_2d(
@@ -701,8 +1066,6 @@ def materialize_tensors(
             covered.add(full_name)
             hist[("packed_moe_per_expert", "BF16" if is_bf16 else fmt)] += 1
 
-    # 3. Passthrough — everything else (norms, embeddings, biases on
-    # non-quantized modules, conv1d, lm_head if not in assignment).
     for name, p in model.named_parameters():
         if any(name.startswith(c + ".") or name == c for c in covered):
             continue
@@ -711,11 +1074,6 @@ def materialize_tensors(
         out[name] = p.detach().to(torch.bfloat16).cpu()
         hist[("passthrough", "BF16")] += 1
 
-    # 4. Persistent buffers — some architectures register learned
-    # scalars (e.g. Gemma 4's per-layer `layer_scalar`) that aren't
-    # in `named_parameters()` but are required at inference. Drop
-    # non-persistent buffers (e.g. rotary inv_freq caches, attention
-    # masks) that vLLM recomputes on load.
     for mod_name, mod in model.named_modules():
         non_persistent = getattr(mod, "_non_persistent_buffers_set", set())
         for buf_name, buf in mod.named_buffers(recurse=False):
@@ -1055,215 +1413,178 @@ def build_quantization_config(
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Recipe canonicalization + Main
 # ---------------------------------------------------------------------------
+def _canonicalize_assignment(raw: dict) -> dict[str, str]:
+    """Accept either AutoRound-style dicts (`{key: {bits: 4, data_type: nv_fp,
+    ...}}`) or shorthand (`{key: "NVFP4"}`). Return `{key: fmt_str}` with
+    fmt in {"NVFP4", "MXFP8", "BF16"}."""
+    out: dict[str, str] = {}
+    for k, v in raw.items():
+        name = _strip_weight(k)
+        out[name] = canonicalize_format(v)
+    return out
+
+
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--model", required=True,
-                    help="HF model dir (must be loadable by transformers v5)")
+                    help="HF model dir (source safetensors + config.json)")
     ap.add_argument("--layer-config", required=True,
                     help="layer_config.json from allocator.py")
     ap.add_argument("--output", required=True,
                     help="Output directory for the compressed checkpoint")
-    ap.add_argument("--shard-bytes", type=int, default=5 * 1024 ** 3,
-                    help="Approximate per-shard size for safetensors split "
-                         "(default: 5 GiB)")
-    ap.add_argument("--device", default="cpu",
-                    help="Device for quantization arithmetic. cpu is safest "
-                         "for streaming a 35B model; cuda for speed.")
+    ap.add_argument("--shard-bytes", type=int, default=5 * 1024**3,
+                    help="Approx per-shard size in bytes (default 5 GiB)")
+    ap.add_argument("--device", default="cuda",
+                    help="Device for quantization arithmetic. Layer "
+                         "weights are read into this device; "
+                         "_quantize_2d / _quantize_3d_packed run here; "
+                         "outputs are moved to CPU before storage.")
+    ap.add_argument("--offload-folder", default=None,
+                    help="Accelerate disk-offload folder (defaults to "
+                         "sibling of output).")
     ap.add_argument("--ignore", nargs="*", default=["lm_head"],
-                    help="Module qnames to keep at bf16 even if assigned "
-                         "elsewhere. Defaults to lm_head.")
+                    help="Module qnames to keep at bf16 even if the "
+                         "allocator assigned another format.")
     args = ap.parse_args()
 
+    from .model_profiles import detect_profile
+    profile = detect_profile(args.model)
+    print(f"[export-stream] model profile: {profile.name}", flush=True)
+
+    with open(args.layer_config) as f:
+        raw_recipe = json.load(f)
+    assignment = _canonicalize_assignment(raw_recipe)
+    validate_mtp_assignment_coverage(args.model, assignment, profile)
+    fmts = Counter(assignment.values())
+    print(f"[export-stream] recipe: {len(assignment)} entries  mix={dict(fmts)}",
+          flush=True)
+
+    dtype = torch.bfloat16
+    device = torch.device(args.device)
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[export] loading recipe from {args.layer_config}", flush=True)
-    raw_recipe = json.load(open(args.layer_config))
-
-    assignment: dict[str, str] = {}
-    for raw_name, raw_value in raw_recipe.items():
-        name = _strip_weight(raw_name)
-        try:
-            fmt = canonicalize_format(raw_value)
-        except ValueError as e:
-            print(f"[export] skip {name!r}: {e}", flush=True)
-            continue
-        assignment[name] = fmt
-    print(f"[export] recipe: {len(assignment)} entries  "
-          f"format mix: {dict(Counter(assignment.values()).most_common())}",
-          flush=True)
-
-    # The probe-side recipe keys use the text-only naming
-    # `model.layers.X.*`. We load via AutoModelForCausalLM (text-only),
-    # so live module names are also `model.layers.X.*` — no rewriting
-    # needed for the recipe → live-module match.
-    #
-    # On the OUTPUT side, the on-disk safetensors must use the HF
-    # multimodal convention `model.language_model.layers.X.*` because
-    # vLLM's Qwen3_5MoeForConditionalGeneration loader was written for
-    # that source naming (it then maps to `language_model.model.X.*`
-    # internally). The output_name_remap dict applied at write time
-    # adds the `language_model.` infix.
-
     bf16_passthrough = set(args.ignore)
+    if args.offload_folder is None:
+        args.offload_folder = str(out_dir / "_streaming_offload")
 
-    # Load the FULL model (no text-only staging). For multimodal
-    # checkpoints (Qwen3.6 = Qwen3VLMoe class) vLLM expects parameter
-    # names with the multimodal prefixes intact
-    # (`model.language_model.layers.X.*`, `visual.blocks.X.*`, etc.).
-    # Stripping those during staging produces a checkpoint vLLM can't
-    # locate parameters in. The visual encoder + MTP heads we don't
-    # quantize travel through as bf16 passthrough.
-    from transformers import AutoModelForImageTextToText
-    # Load the FULL model (no text-only staging). Some multimodal
-    # architectures (Gemma 4) store their text body under a
-    # `model.language_model.*` prefix in safetensors, so loading a
-    # staged text-only sibling class (Gemma4ForCausalLM) would flag
-    # every text Linear as MISSING. We handle the live-vs-recipe
-    # naming mismatch in `materialize_tensors` below, which uses
-    # `profile.live_to_recipe_name()` to look up the allocator's
-    # assignment by the recipe convention regardless of which
-    # loader gave us the live module.
-    print(f"[export] loading model from {args.model}", flush=True)
-    t0 = time.time()
-    load_kwargs = dict(
-        torch_dtype=torch.bfloat16,
-        device_map=args.device,
-        low_cpu_mem_usage=False,
-        trust_remote_code=True,
+    tensors, hist = materialize_tensors_streaming(
+        args.model, assignment,
+        profile=profile, bf16_passthrough=bf16_passthrough,
+        dtype=dtype, device=device,
+        offload_folder=args.offload_folder,
     )
-    try:
-        model = AutoModelForCausalLM.from_pretrained(args.model, **load_kwargs)
-    except (ValueError, KeyError):
-        print("[export] AutoModelForCausalLM declined; using "
-              "AutoModelForImageTextToText", flush=True)
-        model = AutoModelForImageTextToText.from_pretrained(args.model, **load_kwargs)
-    model.eval()
-    for p in model.parameters():
-        p.requires_grad_(False)
-    print(f"[export] model loaded in {time.time() - t0:.1f}s", flush=True)
-
-    from .model_profiles import detect_profile as _detect
-    main_profile = _detect(args.model)
-    print(f"[export] model profile: {main_profile.name}", flush=True)
-    validate_mtp_assignment_coverage(args.model, assignment, main_profile)
-
-    print("[export] materializing compressed tensors ...", flush=True)
-    t0 = time.time()
-    tensors, hist = materialize_tensors(
-        model, assignment, bf16_passthrough=bf16_passthrough,
-        profile=main_profile,
-    )
-    print(f"[export] materialized {len(tensors)} tensors in "
-          f"{time.time() - t0:.1f}s", flush=True)
-    print(f"[export] hist: {hist}", flush=True)
-
-    # Free model — we now hold all weights in `tensors`.
-    del model
-    gc.collect()
-
-    # Add `model.language_model.` prefix to language-model parameters
-    # so the output matches the HF multimodal naming convention vLLM
-    # expects. Top-level entries like `lm_head` are left alone.
-    out_tensors: dict[str, torch.Tensor] = {}
-    for k, v in tensors.items():
-        if k.startswith("model.layers.") or k.startswith("model.embed_tokens") \
-                or k.startswith("model.norm"):
-            out_tensors["model.language_model." + k[len("model."):]] = v
-        else:
-            out_tensors[k] = v
-    tensors = out_tensors
-
-    # Quantize MTP heads per allocator decisions. Transformers drops
-    # `mtp.*` on load (`_keys_to_ignore_on_load_unexpected`), so the main
-    # materialize_tensors pass never sees them. We rebuild a standalone
-    # MTP module, load source weights into it, and run the same quantize
-    # pass for any `mtp.*` entries in the recipe.
-    from .model_profiles import detect_profile
-    export_profile = detect_profile(args.model)
-    if export_profile.has_mtp():
-        print("[export] materializing MTP tensors per allocator ...", flush=True)
-        mtp_tensors = _materialize_mtp_tensors(args.model, assignment,
-                                               bf16_passthrough=bf16_passthrough,
-                                               hist=hist)
-        print(f"[export] MTP: {len(mtp_tensors)} tensors materialized", flush=True)
-    else:
-        print(f"[export] profile '{export_profile.name}' has no MTP — "
-              "skipping MTP materialization", flush=True)
-        mtp_tensors = {}
-
-    # Visual encoder is still source passthrough (we deferred real
-    # calibration for it). MTP passthrough is restricted to source
-    # keys NOT covered by our MTP materialization (layernorms, mtp.fc
-    # when allocator chose BF16, etc.). Passthrough prefix list comes
-    # from the profile so multimodal arches (Gemma 4's vision+audio,
-    # Qwen 3.6's vision, etc.) each pull the right set.
-    print("[export] merging residual passthrough tensors from source ...",
+    print(f"[export-stream] materialized {len(tensors)} tensors  hist={hist}",
           flush=True)
-    passthrough_prefixes = tuple(export_profile.source_passthrough_prefixes())
-    src_extra = _load_source_passthrough(
-        args.model,
-        prefix_filters=passthrough_prefixes,
-    )
-    # Drop source tensors whose target name was already materialized.
-    # The materialize pass produces vLLM-native names (`mtp.fc.weight_packed`
-    # etc.) — we strip any suffix back to the source base name to compare.
-    materialized_bases: set[str] = set()
-    for k in mtp_tensors:
-        # k is like 'mtp.fc.weight_packed', 'mtp.fc.weight_scale',
-        # 'mtp.fc.weight_global_scale', 'mtp.fc.weight' (if BF16), ...
-        # Strip one suffix past the last dot.
-        base = k
-        for suf in (".weight_packed", ".weight_scale", ".weight_global_scale",
-                    ".input_global_scale", ".weight"):
-            if k.endswith(suf):
-                base = k[:-len(suf)] + ".weight"
-                break
-        materialized_bases.add(base)
-        # Also cover packed-expert per-expert outputs: 'mtp.layers.0.mlp.experts.E.gate_proj.weight_packed'
-        # The source key is 'mtp.layers.0.mlp.experts.gate_up_proj' (shape [E, 2M, N]).
-        import re as _re
-        m = _re.match(r"^(mtp\.layers\.\d+\.mlp\.experts)\.\d+\.(gate|up|down)_proj\.", k)
-        if m:
-            if m.group(2) in ("gate", "up"):
-                materialized_bases.add(f"{m.group(1)}.gate_up_proj")
+
+    # Rename body keys → `model.language_model.` on disk for multimodal-
+    # umbrella arches (Qwen3.5/3.6 ConditionalGeneration, Gemma 4
+    # ConditionalGeneration). Our streaming loop produces the text-only
+    # `model.layers.X.*` form.
+    body_infix = getattr(profile, "body_ondisk_infix", None)
+    if callable(body_infix):
+        infix = body_infix()
+    else:
+        # Default: Qwen3.5/3.6 pattern. Profiles for non-multimodal
+        # archs can return "" and we'll skip the rename.
+        infix = "language_model." if profile.name.startswith("qwen3_5") else ""
+    if infix:
+        renamed: dict[str, torch.Tensor] = {}
+        for k, v in tensors.items():
+            if (k.startswith("model.layers.")
+                    or k.startswith("model.embed_tokens")
+                    or k.startswith("model.norm")):
+                renamed[f"model.{infix}{k[len('model.'):]}"] = v
             else:
-                materialized_bases.add(f"{m.group(1)}.down_proj")
-    src_extra = {k: v for k, v in src_extra.items() if k not in materialized_bases}
-    overlap = set(tensors) & set(src_extra)
-    if overlap:
-        for k in overlap:
-            del src_extra[k]
-    overlap_mtp = set(mtp_tensors) & set(src_extra)
-    if overlap_mtp:
-        for k in overlap_mtp:
-            del src_extra[k]
-    tensors.update(mtp_tensors)
-    tensors.update(src_extra)
-    print(f"[export] merged {len(src_extra)} passthrough + "
-          f"{len(mtp_tensors)} mtp-quantized tensors", flush=True)
+                renamed[k] = v
+        tensors = renamed
+        print(f"[export-stream] renamed body → model.{infix}...",
+              flush=True)
 
-    # Sharded safetensors save.
-    print("[export] writing safetensors shards ...", flush=True)
+    # MTP materialization if the profile has heads. Uses the in-memory
+    # helper — MTP heads are small enough that full-model residency
+    # isn't a concern.
+    mtp_tensors: dict[str, torch.Tensor] = {}
+    if profile.has_mtp():
+        print("[export-stream] materializing MTP tensors ...", flush=True)
+        mtp_tensors = _materialize_mtp_tensors(
+            args.model, assignment,
+            bf16_passthrough=bf16_passthrough, hist=hist)
+        print(f"[export-stream] MTP: {len(mtp_tensors)} tensors", flush=True)
+    else:
+        print(f"[export-stream] profile '{profile.name}' has no MTP — "
+              "skipping", flush=True)
+
+    # Merge source passthrough (visual/audio towers etc.) that aren't
+    # part of our streaming pass. Drop entries that MTP materialize
+    # already covered.
+    passthrough_prefixes = tuple(profile.source_passthrough_prefixes())
+    if passthrough_prefixes:
+        src_extra = _load_source_passthrough(
+            args.model, prefix_filters=passthrough_prefixes)
+        materialized_bases: set[str] = set()
+        for k in mtp_tensors:
+            base = k
+            for suf in (".weight_packed", ".weight_scale",
+                        ".weight_global_scale", ".input_global_scale",
+                        ".weight"):
+                if k.endswith(suf):
+                    base = k[:-len(suf)] + ".weight"
+                    break
+            materialized_bases.add(base)
+            m = re.match(r"^(mtp\.layers\.\d+\.mlp\.experts)\.\d+\.(gate|up|down)_proj\.", k)
+            if m:
+                if m.group(2) in ("gate", "up"):
+                    materialized_bases.add(f"{m.group(1)}.gate_up_proj")
+                else:
+                    materialized_bases.add(f"{m.group(1)}.down_proj")
+        src_extra = {k: v for k, v in src_extra.items()
+                     if k not in materialized_bases}
+        for k in list(src_extra.keys()):
+            if k in tensors or k in mtp_tensors:
+                del src_extra[k]
+        tensors.update(mtp_tensors)
+        tensors.update(src_extra)
+        print(f"[export-stream] merged {len(src_extra)} source-passthrough + "
+              f"{len(mtp_tensors)} MTP tensors", flush=True)
+    else:
+        tensors.update(mtp_tensors)
+
+    print("[export-stream] writing safetensors shards ...", flush=True)
+    t_write = time.time()
     write_sharded_safetensors(tensors, out_dir, args.shard_bytes)
+    print(f"[export-stream] sharded write: {time.time()-t_write:.1f}s",
+          flush=True)
 
-    # Enumerate Linears the recipe DOESN'T mention so we can add them
-    # to the ignore list. Without this, any Linear not in `assignment`
-    # would be silently caught by the catch-all group's regex and vLLM
-    # would try to load a bf16 weight into an NVFP4 packed param.
-    # Examples on Qwen3.6: routers (`mlp.gate`), `shared_expert_gate`,
-    # `linear_attn.norm` (which is RMSNorm, not Linear, so excluded),
-    # vision encoder Linears.
+    # Scan source safetensors for 2D `.weight` keys not covered by the
+    # recipe — these are visual encoder / unmapped Linears that vLLM
+    # instantiates during model-construction time. Without an explicit
+    # ignore entry, compressed-tensors' `find_matched_target` raises
+    # `ValueError: Unable to find matching target for visual.merger.*`.
     extra_ignore: list[str] = []
-    # Reload the model briefly via a no-op iteration would be expensive;
-    # instead, scan the source safetensors for any 2D `.weight` keys
-    # that aren't covered by `assignment`.
     seen_recipe = {n for n in assignment}
     src_dir = Path(args.model)
+    # Per-expert siblings map to a fused packed parent at recipe level.
+    # If the parent IS quantized, the per-expert source keys are already
+    # covered and must NOT be added to `extra_ignore` — otherwise vLLM's
+    # compressed-tensors loader marks the FusedMoE layer as un-quantized
+    # and the NVFP4 scale params (w2_input_global_scale, ...) never get
+    # registered, crashing at weight-load.
+    _per_expert_re = re.compile(
+        r"^(?P<prefix>.+\.experts)\.\d+\.(?P<proj>gate|up|down)_proj$")
+
+    def _per_expert_parent(base: str) -> str | None:
+        m = _per_expert_re.match(base)
+        if not m:
+            return None
+        proj = m.group("proj")
+        parent = "gate_up_proj" if proj in ("gate", "up") else "down_proj"
+        return f"{m.group('prefix')}.{parent}"
+
     if src_dir.exists():
-        from safetensors.torch import safe_open
+        from safetensors import safe_open
         import os as _os
         for f in sorted(_os.listdir(src_dir)):
             if not f.endswith(".safetensors"):
@@ -1272,44 +1593,30 @@ def main():
                 for k in sf.keys():
                     if not k.endswith(".weight"):
                         continue
-                    base = k[:-7]   # strip .weight
-                    # The recipe uses text-only naming `model.layers.X.*`;
-                    # source uses multimodal `model.language_model.layers.X.*`.
-                    # Convert source-name → recipe-name to compare.
-                    if base.startswith("model.language_model."):
-                        recipe_name = "model." + base[len("model.language_model."):]
-                    else:
-                        recipe_name = base
+                    base = k[:-7]
+                    recipe_name = ("model." + base[len("model.language_model."):]
+                                   if base.startswith("model.language_model.")
+                                   else base)
                     if recipe_name in seen_recipe:
                         continue
-                    # Skip norm-like + embed-like + bias + 1D modules — only
-                    # Linears need explicit ignore (catch-all targets Linear).
-                    # We approximate "is this a Linear weight" by looking
-                    # at the tensor's rank.
+                    parent = _per_expert_parent(recipe_name)
+                    if parent is not None and parent in seen_recipe:
+                        continue
                     try:
-                        meta = sf.get_slice(k)
-                        shape = list(meta.get_shape())
+                        shape = list(sf.get_slice(k).get_shape())
                     except Exception:
                         shape = []
                     if len(shape) != 2:
                         continue
                     extra_ignore.append(base)
+    print(f"[export-stream] extra ignore (unmapped Linears): "
+          f"{len(extra_ignore)}", flush=True)
 
-    print(f"[export] extra ignore (unmapped Linears): {len(extra_ignore)}",
-          flush=True)
-
-    # Write config.json with quantization_config.
-    print("[export] writing config.json ...", flush=True)
     write_config_with_quantization(
         args.model, out_dir, assignment, bf16_passthrough,
-        extra_ignore=extra_ignore,
-    )
-
-    # Tokenizer + auxiliary files.
-    print("[export] copying tokenizer files ...", flush=True)
+        extra_ignore=extra_ignore)
     _copy_tokenizer(args.model, out_dir)
 
-    # Manifest for traceability.
     with open(out_dir / "mixed_native_manifest.json", "w") as f:
         json.dump({
             "source_model": args.model,
@@ -1319,7 +1626,7 @@ def main():
             "ignore": sorted(bf16_passthrough),
         }, f, indent=2)
 
-    print(f"[export] done. Serve with:\n"
+    print(f"[export-stream] done. Serve with:\n"
           f"  vllm serve {out_dir.resolve()} --quantization compressed-tensors",
           flush=True)
 
@@ -1422,12 +1729,11 @@ def _materialize_mtp_tensors(src_model: str,
 
     Transformers v5 does not instantiate MTP modules when loading
     Qwen3.5/3.6 MoE checkpoints (see `_keys_to_ignore_on_load_unexpected`),
-    so `materialize_tensors` — which walks `model.named_modules()` —
-    never sees any `mtp.*` entry in `assignment`. We build a standalone
-    MTP module, load the source `mtp.*` weights into it, wrap it in a
-    parent module named `mtp` (so qualified names come out as
-    `mtp.fc`, `mtp.layers.0.self_attn.q_proj`, ...), and run the same
-    materialize pass.
+    so the streaming decoder-layer sweep never sees any `mtp.*` entry in
+    `assignment`. We build a standalone MTP module, load the source
+    `mtp.*` weights into it, wrap it in a parent module named `mtp` (so
+    qualified names come out as `mtp.fc`, `mtp.layers.0.self_attn.q_proj`,
+    ...), and run the in-memory materialize helper.
 
     Output tensor names match the checkpoint convention (`mtp.fc.*`,
     `mtp.layers.0.<rest>`). vLLM's `qwen3_5_mtp.load_weights` remaps
@@ -1454,7 +1760,7 @@ def _materialize_mtp_tensors(src_model: str,
     if not mtp_assignment:
         return {}
 
-    out, sub_hist = materialize_tensors(
+    out, sub_hist = _materialize_tensors_inmemory(
         wrapper, mtp_assignment, bf16_passthrough=bf16_passthrough,
     )
     # Merge MTP histogram into caller's.
