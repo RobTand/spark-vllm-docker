@@ -18,6 +18,7 @@ import pickle
 import re
 from collections import defaultdict
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -148,6 +149,65 @@ def _merge_nested_counts(dst: dict, src: dict):
         tgt = dst.setdefault(key, {})
         for sk, sv in sub.items():
             tgt[sk] = tgt.get(sk, 0.0) + float(sv)
+
+
+def _read_pickle(path: Path) -> Any:
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+def _expected_probe_shard_meta(args, *,
+                               linear_include: str,
+                               shard_idx: int,
+                               activation_cache_dir: str) -> dict[str, Any]:
+    return {
+        "model": args.model,
+        "dataset": args.dataset,
+        "nsamples": args.nsamples,
+        "seqlen": args.seqlen,
+        "dtype": args.dtype,
+        "requested_device": args.device,
+        "requested_device_map": str(args.device_map),
+        "importance_weighting": args.importance_weighting,
+        "activation_cache_dir": str(Path(activation_cache_dir)),
+        "linear_include": linear_include,
+        "linear_exclude": (
+            r"(?:mlp\.gate$|mlp\..*gate$|\.router(?:$|\.)|block_sparse_moe\.gate$)"
+        ),
+        "h_detail_dir": str(Path(args.h_detail_dir)) if args.h_detail_dir else None,
+        "shard_idx": shard_idx,
+    }
+
+
+def probe_shard_is_reusable(path: Path, expected_meta: dict[str, Any]) -> bool:
+    try:
+        data = _read_pickle(path)
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    if "stats" not in data or "meta" not in data:
+        return False
+    if not isinstance(data["stats"], dict):
+        return False
+    meta = data.get("meta") or {}
+    probe_meta = dict(meta)
+    probe_meta.update(meta.get("incremental_shard", {}))
+    for key, expected in expected_meta.items():
+        if probe_meta.get(key) != expected:
+            return False
+    return True
+
+
+def annotate_probe_shard(path: Path, extra_meta: dict[str, Any]) -> None:
+    data = _read_pickle(path)
+    meta = dict(data.get("meta", {}))
+    inc = dict(meta.get("incremental_shard", {}))
+    inc.update(extra_meta)
+    meta["incremental_shard"] = inc
+    data["meta"] = meta
+    with open(path, "wb") as f:
+        pickle.dump(data, f)
 
 
 def merge_probe_pickles(paths: list[Path], output_path: Path):
@@ -295,9 +355,18 @@ def main():
     for shard_idx, linear_include in enumerate(shard_regexes):
         shard_path = shard_dir / f"probe_shard_{shard_idx:03d}.pkl"
         shard_paths.append(shard_path)
-        if shard_path.exists():
+        expected_meta = _expected_probe_shard_meta(
+            args,
+            linear_include=linear_include,
+            shard_idx=shard_idx,
+            activation_cache_dir=args.activation_cache_dir,
+        )
+        if shard_path.exists() and probe_shard_is_reusable(shard_path, expected_meta):
             print(f"[incremental] reuse shard {shard_idx}: {shard_path}", flush=True)
             continue
+        if shard_path.exists():
+            print(f"[incremental] stale shard {shard_idx}: recomputing {shard_path}",
+                  flush=True)
         print(f"[incremental] shard {shard_idx}: include={linear_include}", flush=True)
         run_probe_pass(
             model=model,
@@ -319,6 +388,7 @@ def main():
             h_detail_dir=args.h_detail_dir,
             output_path=str(shard_path),
         )
+        annotate_probe_shard(shard_path, expected_meta)
         if exec_device.type == "cuda":
             torch.cuda.empty_cache()
 

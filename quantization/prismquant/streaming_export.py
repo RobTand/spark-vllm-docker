@@ -49,9 +49,10 @@ from .export_native_compressed import (
     write_sharded_safetensors,
     _copy_tokenizer,
     _load_source_passthrough,
+    validate_mtp_assignment_coverage,
 )
 from .sensitivity_probe import stage_text_only
-from .streaming_probe import (
+from .layer_streaming import (
     _build_install_resolver,
     _build_weight_map,
     _fast_install,
@@ -504,6 +505,7 @@ def main():
     with open(args.layer_config) as f:
         raw_recipe = json.load(f)
     assignment = _canonicalize_assignment(raw_recipe)
+    validate_mtp_assignment_coverage(args.model, assignment, profile)
     fmts = Counter(assignment.values())
     print(f"[export-stream] recipe: {len(assignment)} entries  mix={dict(fmts)}",
           flush=True)

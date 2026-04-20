@@ -10,6 +10,7 @@ import argparse
 import pickle
 import re
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -53,6 +54,69 @@ def merge_cost_pickles(paths: list[Path], output_path: Path):
                 "shards": shard_metas,
             },
         }, f)
+
+
+def _read_pickle(path: Path) -> Any:
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+def _expected_cost_shard_meta(*,
+                              model: str,
+                              probe_path: Path,
+                              linear_include: str,
+                              shard_idx: int,
+                              activation_cache_dir: str,
+                              mode: str,
+                              chunk_size: int,
+                              h_detail_dir: str | None,
+                              formats: list[str]) -> dict[str, Any]:
+    return {
+        "model": model,
+        "probe": str(probe_path),
+        "activation_cache_dir": str(Path(activation_cache_dir)),
+        "linear_include": linear_include,
+        "mode": mode,
+        "chunk_size": chunk_size,
+        "h_detail_dir": str(Path(h_detail_dir)) if h_detail_dir else None,
+        "shard_idx": shard_idx,
+        "formats": list(formats),
+    }
+
+
+def cost_shard_is_reusable(path: Path, expected_meta: dict[str, Any]) -> bool:
+    try:
+        data = _read_pickle(path)
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    if "costs" not in data or "meta" not in data:
+        return False
+    if not isinstance(data["costs"], dict):
+        return False
+    meta = dict(data.get("meta", {}))
+    meta.update(meta.get("incremental_shard", {}))
+    actual_formats = data.get("formats", [])
+    if list(actual_formats) != list(expected_meta.get("formats", [])):
+        return False
+    for key, expected in expected_meta.items():
+        if key == "formats":
+            continue
+        if meta.get(key) != expected:
+            return False
+    return True
+
+
+def annotate_cost_shard(path: Path, extra_meta: dict[str, Any]) -> None:
+    data = _read_pickle(path)
+    meta = dict(data.get("meta", {}))
+    inc = dict(meta.get("incremental_shard", {}))
+    inc.update(extra_meta)
+    meta["incremental_shard"] = inc
+    data["meta"] = meta
+    with open(path, "wb") as f:
+        pickle.dump(data, f)
 
 
 def main():
@@ -137,16 +201,29 @@ def main():
     for shard_idx, linear_include in enumerate(shard_regexes):
         shard_path = shard_dir / f"cost_shard_{shard_idx:03d}.pkl"
         shard_paths.append(shard_path)
-        if shard_path.exists():
+        shard_probe = shard_dir / f"probe_subset_{shard_idx:03d}.pkl"
+        expected_meta = _expected_cost_shard_meta(
+            model=args.model,
+            probe_path=shard_probe,
+            linear_include=linear_include,
+            shard_idx=shard_idx,
+            activation_cache_dir=args.activation_cache_dir,
+            mode=args.mode,
+            chunk_size=args.chunk_size,
+            h_detail_dir=args.h_detail_dir,
+            formats=[s.name for s in specs],
+        )
+        if shard_path.exists() and cost_shard_is_reusable(shard_path, expected_meta):
             print(f"[incremental-cost] reuse shard {shard_idx}: {shard_path}", flush=True)
             continue
+        if shard_path.exists():
+            print(f"[incremental-cost] stale shard {shard_idx}: recomputing {shard_path}",
+                  flush=True)
 
-        shard_probe = shard_dir / f"probe_subset_{shard_idx:03d}.pkl"
         shard_probe_data = dict(probe)
         shard_probe_data["stats"] = {
             k: v for k, v in probe["stats"].items() if re.search(linear_include, k)
         }
-        shard_probe = shard_dir / f"probe_subset_{shard_idx:03d}.pkl"
         with open(shard_probe, "wb") as f:
             pickle.dump(shard_probe_data, f)
 
@@ -168,6 +245,7 @@ def main():
             output_path=str(shard_path),
             h_detail_dir=args.h_detail_dir,
         )
+        annotate_cost_shard(shard_path, expected_meta)
         if args.device.startswith("cuda"):
             torch.cuda.empty_cache()
 

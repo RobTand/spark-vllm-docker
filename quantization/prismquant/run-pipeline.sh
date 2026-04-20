@@ -27,6 +27,14 @@ set -euo pipefail
 : "${DEVICE:=cuda}"
 : "${EXPORT_DEVICE:=cpu}"   # cpu is safer for streaming; cuda is faster
 : "${TARGET_PROFILE:=vllm_qwen3_5_packed_moe}"
+: "${INCLUDE_MTP:=1}"
+
+BODY_PROBE_PATH="${WORK_DIR}/artifacts/probe_body.pkl"
+BODY_COST_PATH="${WORK_DIR}/artifacts/cost_body.pkl"
+MTP_PROBE_PATH="${WORK_DIR}/artifacts/mtp_probe.pkl"
+MTP_COST_PATH="${WORK_DIR}/artifacts/mtp_cost.pkl"
+PROBE_PATH="${WORK_DIR}/artifacts/probe.pkl"
+COST_PATH="${WORK_DIR}/artifacts/cost.pkl"
 
 mkdir -p "${WORK_DIR}"/{artifacts,act,work,logs,exported}
 
@@ -40,33 +48,33 @@ echo
 # -----------------------------------------------------------------------
 # 1. Sensitivity probe (per-Linear empirical Fisher diagonal trace)
 # -----------------------------------------------------------------------
-if [[ ! -f "${WORK_DIR}/artifacts/probe.pkl" ]]; then
+if [[ ! -f "${BODY_PROBE_PATH}" ]]; then
   echo "[pipeline] [1/4] running sensitivity probe ..."
   python3 -m quantization.prismquant.incremental_probe \
     --model "$MODEL_PATH" \
     --dataset "$DATASET" \
     --nsamples "$NSAMPLES" --seqlen "$SEQLEN" \
     --device "$DEVICE" --dtype bf16 \
-    --output "${WORK_DIR}/artifacts/probe.pkl" \
+    --output "${BODY_PROBE_PATH}" \
     --activation-cache-dir "${WORK_DIR}/act" \
     --work-dir "${WORK_DIR}/work" \
     --layers-per-shard "$LAYERS_PER_SHARD" \
     2>&1 | tee "${WORK_DIR}/logs/probe.log"
 else
-  echo "[pipeline] [1/4] probe.pkl exists, skipping"
+  echo "[pipeline] [1/4] probe_body.pkl exists, skipping"
 fi
 
 # -----------------------------------------------------------------------
 # 2. Cost measurement (per-(Linear, format) measured RTN error)
 # -----------------------------------------------------------------------
-if [[ ! -f "${WORK_DIR}/artifacts/cost.pkl" ]]; then
+if [[ ! -f "${BODY_COST_PATH}" ]]; then
   echo "[pipeline] [2/4] measuring per-(layer, format) cost ..."
   python3 -m quantization.prismquant.incremental_measure_quant_cost \
     --model "$MODEL_PATH" \
-    --probe "${WORK_DIR}/artifacts/probe.pkl" \
+    --probe "${BODY_PROBE_PATH}" \
     --activation-cache-dir "${WORK_DIR}/act" \
     --formats "$FORMATS" \
-    --output "${WORK_DIR}/artifacts/cost.pkl" \
+    --output "${BODY_COST_PATH}" \
     --work-dir "${WORK_DIR}/work" \
     --device "$DEVICE" --dtype bf16 \
     --mode batched --chunk-size 256 \
@@ -74,7 +82,48 @@ if [[ ! -f "${WORK_DIR}/artifacts/cost.pkl" ]]; then
     --skip-missing-activations \
     2>&1 | tee "${WORK_DIR}/logs/cost.log"
 else
-  echo "[pipeline] [2/4] cost.pkl exists, skipping"
+  echo "[pipeline] [2/4] cost_body.pkl exists, skipping"
+fi
+
+if [[ "${INCLUDE_MTP}" == "1" ]]; then
+  if [[ ! -f "${MTP_PROBE_PATH}" ]]; then
+    echo "[pipeline] [2a/4] running mtp probe ..."
+    python3 -m quantization.prismquant.mtp_probe \
+      --model "$MODEL_PATH" \
+      --dataset "$DATASET" \
+      --nsamples "$NSAMPLES" --seqlen "$SEQLEN" \
+      --device "$DEVICE" --dtype bf16 \
+      --activation-cache-dir "${WORK_DIR}/act_mtp" \
+      --output "${MTP_PROBE_PATH}" \
+      2>&1 | tee "${WORK_DIR}/logs/mtp_probe.log"
+  else
+    echo "[pipeline] [2a/4] mtp_probe.pkl exists, skipping"
+  fi
+
+  if [[ ! -f "${MTP_COST_PATH}" ]]; then
+    echo "[pipeline] [2b/4] running mtp cost ..."
+    python3 -m quantization.prismquant.mtp_cost \
+      --model "$MODEL_PATH" \
+      --formats "$FORMATS" \
+      --activation-cache-dir "${WORK_DIR}/act_mtp" \
+      --output "${MTP_COST_PATH}" \
+      --device "$DEVICE" --dtype bf16 --mode batched --chunk-size 256 \
+      2>&1 | tee "${WORK_DIR}/logs/mtp_cost.log"
+  else
+    echo "[pipeline] [2b/4] mtp_cost.pkl exists, skipping"
+  fi
+
+  echo "[pipeline] [2c/4] merging body + mtp probe/cost ..."
+  python3 - <<PY
+from pathlib import Path
+from quantization.prismquant.incremental_probe import merge_probe_pickles
+from quantization.prismquant.incremental_measure_quant_cost import merge_cost_pickles
+merge_probe_pickles([Path("${BODY_PROBE_PATH}"), Path("${MTP_PROBE_PATH}")], Path("${PROBE_PATH}"))
+merge_cost_pickles([Path("${BODY_COST_PATH}"), Path("${MTP_COST_PATH}")], Path("${COST_PATH}"))
+PY
+else
+  cp "${BODY_PROBE_PATH}" "${PROBE_PATH}"
+  cp "${BODY_COST_PATH}" "${COST_PATH}"
 fi
 
 # -----------------------------------------------------------------------
@@ -82,8 +131,8 @@ fi
 # -----------------------------------------------------------------------
 echo "[pipeline] [3/4] running allocator at target=${TARGET_BITS} bpp ..."
 python3 -m quantization.prismquant.allocator \
-  --probe "${WORK_DIR}/artifacts/probe.pkl" \
-  --costs "${WORK_DIR}/artifacts/cost.pkl" \
+  --probe "${PROBE_PATH}" \
+  --costs "${COST_PATH}" \
   --target-bits "$TARGET_BITS" \
   --formats "$FORMATS" \
   --target-profile "$TARGET_PROFILE" \

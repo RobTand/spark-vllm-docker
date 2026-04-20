@@ -29,6 +29,7 @@ import copy
 import json
 import pickle
 import re
+import tempfile
 import time
 from pathlib import Path
 
@@ -41,8 +42,6 @@ from .sensitivity_probe import (
     FisherAccumulator,
     install_packed_expert_hooks,
     load_calibration,
-    load_probe_model_and_tokenizer,
-    resolve_execution_device,
     stage_text_only,
 )
 
@@ -150,18 +149,167 @@ def _load_into_mtp(mtp: MtpModule, raw: dict[str, torch.Tensor]):
     The HF `Qwen3_5MoeDecoderLayer` stores packed experts as 3D
     `mlp.experts.gate_up_proj` / `down_proj`, matching the checkpoint."""
     sd = mtp.state_dict()
+    params = dict(mtp.named_parameters())
     mapped: dict[str, torch.Tensor] = {}
     missing: list[str] = []
+    loaded_module_keys: set[str] = set()
+    packed_pat = re.compile(
+        r"^(layers\.\d+\.mlp\.experts)\.(\d+)\."
+        r"(gate_proj|up_proj|down_proj)\.weight$"
+    )
+
     for k, v in raw.items():
         if k in sd:
             mapped[k] = v
-        else:
+            loaded_module_keys.add(k)
+            continue
+
+        m = packed_pat.match(k)
+        if m is None:
             missing.append(k)
-    extra = [k for k in sd if k not in mapped]
-    # Load with strict=False so any HF-internal buffer (e.g. sparse
-    # expert state that we don't ship) doesn't break loading.
+            continue
+
+        prefix, expert_id_s, proj = m.groups()
+        expert_id = int(expert_id_s)
+        if proj == "down_proj":
+            packed_name = f"{prefix}.down_proj"
+            packed = params.get(packed_name)
+            if packed is None:
+                missing.append(k)
+                continue
+            packed.data[expert_id].copy_(v.to(device=packed.device, dtype=packed.dtype))
+            loaded_module_keys.add(packed_name)
+            continue
+
+        packed_name = f"{prefix}.gate_up_proj"
+        packed = params.get(packed_name)
+        if packed is None:
+            missing.append(k)
+            continue
+        rows = v.shape[0]
+        start = 0 if proj == "gate_proj" else rows
+        packed.data[expert_id, start:start + rows].copy_(
+            v.to(device=packed.device, dtype=packed.dtype)
+        )
+        loaded_module_keys.add(packed_name)
+
+    # Load exact-name tensors through state_dict for everything that isn't
+    # a packed expert tensor we filled manually above.
     mtp.load_state_dict(mapped, strict=False)
+    extra = [k for k in sd if k not in loaded_module_keys]
     return missing, extra
+
+
+def _stream_body_hidden_states(model_path: str,
+                               calib: torch.Tensor,
+                               *,
+                               device: torch.device,
+                               dtype: torch.dtype,
+                               offload_folder: str | None = None):
+    """Incrementally materialize the frozen body and return
+    `(model, base_model, inputs_embeds_cpu, final_hidden_cpu)`.
+
+    This deliberately avoids the legacy full-model `from_pretrained(..., device_map=cuda)`
+    path. Decoder layers live on disk and are streamed one at a time.
+    """
+    from accelerate import init_empty_weights
+    from accelerate.hooks import remove_hook_from_module
+    from transformers import AutoConfig, AutoModelForCausalLM
+    from .layer_streaming import (
+        _build_install_resolver,
+        _build_weight_map,
+        _call_layer,
+        _compute_position_embeddings,
+        _fast_install,
+        _get_layer_list,
+        _head_prefixes,
+        _make_causal_mask,
+        _read_layer_to_device,
+        _resolve_base_prefix,
+        _unload,
+    )
+
+    staged = stage_text_only(model_path)
+    config = AutoConfig.from_pretrained(staged, trust_remote_code=True)
+
+    with init_empty_weights():
+        skeleton = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+    skel_base, skel_layers = _get_layer_list(skeleton)
+    base_prefix = _resolve_base_prefix(skeleton, skel_base)
+    num_layers = len(skel_layers)
+    del skeleton, skel_base, skel_layers
+
+    base = base_prefix if base_prefix else ""
+    device_map: dict[str, object] = {}
+    resident_device = 0 if device.type == "cuda" else "cpu"
+    for pfx in (f"{base}.embed_tokens" if base else "embed_tokens",
+                f"{base}.norm" if base else "norm",
+                f"{base}.rotary_emb" if base else "rotary_emb",
+                "lm_head"):
+        device_map[pfx] = resident_device
+    for L in range(num_layers):
+        device_map[f"{base}.layers.{L}" if base else f"layers.{L}"] = "disk"
+
+    if offload_folder is None:
+        offload_folder = tempfile.mkdtemp(prefix="prismquant_mtp_stream_")
+    Path(offload_folder).mkdir(parents=True, exist_ok=True)
+
+    model = AutoModelForCausalLM.from_pretrained(
+        staged,
+        torch_dtype=dtype,
+        device_map=device_map,
+        trust_remote_code=True,
+        low_cpu_mem_usage=True,
+        offload_folder=offload_folder,
+        offload_buffers=True,
+    )
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
+    base_model, layers = _get_layer_list(model)
+    for L in range(num_layers):
+        remove_hook_from_module(layers[L], recurse=True)
+
+    layers_prefix = f"{base_prefix}.layers." if base_prefix else "layers."
+    for L in range(num_layers):
+        _unload(model, [f"{layers_prefix}{L}."])
+
+    weight_shard, weight_ckpt = _build_weight_map(model_path)
+    install_resolvers = [
+        _build_install_resolver(model, f"{layers_prefix}{L}".rstrip("."))
+        for L in range(num_layers)
+    ]
+
+    ids = calib.to(device)
+    position_ids = torch.arange(calib.size(-1), device=device).unsqueeze(0)
+    with torch.no_grad():
+        inputs_embeds = base_model.embed_tokens(ids).to(dtype)
+        hidden = inputs_embeds
+    causal_mask = _make_causal_mask(calib.size(-1), device, dtype)
+    position_embeddings = _compute_position_embeddings(
+        base_model, hidden, position_ids
+    )
+
+    for L in range(num_layers):
+        prefix = f"{layers_prefix}{L}."
+        tensors = _read_layer_to_device(prefix, weight_shard, weight_ckpt, dtype, device)
+        _fast_install(install_resolvers[L], tensors, device, model=model)
+        with torch.no_grad():
+            hidden = _call_layer(
+                layers[L],
+                hidden,
+                position_embeddings=position_embeddings,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+            )
+        _unload(model, [prefix])
+        del tensors
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    with torch.no_grad():
+        final_hidden = base_model.norm(hidden)
+    return model, base_model, inputs_embeds.detach().cpu(), final_hidden.detach().cpu()
 
 
 # ---------------------------------------------------------------------------
@@ -224,15 +372,22 @@ def run_mtp_probe(model_path: str,
                   dtype: torch.dtype,
                   output_path: str,
                   activation_cache_dir: str | None,
-                  importance_weighting: bool):
-    staged, tokenizer, body_model, exec_device, load_device_map = \
-        load_probe_model_and_tokenizer(
-            model_path,
-            requested_device=device,
-            dtype=dtype,
-            device_map=device,
-            gradient_checkpointing=False,
-        )
+                  importance_weighting: bool,
+                  offload_folder: str | None = None):
+    from transformers import AutoTokenizer
+
+    exec_device = torch.device(device)
+    staged = stage_text_only(model_path)
+    tokenizer = AutoTokenizer.from_pretrained(staged, trust_remote_code=True)
+    calib = load_calibration(tokenizer, dataset, nsamples, seqlen)
+    body_model, base_model, embeds_cpu, body_hidden_cpu = _stream_body_hidden_states(
+        model_path,
+        calib,
+        device=exec_device,
+        dtype=dtype,
+        offload_folder=offload_folder,
+    )
+    load_device_map = "streaming-layerwise"
 
     # 1. Build MTP module from body's text_config, wrapped so every
     # child is reachable as `mtp.<path>` — matching the checkpoint's
@@ -283,8 +438,6 @@ def run_mtp_probe(model_path: str,
         cache_dir.mkdir(parents=True, exist_ok=True)
     acc = FisherAccumulator(mtp_wrapper, tracked, expert_info, cache_dir)
 
-    # 6. Prepare calibration.
-    calib = load_calibration(tokenizer, dataset, nsamples, seqlen)
     print(f"[mtp-probe] calibration shape: {tuple(calib.shape)}", flush=True)
 
     # 7. Fetch lm_head (tied / untied, via body model).
@@ -295,12 +448,8 @@ def run_mtp_probe(model_path: str,
     for i in range(calib.size(0)):
         ids = calib[i:i + 1].to(exec_device)
         t0 = time.time()
-
-        # Body forward under no_grad to get hidden states and cached
-        # position embeddings. The MTP loss is local to MTP weights;
-        # we don't need grads to propagate back into the body.
-        embed, body_hidden, pos_emb, causal_mask, text_pos = \
-            _run_body_forward_for_hidden_states(body_model, ids, exec_device)
+        embed = embeds_cpu[i:i + 1].to(exec_device, dtype=dtype)
+        body_hidden = body_hidden_cpu[i:i + 1].to(exec_device, dtype=dtype)
 
         # MTP input token embedding is shifted by +1 relative to the
         # hidden state input (MTP predicts token t+2 from hidden_t and
@@ -323,7 +472,7 @@ def run_mtp_probe(model_path: str,
         )
         # Rotary emb requires a 4-axis position_ids with rank 3 (axes 0=text, 1/2/3=spatial).
         rot_pos = trimmed_pos_ids.view(1, B, T2).expand(3, B, T2)
-        pos_emb_t2 = body_model.model.rotary_emb(shifted_embed, rot_pos)
+        pos_emb_t2 = base_model.rotary_emb(shifted_embed, rot_pos)
 
         # Mark that hidden states need grad (for Fisher hook capture).
         shifted_hidden = shifted_hidden.detach().requires_grad_(True)
@@ -387,6 +536,7 @@ def run_mtp_probe(model_path: str,
                 "seqlen": seqlen,
                 "dtype": str(dtype),
                 "device": device,
+                "device_map": load_device_map,
                 "mtp_probe": True,
                 "mtp_objective": "CE(lm_head(MTP(embed_{t+1}, body_hidden_t)), ids_{t+2})",
             },
@@ -407,6 +557,9 @@ def main():
     ap.add_argument("--importance-weighting", action="store_true", default=True)
     ap.add_argument("--no-importance-weighting", action="store_false",
                     dest="importance_weighting")
+    ap.add_argument("--offload-folder", default=None,
+                    help="Optional disk offload folder passed through to "
+                         "load_probe_model_and_tokenizer.")
     args = ap.parse_args()
 
     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[args.dtype]
@@ -420,6 +573,7 @@ def main():
         output_path=args.output,
         activation_cache_dir=args.activation_cache_dir,
         importance_weighting=args.importance_weighting,
+        offload_folder=args.offload_folder,
     )
 
 

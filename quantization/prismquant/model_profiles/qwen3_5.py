@@ -30,6 +30,14 @@ import torch.nn as nn
 from .base import ModelProfile
 
 
+_QWEN3_5_FALLBACK_PACKED_MODULES = {
+    "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+    "gate_up_proj": ["gate_proj", "up_proj"],
+    "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
+    "in_proj_ba": ["in_proj_b", "in_proj_a"],
+}
+
+
 class Qwen3_5Profile(ModelProfile):
 
     @classmethod
@@ -54,6 +62,29 @@ class Qwen3_5Profile(ModelProfile):
         override `to_vllm_internal_name()` below to handle the MTP
         prefix specially."""
         return "Qwen3_5MoeForConditionalGeneration"
+
+    def fused_sibling_group(self, linear_qname: str) -> str | None:
+        """Return the canonical fused-module key for Qwen3.5/3.6 Linears.
+
+        Allocation often runs on a CPU-only host where vLLM is not
+        importable. In that environment the base implementation silently
+        loses the packed-module mapping and fused-sibling promotion is
+        skipped, which can produce mixed-format `linear_attn` groups that
+        vLLM cannot load. Keep a local fallback map so allocation remains
+        correct without vLLM in-process.
+        """
+        if self._fused_matcher is None:
+            self._ensure_vllm_class()
+            from .vllm_registry import (
+                fused_sibling_matcher_from_packed_mapping,
+                packed_modules_mapping_from_class,
+            )
+            pm = (
+                packed_modules_mapping_from_class(self._vllm_cls)
+                or _QWEN3_5_FALLBACK_PACKED_MODULES
+            )
+            self._fused_matcher = fused_sibling_matcher_from_packed_mapping(pm)
+        return self._fused_matcher(linear_qname)
 
     # ------------------------------------------------------------
     # MoE
@@ -190,7 +221,16 @@ class Qwen3_5Profile(ModelProfile):
                 or name.startswith("model.norm")
                 or name == "model"):
             name = "model.language_model." + name[len("model."):]
-        return super().to_vllm_internal_name(name)
+        mapped = super().to_vllm_internal_name(name)
+        # Fallback when vLLM isn't importable locally: preserve the
+        # expected scheme-dispatch names rather than returning the HF
+        # checkpoint names unchanged.
+        if mapped == name:
+            if name.startswith("model.language_model."):
+                return "language_model.model." + name[len("model.language_model."):]
+            if name.startswith("model.visual."):
+                return name[len("model."):]
+        return mapped
 
     # ------------------------------------------------------------
     # Source passthrough + staging

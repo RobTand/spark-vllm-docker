@@ -60,6 +60,8 @@ import torch.nn as nn
 from safetensors.torch import save_file
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from .model_profiles.qwen3_5 import Qwen3_5Profile
+
 # ---------------------------------------------------------------------------
 # NVFP4 packing (inlined from compressed-tensors fp4_quantized.py to avoid
 # importing the library's __init__ which pulls in transformers internals
@@ -68,6 +70,35 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 FLOAT_TO_E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
 NVFP4_MAX = 6.0     # max(|FLOAT_TO_E2M1|)
 FP8_E4M3_MAX = 448.0  # max representable in torch.float8_e4m3fn
+
+# Back-compat exports for unit tests that validate the Qwen3.5 naming
+# and per-expert catch-all contract via the historical helper symbols.
+_COMPAT_QWEN_PROFILE = Qwen3_5Profile()
+PER_EXPERT_MOE_REGEX = _COMPAT_QWEN_PROFILE.per_expert_moe_regex()
+
+
+def _to_vllm_internal_name(checkpoint_name: str) -> str:
+    """Compatibility helper kept for unit tests.
+
+    The production path is profile-driven via `profile.to_vllm_internal_name`;
+    this helper preserves the historical Qwen3.5/3.6 mapping semantics
+    without depending on a local vLLM install.
+    """
+    name = checkpoint_name
+    if name.startswith("mtp."):
+        return name
+    if name == "lm_head":
+        return "language_model.lm_head"
+    if name.startswith("model.visual."):
+        return name[len("model."):]
+    if name.startswith("model.language_model."):
+        return "language_model.model." + name[len("model.language_model."):]
+    if (name.startswith("model.layers.")
+            or name.startswith("model.embed_tokens")
+            or name.startswith("model.norm")
+            or name == "model"):
+        return "language_model.model." + name[len("model."):]
+    return name
 
 
 def _nvfp4_codebook(device, dtype=torch.float32) -> torch.Tensor:
@@ -464,10 +495,8 @@ def _quantize_2d(
     scale shared across all siblings. vLLM warns when sibling scales
     differ and reports degraded accuracy; sharing avoids both.
 
-    `fmt = MXFP8` is routed to vLLM's CompressedTensorsW8A8Fp8 path
-    (per-channel FP8 + dynamic-token activations) — the closest 8-bit
-    format that the version of compressed-tensors vLLM is pinned
-    against actually serves natively.
+    `fmt = MXFP8` emits real MXFP8 tensors: fp8_e4m3fn weights plus
+    E8M0 uint8 per-group scales (group_size=32).
     """
     if fmt == "NVFP4":
         wp, ws, wg = quantize_dequantize_nvfp4(
@@ -488,10 +517,7 @@ def _quantize_2d(
             ),
         }
     if fmt == "MXFP8":
-        # FP8 W8A8 dynamic per-channel — naming `weight` (not `weight_packed`)
-        # because vLLM's CompressedTensorsW8A8Fp8 looks for the standard
-        # `weight` tensor in fp8 dtype rather than a packed-uint8 form.
-        w, ws = quantize_dequantize_fp8_dynamic(weight)
+        w, ws = quantize_dequantize_mxfp8(weight, group_size=32)
         return {"weight": w, "weight_scale": ws}
     if fmt == "BF16":
         return {"weight": weight.to(torch.bfloat16)}
@@ -517,8 +543,7 @@ def _quantize_3d_packed(packed: torch.Tensor, fmt: str) -> dict[str, torch.Tenso
             "weight_global_scale": wg,
         }
     if fmt == "MXFP8":
-        # Per-expert FP8 W8A8 dynamic per-channel for packed MoE.
-        w, ws = quantize_dequantize_fp8_dynamic_packed(packed)
+        w, ws = quantize_dequantize_mxfp8_packed(packed, group_size=32)
         return {"weight": w, "weight_scale": ws}
     raise ValueError(f"unsupported format for packed-MoE: {fmt}")
 
@@ -727,20 +752,22 @@ NVFP4_SCHEME = {
         "zp_dtype": "torch.float8_e4m3fn",
     },
 }
-# FP8 dynamic per-channel — vLLM serves this via CompressedTensorsW8A8Fp8.
-# Stand-in for MXFP8 (no compressed-tensors-MXFP8 in the version vLLM is
-# pinned against). Same 8-bit bit-budget; per-channel scale instead of
-# per-group E8M0; dynamic-token activation instead of dynamic-group.
-FP8_DYNAMIC_SCHEME = {
-    "format": "float-quantized",
+MXFP8_SCHEME = {
+    "format": "mxfp8-quantized",
     "weights": {
-        "num_bits": 8, "type": "float", "strategy": "channel",
+        "num_bits": 8, "type": "float", "strategy": "group",
+        "group_size": 32,
         "symmetric": True, "dynamic": False,
+        "scale_dtype": "torch.uint8",
+        "zp_dtype": "torch.uint8",
         "observer": "memoryless_minmax",
     },
     "input_activations": {
-        "num_bits": 8, "type": "float", "strategy": "token",
+        "num_bits": 8, "type": "float", "strategy": "group",
+        "group_size": 32,
         "symmetric": True, "dynamic": True,
+        "scale_dtype": "torch.uint8",
+        "zp_dtype": "torch.uint8",
     },
 }
 def _bf16_packed_expert_ignore_regex(
@@ -827,13 +854,7 @@ def _bf16_packed_expert_ignore_regex(
 
 FORMAT_SCHEME = {
     "NVFP4": NVFP4_SCHEME,
-    # Phase 1: route MXFP8 recipe entries through FP8_DYNAMIC. The
-    # version of compressed-tensors that vLLM is pinned against does
-    # not ship an MXFP8 dispatcher, so we fall back to the closest
-    # vLLM-supported 8-bit format. Recipes that picked MXFP8 will
-    # serve under the W8A8Fp8 path; quality is comparable for this
-    # bucket.
-    "MXFP8": FP8_DYNAMIC_SCHEME,
+    "MXFP8": MXFP8_SCHEME,
 }
 
 
@@ -1127,6 +1148,7 @@ def main():
     from .model_profiles import detect_profile as _detect
     main_profile = _detect(args.model)
     print(f"[export] model profile: {main_profile.name}", flush=True)
+    validate_mtp_assignment_coverage(args.model, assignment, main_profile)
 
     print("[export] materializing compressed tensors ...", flush=True)
     t0 = time.time()
@@ -1480,6 +1502,48 @@ def _copy_tokenizer(src_model: str, out_dir: Path) -> None:
         p = src / name
         if p.exists():
             shutil.copy2(p, out_dir / name)
+
+
+def _source_has_prefixed_weights(src_model: str, prefix: str) -> bool:
+    """Return True when the source safetensors index contains any key
+    beginning with `prefix`.
+
+    Export-time validation should use the index rather than a loaded HF
+    model because transformers intentionally drops `mtp.*` on load for
+    Qwen3.5/3.6, which would otherwise make missing recipe coverage look
+    benign.
+    """
+    idx_path = Path(src_model) / "model.safetensors.index.json"
+    if not idx_path.exists():
+        return False
+    with open(idx_path) as f:
+        weight_map = json.load(f).get("weight_map", {})
+    return any(k.startswith(prefix) for k in weight_map)
+
+
+def validate_mtp_assignment_coverage(src_model: str,
+                                     assignment: dict[str, str],
+                                     profile) -> None:
+    """Fail fast when an architecture with MTP source weights is being
+    exported without any allocator coverage for `mtp.*`.
+
+    Passing raw MTP weights through silently produces a checkpoint that
+    looks complete but violates PrismQuant's intended contract: MTP must
+    participate in the same probe/cost/allocation loop as the body. This
+    exact state was observed on Qwen3.5-122B where the body artifacts on
+    disk were generated without merged MTP probe/cost results.
+    """
+    if not profile.has_mtp():
+        return
+    if not _source_has_prefixed_weights(src_model, "mtp."):
+        return
+    if any(k.startswith("mtp.") for k in assignment):
+        return
+    raise RuntimeError(
+        "source checkpoint contains mtp.* weights but the allocator recipe "
+        "contains no mtp.* entries. Run mtp_probe + mtp_cost, merge them "
+        "into the body probe/cost artifacts, then rerun allocator/export."
+    )
 
 
 if __name__ == "__main__":
