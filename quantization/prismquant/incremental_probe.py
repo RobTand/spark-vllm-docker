@@ -566,9 +566,16 @@ def _run_body_streaming_shard(
         packed_grad_acc: dict[str, float] = {}
         packed_full_acc: dict[str, torch.Tensor] | None = (
             {} if h_detail_dir is not None else None)
+        # Reverse-sweep visits every layer (gradient chain-rule needs
+        # all of them), but Fisher stats should only be recorded for
+        # layers in this shard's scope. Skip the packed-expert install
+        # + stats merge when L is out-of-scope; backward still flows.
+        layer_in_scope = bool(tracked_here) or bool(
+            inc.search(f"{layers_prefix}{L}."))
         packed_meta = install_packed_expert_hooks(
             layers[L], accumulator=packed_grad_acc,
-            full_accumulator=packed_full_acc)
+            full_accumulator=packed_full_acc,
+        ) if layer_in_scope else {}
         layer_prefix = f"{layers_prefix}{L}."
         layer_packed_handles: list = []
         for key, md in packed_meta.items():
