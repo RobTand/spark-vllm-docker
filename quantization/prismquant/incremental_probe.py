@@ -333,9 +333,21 @@ def _run_body_streaming_shard(
         pref = f"{layers_prefix}{L}."
         layer_linear_names.append([n for n in all_tracked if n.startswith(pref)])
     total_tracked = sum(len(x) for x in layer_linear_names)
-    if total_tracked == 0:
+    # Linears not in any decoder layer (lm_head, root-level projections,
+    # visual/audio encoders wired into the model top-level) are resident
+    # on device during streaming. They still need Fisher hooks installed
+    # and stats recorded if the shard's regex matches them. We collect
+    # them here so the shard can install hooks around Phase-2 (whose
+    # chunked CE backward invokes lm_head) and skip Phase-3 when the
+    # shard is purely resident-scoped.
+    resident_linears: list[str] = [
+        n for n in all_tracked
+        if not any(n.startswith(f"{layers_prefix}{L}.") for L in range(num_layers))
+    ]
+    if total_tracked == 0 and not resident_linears:
         print(f"[incremental] shard has no Linears matching "
-              f"{linear_include!r} under {layers_prefix}*; writing empty pickle",
+              f"{linear_include!r} under {layers_prefix}* or model root; "
+              "writing empty pickle",
               flush=True)
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         with open(output_path, "wb") as f:
@@ -360,8 +372,9 @@ def _run_body_streaming_shard(
                 },
             }, f)
         return
-    print(f"[incremental] body shard: tracking {total_tracked} Linears "
+    print(f"[incremental] body shard: tracking {total_tracked} body Linears "
           f"across {sum(1 for x in layer_linear_names if x)} layers "
+          f"+ {len(resident_linears)} resident Linears "
           f"(include={linear_include!r})", flush=True)
 
     top_k = read_top_k(model, default=2)
@@ -418,6 +431,96 @@ def _run_body_streaming_shard(
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
+    # Install Fisher hooks on resident linears (lm_head, root projections)
+    # BEFORE Phase-2 runs: the chunked CE backward pass invokes
+    # `model.lm_head(...)` inside this block, so a forward+full-backward
+    # hook on the resident Linear naturally captures (inputs, grad_output)
+    # pairs and lets us accumulate the standard Linear Fisher:
+    #     grad_w = grad_out.t() @ x_in     → sum of grad_w^2 = Fisher diag
+    # The hook implementation mirrors the body loop below so downstream
+    # finalization + h-detail paths treat resident and body Linears
+    # identically.
+    resident_stats: dict[str, dict] = {}
+    resident_h_full: dict[str, torch.Tensor] = {}
+    resident_saved_inputs: dict[str, torch.Tensor] = {}
+    resident_handles: list = []
+    # Activation snapshot for resident linears feeds the cost stage's
+    # ActivationIndex just like body Linears — capture up to
+    # `input_rows_limit` rows of flattened inputs across the Phase-2
+    # chunk loop.
+    resident_act_snaps: dict[str, list[torch.Tensor]] = defaultdict(list)
+    resident_act_rows: dict[str, int] = defaultdict(int)
+    resident_input_rows_limit = 256
+    _resident_cache_dir = Path(activation_cache_dir) if activation_cache_dir else None
+    if _resident_cache_dir is not None:
+        _resident_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def _make_resident_fwd(name: str):
+        def hook(module, inp, out):
+            x = inp[0] if isinstance(inp, tuple) else inp
+            resident_saved_inputs[name] = x.detach()
+            if _resident_cache_dir is not None:
+                need = resident_input_rows_limit - resident_act_rows[name]
+                if need > 0:
+                    flat = x.detach().reshape(-1, x.size(-1))
+                    if flat.size(0) > need:
+                        idx = torch.randperm(flat.size(0), device=flat.device)[:need]
+                        flat = flat.index_select(0, idx)
+                    resident_act_snaps[name].append(flat.to("cpu"))
+                    resident_act_rows[name] += flat.size(0)
+        return hook
+
+    def _make_resident_bwd(name: str, mod_ref: nn.Linear):
+        def hook(module, grad_input, grad_output):
+            gy = grad_output[0]
+            x = resident_saved_inputs.pop(name, None)
+            if x is None or gy is None:
+                return
+            gy2 = gy.reshape(-1, gy.size(-1))
+            x2 = x.reshape(-1, x.size(-1))
+            grad_w = gy2.t() @ x2
+            grad_w_sq = grad_w.pow(2)
+            acc = resident_h_full.get(name)
+            if acc is None:
+                acc = torch.zeros(
+                    grad_w.shape[0], grad_w.shape[1],
+                    dtype=torch.float32, device="cpu")
+                resident_h_full[name] = acc
+            acc.add_(grad_w_sq.float().to("cpu"))
+            resident_stats[name]["h_trace_raw"] += float(grad_w_sq.sum().item())
+            w = mod_ref.weight
+            if w is not None and not w.is_meta:
+                resident_stats[name]["h_w2_sum_raw"] += float(
+                    (grad_w_sq * w.detach().pow(2)).sum().item())
+            resident_stats[name]["n_tokens_seen"] += x2.size(0)
+        return hook
+
+    for fqn in resident_linears:
+        mod = model.get_submodule(fqn)
+        if not isinstance(mod, nn.Linear):
+            continue
+        w = mod.weight
+        if w.is_meta:
+            continue
+        resident_stats[fqn] = {
+            "h_trace_raw": 0.0,
+            "h_w2_sum_raw": 0.0,
+            "w_max_abs": float(w.detach().abs().max().item()),
+            "w_norm_sq": float(w.detach().pow(2).sum().item()),
+            "n_params": int(w.numel()),
+            "in_features": mod.in_features,
+            "out_features": mod.out_features,
+            "n_tokens_seen": 0,
+            "route_prob": None,
+            "router_path": None,
+            "expert_id": None,
+        }
+        for p in mod.parameters():
+            p.requires_grad_(True)
+        resident_handles.append(mod.register_forward_hook(_make_resident_fwd(fqn)))
+        resident_handles.append(
+            mod.register_full_backward_hook(_make_resident_bwd(fqn, mod)))
+
     t_phase = time.time()
     final_hidden = activations_cpu[-1].to(device).to(dtype).requires_grad_(True)
     norm_out = base_model.norm(final_hidden)
@@ -444,6 +547,8 @@ def _run_body_streaming_shard(
     else:
         ce_mean = None
 
+    # Phase-2 chunked CE backward through lm_head (via norm_out_d) — if
+    # resident hooks are installed, each chunk's backward populates them.
     for start in range(0, T - 1, chunk_T):
         end = min(start + chunk_T, T)
         cut = end - 1 - start if end >= T else end - start
@@ -464,19 +569,31 @@ def _run_body_streaming_shard(
         del preds, lp_c, tok_ce, chunk_loss, g
     norm_out.backward(grad_buf)
     grad_at_tail = final_hidden.grad.detach().clone()
+    # Remove resident hooks now that Phase-2 is complete — Phase-3 reverse
+    # sweep does not re-invoke lm_head, so keeping them live would only
+    # risk double-counting if anything downstream touched the module.
+    for h in resident_handles:
+        h.remove()
+    resident_handles.clear()
+    resident_saved_inputs.clear()
     del grad_buf, norm_out, norm_out_d, final_hidden
     gc.collect()
     if device.type == "cuda":
         torch.cuda.empty_cache()
-    print(f"[incremental] phase-2 loss+head bwd: {time.time()-t_phase:.1f}s",
+    print(f"[incremental] phase-2 loss+head bwd: {time.time()-t_phase:.1f}s  "
+          f"(resident stats collected: {len(resident_stats)})",
           flush=True)
 
-    # ---- Phase 3: reverse sweep, Fisher collection only on tracked Linears ----
-    t_phase = time.time()
-    grad_out = grad_at_tail
-    for d in range(prefetch_depth):
-        ctx.schedule_prefetch(num_layers - 1 - d)
+    # Fold resident Fisher stats + H-diag into the main accumulators so
+    # downstream finalization / h-detail / pickle write paths are agnostic
+    # to whether a Linear was body-scoped or resident.
+    for fqn, s in resident_stats.items():
+        merged_stats[fqn] = dict(s)
+    for fqn, h in resident_h_full.items():
+        merged_h_full[fqn] = h
 
+    # Activation snap accumulators (populated during Phase-3 for body
+    # Linears; resident snaps were populated during Phase-2 hooks above).
     activation_snaps: dict[str, list[torch.Tensor]] = defaultdict(list)
     activation_rows: dict[str, int] = defaultdict(int)
     input_rows_limit = 256
@@ -486,193 +603,210 @@ def _run_body_streaming_shard(
     packed_act_snaps: dict[str, list[torch.Tensor]] = defaultdict(list)
     packed_act_rows: dict[str, int] = defaultdict(int)
 
-    for L in reversed(range(num_layers)):
-        load_t0 = time.time()
-        src = ctx.install(L)
-        ctx.schedule_prefetch(L - prefetch_depth)
-        load_s = time.time() - load_t0
+    # Phase-3 reverse sweep runs only when this shard has body-scoped
+    # Linears. Pure resident-scoped shards (e.g. `^lm_head$`) skip it —
+    # Fisher for resident Linears was captured in Phase-2 above; the
+    # tail gradient was only needed to drive the sweep over decoder
+    # layers, which has no resident Linears to measure.
+    if total_tracked == 0:
+        print(f"[incremental] shard has only resident Linears "
+              f"(n={len(resident_linears)}); skipping Phase-3 reverse sweep",
+              flush=True)
+        del activations_cpu, grad_at_tail
+    else:
+        # ---- Phase 3: reverse sweep, Fisher collection only on tracked Linears ----
+        t_phase = time.time()
+        grad_out = grad_at_tail
+        for d in range(prefetch_depth):
+            ctx.schedule_prefetch(num_layers - 1 - d)
 
-        tracked_here = layer_linear_names[L]
-        acc_h_full: dict[str, torch.Tensor] = {}
-        acc_stats: dict[str, dict] = {}
-        saved_inputs: dict[str, torch.Tensor] = {}
-        handles: list = []
+        for L in reversed(range(num_layers)):
+            load_t0 = time.time()
+            src = ctx.install(L)
+            ctx.schedule_prefetch(L - prefetch_depth)
+            load_s = time.time() - load_t0
 
-        def make_fwd(name: str):
-            def hook(module, inp, out):
-                x = inp[0] if isinstance(inp, tuple) else inp
-                saved_inputs[name] = x.detach()
+            tracked_here = layer_linear_names[L]
+            acc_h_full: dict[str, torch.Tensor] = {}
+            acc_stats: dict[str, dict] = {}
+            saved_inputs: dict[str, torch.Tensor] = {}
+            handles: list = []
+
+            def make_fwd(name: str):
+                def hook(module, inp, out):
+                    x = inp[0] if isinstance(inp, tuple) else inp
+                    saved_inputs[name] = x.detach()
+                    if cache_dir is not None:
+                        need = input_rows_limit - activation_rows[name]
+                        if need > 0:
+                            flat = x.detach().reshape(-1, x.size(-1))
+                            if flat.size(0) > need:
+                                idx = torch.randperm(flat.size(0), device=flat.device)[:need]
+                                flat = flat.index_select(0, idx)
+                            activation_snaps[name].append(flat.to("cpu"))
+                            activation_rows[name] += flat.size(0)
+                return hook
+
+            def make_bwd(name: str, mod_ref: nn.Linear):
+                def hook(module, grad_input, grad_output):
+                    gy = grad_output[0]
+                    x = saved_inputs.pop(name, None)
+                    if x is None or gy is None:
+                        return
+                    gy2 = gy.reshape(-1, gy.size(-1))
+                    x2 = x.reshape(-1, x.size(-1))
+                    grad_w = gy2.t() @ x2
+                    grad_w_sq = grad_w.pow(2)
+                    acc = acc_h_full.get(name)
+                    if acc is None:
+                        acc = torch.zeros(
+                            grad_w.shape[0], grad_w.shape[1],
+                            dtype=torch.float32, device="cpu")
+                        acc_h_full[name] = acc
+                    acc.add_(grad_w_sq.float().to("cpu"))
+                    acc_stats[name]["h_trace_raw"] += float(grad_w_sq.sum().item())
+                    w = mod_ref.weight
+                    if w is not None and not w.is_meta:
+                        acc_stats[name]["h_w2_sum_raw"] += float(
+                            (grad_w_sq * w.detach().pow(2)).sum().item())
+                    acc_stats[name]["n_tokens_seen"] += x2.size(0)
+                return hook
+
+            for fqn in tracked_here:
+                mod = model.get_submodule(fqn)
+                if not isinstance(mod, nn.Linear):
+                    continue
+                w = mod.weight
+                if w.is_meta:
+                    continue
+                acc_stats[fqn] = {
+                    "h_trace_raw": 0.0,
+                    "h_w2_sum_raw": 0.0,
+                    "w_max_abs": float(w.detach().abs().max().item()),
+                    "w_norm_sq": float(w.detach().pow(2).sum().item()),
+                    "n_params": int(w.numel()),
+                    "in_features": mod.in_features,
+                    "out_features": mod.out_features,
+                    "n_tokens_seen": 0,
+                    "route_prob": None,
+                    "router_path": None,
+                    "expert_id": None,
+                }
+                for p in mod.parameters():
+                    p.requires_grad_(True)
+                handles.append(mod.register_forward_hook(make_fwd(fqn)))
+                handles.append(mod.register_full_backward_hook(make_bwd(fqn, mod)))
+
+            packed_grad_acc: dict[str, float] = {}
+            packed_full_acc: dict[str, torch.Tensor] | None = (
+                {} if h_detail_dir is not None else None)
+            # Reverse-sweep visits every layer (gradient chain-rule needs
+            # all of them), but Fisher stats should only be recorded for
+            # layers in this shard's scope. Skip the packed-expert install
+            # + stats merge when L is out-of-scope; backward still flows.
+            layer_in_scope = bool(tracked_here) or bool(
+                inc.search(f"{layers_prefix}{L}."))
+            packed_meta = install_packed_expert_hooks(
+                layers[L], accumulator=packed_grad_acc,
+                full_accumulator=packed_full_acc,
+            ) if layer_in_scope else {}
+            layer_prefix = f"{layers_prefix}{L}."
+            layer_packed_handles: list = []
+            for key, md in packed_meta.items():
+                full_key = f"{layer_prefix}{key}"
+                experts_qname_rel = md["_packed_experts_module"]
+                md["_packed_experts_module"] = f"{layer_prefix}{experts_qname_rel}"
+                acc_stats[full_key] = md
+                # Capture activations for the packed-experts module so the
+                # allocator can use the same input cache as nn.Linear entries.
                 if cache_dir is not None:
-                    need = input_rows_limit - activation_rows[name]
-                    if need > 0:
-                        flat = x.detach().reshape(-1, x.size(-1))
-                        if flat.size(0) > need:
-                            idx = torch.randperm(flat.size(0), device=flat.device)[:need]
-                            flat = flat.index_select(0, idx)
-                        activation_snaps[name].append(flat.to("cpu"))
-                        activation_rows[name] += flat.size(0)
-            return hook
+                    try:
+                        experts_mod = layers[L].get_submodule(experts_qname_rel)
+                    except AttributeError:
+                        experts_mod = None
+                    if experts_mod is not None:
+                        experts_full = f"{layer_prefix}{experts_qname_rel}"
 
-        def make_bwd(name: str, mod_ref: nn.Linear):
-            def hook(module, grad_input, grad_output):
-                gy = grad_output[0]
-                x = saved_inputs.pop(name, None)
-                if x is None or gy is None:
-                    return
-                gy2 = gy.reshape(-1, gy.size(-1))
-                x2 = x.reshape(-1, x.size(-1))
-                grad_w = gy2.t() @ x2
-                grad_w_sq = grad_w.pow(2)
-                acc = acc_h_full.get(name)
-                if acc is None:
-                    acc = torch.zeros(
-                        grad_w.shape[0], grad_w.shape[1],
-                        dtype=torch.float32, device="cpu")
-                    acc_h_full[name] = acc
-                acc.add_(grad_w_sq.float().to("cpu"))
-                acc_stats[name]["h_trace_raw"] += float(grad_w_sq.sum().item())
-                w = mod_ref.weight
-                if w is not None and not w.is_meta:
-                    acc_stats[name]["h_w2_sum_raw"] += float(
-                        (grad_w_sq * w.detach().pow(2)).sum().item())
-                acc_stats[name]["n_tokens_seen"] += x2.size(0)
-            return hook
+                        def _exp_fwd(_mod, inp, _out,
+                                     _q=experts_full, _rows=packed_act_rows,
+                                     _snaps=packed_act_snaps,
+                                     _lim=input_rows_limit):
+                            x = inp[0] if isinstance(inp, tuple) else inp
+                            if isinstance(x, torch.Tensor):
+                                need = _lim - _rows[_q]
+                                if need > 0:
+                                    flat = x.detach().reshape(-1, x.size(-1))
+                                    if flat.size(0) > need:
+                                        idx = torch.randperm(flat.size(0), device=flat.device)[:need]
+                                        flat = flat.index_select(0, idx)
+                                    _snaps[_q].append(flat.to("cpu"))
+                                    _rows[_q] += flat.size(0)
 
-        for fqn in tracked_here:
-            mod = model.get_submodule(fqn)
-            if not isinstance(mod, nn.Linear):
-                continue
-            w = mod.weight
-            if w.is_meta:
-                continue
-            acc_stats[fqn] = {
-                "h_trace_raw": 0.0,
-                "h_w2_sum_raw": 0.0,
-                "w_max_abs": float(w.detach().abs().max().item()),
-                "w_norm_sq": float(w.detach().pow(2).sum().item()),
-                "n_params": int(w.numel()),
-                "in_features": mod.in_features,
-                "out_features": mod.out_features,
-                "n_tokens_seen": 0,
-                "route_prob": None,
-                "router_path": None,
-                "expert_id": None,
-            }
-            for p in mod.parameters():
-                p.requires_grad_(True)
-            handles.append(mod.register_forward_hook(make_fwd(fqn)))
-            handles.append(mod.register_full_backward_hook(make_bwd(fqn, mod)))
+                        layer_packed_handles.append(
+                            experts_mod.register_forward_hook(_exp_fwd))
 
-        packed_grad_acc: dict[str, float] = {}
-        packed_full_acc: dict[str, torch.Tensor] | None = (
-            {} if h_detail_dir is not None else None)
-        # Reverse-sweep visits every layer (gradient chain-rule needs
-        # all of them), but Fisher stats should only be recorded for
-        # layers in this shard's scope. Skip the packed-expert install
-        # + stats merge when L is out-of-scope; backward still flows.
-        layer_in_scope = bool(tracked_here) or bool(
-            inc.search(f"{layers_prefix}{L}."))
-        packed_meta = install_packed_expert_hooks(
-            layers[L], accumulator=packed_grad_acc,
-            full_accumulator=packed_full_acc,
-        ) if layer_in_scope else {}
-        layer_prefix = f"{layers_prefix}{L}."
-        layer_packed_handles: list = []
-        for key, md in packed_meta.items():
-            full_key = f"{layer_prefix}{key}"
-            experts_qname_rel = md["_packed_experts_module"]
-            md["_packed_experts_module"] = f"{layer_prefix}{experts_qname_rel}"
-            acc_stats[full_key] = md
-            # Capture activations for the packed-experts module so the
-            # allocator can use the same input cache as nn.Linear entries.
-            if cache_dir is not None:
-                try:
-                    experts_mod = layers[L].get_submodule(experts_qname_rel)
-                except AttributeError:
-                    experts_mod = None
-                if experts_mod is not None:
-                    experts_full = f"{layer_prefix}{experts_qname_rel}"
+            # Forward + backward for this layer with the full batch.
+            x_in = activations_cpu[L].to(device).to(dtype).detach().requires_grad_(True)
+            bwd_t0 = time.time()
+            out = _call_layer(
+                layers[L], x_in,
+                position_embeddings=position_embeddings,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+            )
+            out.backward(grad_out.to(device))
+            bwd_s = time.time() - bwd_t0
 
-                    def _exp_fwd(_mod, inp, _out,
-                                 _q=experts_full, _rows=packed_act_rows,
-                                 _snaps=packed_act_snaps,
-                                 _lim=input_rows_limit):
-                        x = inp[0] if isinstance(inp, tuple) else inp
-                        if isinstance(x, torch.Tensor):
-                            need = _lim - _rows[_q]
-                            if need > 0:
-                                flat = x.detach().reshape(-1, x.size(-1))
-                                if flat.size(0) > need:
-                                    idx = torch.randperm(flat.size(0), device=flat.device)[:need]
-                                    flat = flat.index_select(0, idx)
-                                _snaps[_q].append(flat.to("cpu"))
-                                _rows[_q] += flat.size(0)
-
-                    layer_packed_handles.append(
-                        experts_mod.register_forward_hook(_exp_fwd))
-
-        # Forward + backward for this layer with the full batch.
-        x_in = activations_cpu[L].to(device).to(dtype).detach().requires_grad_(True)
-        bwd_t0 = time.time()
-        out = _call_layer(
-            layers[L], x_in,
-            position_embeddings=position_embeddings,
-            attention_mask=causal_mask,
-            position_ids=position_ids,
-        )
-        out.backward(grad_out.to(device))
-        bwd_s = time.time() - bwd_t0
-
-        for local_key, raw in packed_grad_acc.items():
-            full_key = f"{layer_prefix}{local_key}"
-            if full_key in acc_stats:
-                acc_stats[full_key]["h_trace_raw"] += float(raw)
-                acc_stats[full_key]["n_tokens_seen"] = \
-                    acc_stats[full_key].get("n_tokens_seen", 0) + x_in.size(0) * x_in.size(1)
-
-        grad_out = x_in.grad.detach().clone().cpu()
-
-        for h in handles:
-            h.remove()
-        for h in layer_packed_handles:
-            h.remove()
-        for fqn, s in acc_stats.items():
-            prev = merged_stats.get(fqn)
-            if prev is None:
-                merged_stats[fqn] = dict(s)
-            else:
-                prev["h_trace_raw"] += s.get("h_trace_raw", 0.0)
-                prev["h_w2_sum_raw"] += s.get("h_w2_sum_raw", 0.0)
-                prev["n_tokens_seen"] += s.get("n_tokens_seen", 0)
-        for fqn, h in acc_h_full.items():
-            if fqn in merged_h_full:
-                merged_h_full[fqn].add_(h)
-            else:
-                merged_h_full[fqn] = h.clone()
-        if packed_full_acc:
-            detail_dir = Path(h_detail_dir)
-            detail_dir.mkdir(parents=True, exist_ok=True)
-            for local_key, tensor in packed_full_acc.items():
+            for local_key, raw in packed_grad_acc.items():
                 full_key = f"{layer_prefix}{local_key}"
-                fname = re.sub(r"[^A-Za-z0-9_-]", "__", full_key) + ".pt"
-                torch.save({"H": tensor, "name": full_key},
-                           detail_dir / fname)
-            packed_full_acc.clear()
+                if full_key in acc_stats:
+                    acc_stats[full_key]["h_trace_raw"] += float(raw)
+                    acc_stats[full_key]["n_tokens_seen"] = \
+                        acc_stats[full_key].get("n_tokens_seen", 0) + x_in.size(0) * x_in.size(1)
 
-        ctx.unload(L)
-        del x_in, out, saved_inputs, acc_stats, acc_h_full, handles
-        gc.collect()
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+            grad_out = x_in.grad.detach().clone().cpu()
 
-        if L % 8 == 0 or L == 0 or L == num_layers - 1:
-            print(f"[incremental] bwd L{L:02d}  src={src}  load={load_s:.2f}s  "
-                  f"bwd={bwd_s:.2f}s", flush=True)
+            for h in handles:
+                h.remove()
+            for h in layer_packed_handles:
+                h.remove()
+            for fqn, s in acc_stats.items():
+                prev = merged_stats.get(fqn)
+                if prev is None:
+                    merged_stats[fqn] = dict(s)
+                else:
+                    prev["h_trace_raw"] += s.get("h_trace_raw", 0.0)
+                    prev["h_w2_sum_raw"] += s.get("h_w2_sum_raw", 0.0)
+                    prev["n_tokens_seen"] += s.get("n_tokens_seen", 0)
+            for fqn, h in acc_h_full.items():
+                if fqn in merged_h_full:
+                    merged_h_full[fqn].add_(h)
+                else:
+                    merged_h_full[fqn] = h.clone()
+            if packed_full_acc:
+                detail_dir = Path(h_detail_dir)
+                detail_dir.mkdir(parents=True, exist_ok=True)
+                for local_key, tensor in packed_full_acc.items():
+                    full_key = f"{layer_prefix}{local_key}"
+                    fname = re.sub(r"[^A-Za-z0-9_-]", "__", full_key) + ".pt"
+                    torch.save({"H": tensor, "name": full_key},
+                               detail_dir / fname)
+                packed_full_acc.clear()
 
-    print(f"[incremental] phase-3 reverse sweep: {time.time()-t_phase:.1f}s  "
-          f"{ctx.layer_cache.summary()}", flush=True)
+            ctx.unload(L)
+            del x_in, out, saved_inputs, acc_stats, acc_h_full, handles
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
-    del activations_cpu, grad_at_tail, grad_out
+            if L % 8 == 0 or L == 0 or L == num_layers - 1:
+                print(f"[incremental] bwd L{L:02d}  src={src}  load={load_s:.2f}s  "
+                      f"bwd={bwd_s:.2f}s", flush=True)
+
+        print(f"[incremental] phase-3 reverse sweep: {time.time()-t_phase:.1f}s  "
+              f"{ctx.layer_cache.summary()}", flush=True)
+
+        del activations_cpu, grad_at_tail, grad_out
 
     # ---- Finalize ----
     for s in merged_stats.values():
@@ -702,6 +836,12 @@ def _run_body_streaming_shard(
             X = torch.cat(snaps, dim=0).to(torch.bfloat16).contiguous()
             fname = sub.sub("__", experts_qname) + ".pt"
             torch.save({"inputs": X, "name": experts_qname}, cache_dir / fname)
+        for name, snaps in resident_act_snaps.items():
+            if not snaps:
+                continue
+            X = torch.cat(snaps, dim=0).to(torch.bfloat16).contiguous()
+            fname = sub.sub("__", name) + ".pt"
+            torch.save({"inputs": X, "name": name}, cache_dir / fname)
 
     out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)

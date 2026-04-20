@@ -235,7 +235,8 @@ def _run_body_cost_shard(
 
     # Figure out which decoder layers (by index) this shard touches.
     # lm_head / purely-top-level shards don't need any decoder layer
-    # installed — their target is a resident module.
+    # installed — their target is a resident module already materialized
+    # at context setup.
     inc = re.compile(linear_include)
     body_layers_needed: set[int] = set()
     if shard_kind == "body":
@@ -249,6 +250,15 @@ def _run_body_cost_shard(
                     break
 
     # Pre-filter the target set to what actually matches this shard.
+    # target_names partitions into:
+    #   - body-layer-scoped Linears: matched via the shard regex and
+    #     covered by the install loop below.
+    #   - resident Linears (lm_head, root-level projections): matched
+    #     by the shard regex but with no decoder-layer prefix. They
+    #     are already resident on device from `_build_streaming_context`
+    #     (head modules were pinned with resident_device), so no install
+    #     is needed — `model.get_submodule(name)` during measurement
+    #     finds them directly.
     target_names: set[str] = {
         n for n in probe_stats if inc.search(n)
     }

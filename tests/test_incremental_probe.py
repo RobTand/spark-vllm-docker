@@ -188,6 +188,102 @@ class _DummyMtp(nn.Module):
         )
 
 
+class TestResidentLinearClassification(unittest.TestCase):
+    """Regression for the resident-linear bug: lm_head (and any other
+    root-level Linear not under a decoder-layer prefix) must NOT be
+    dropped by the per-layer bucketing in `_run_body_streaming_shard`.
+
+    The probe function is large and needs a full StreamingContext to
+    invoke, so rather than stand one up we replay the classification
+    logic in isolation — the same two lines that decide whether a
+    Linear gets a Fisher hook installed. A future failure in the body
+    would here mean `resident_linears` again returns `[]` for lm_head,
+    which is exactly what the original bug did.
+    """
+
+    def test_lm_head_classified_as_resident_not_body(self):
+        # Build a tiny fake model with decoder layers + a root lm_head.
+        class _Layer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.q_proj = nn.Linear(4, 4, bias=False)
+
+        class _FakeModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Module()
+                self.model.layers = nn.ModuleList([_Layer(), _Layer()])
+                self.lm_head = nn.Linear(4, 8, bias=False)
+
+        model = _FakeModel()
+        layers_prefix = "model.layers."
+        num_layers = 2
+        linear_include = r"^lm_head$"
+        linear_exclude = (
+            r"(?:mlp\.gate$|mlp\..*gate$|\.router(?:$|\.)|"
+            r"block_sparse_moe\.gate$)"
+        )
+
+        # Replay the exact classification from the probe shard runner.
+        inc = re.compile(linear_include)
+        exc = re.compile(linear_exclude)
+        all_linears = [
+            n for n, m in model.named_modules() if isinstance(m, nn.Linear)
+        ]
+        all_tracked = [n for n in all_linears
+                       if inc.search(n) and not exc.search(n)]
+        layer_linear_names = []
+        for L in range(num_layers):
+            pref = f"{layers_prefix}{L}."
+            layer_linear_names.append(
+                [n for n in all_tracked if n.startswith(pref)])
+        total_tracked = sum(len(x) for x in layer_linear_names)
+        resident_linears = [
+            n for n in all_tracked
+            if not any(
+                n.startswith(f"{layers_prefix}{L}.") for L in range(num_layers))
+        ]
+
+        # The original bug: lm_head is in all_tracked but falls into no
+        # layer bucket, so `total_tracked` was 0 and the shard wrote an
+        # empty pickle. The fix: resident_linears captures it so the
+        # shard runs Phase-2 with hooks installed.
+        self.assertIn("lm_head", all_tracked)
+        self.assertEqual(total_tracked, 0,
+                         "lm_head must not fall into any decoder-layer bucket")
+        self.assertEqual(resident_linears, ["lm_head"],
+                         "lm_head must be classified as resident so the "
+                         "shard does not early-return with an empty pickle")
+
+    def test_body_linear_classified_as_body_not_resident(self):
+        # Sanity check the other direction: a layer Linear must be
+        # bucketed into a body layer, not classified as resident.
+        class _Layer(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.q_proj = nn.Linear(4, 4, bias=False)
+
+        class _FakeModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.model = nn.Module()
+                self.model.layers = nn.ModuleList([_Layer()])
+                self.lm_head = nn.Linear(4, 8, bias=False)
+
+        model = _FakeModel()
+        inc = re.compile(r"model\.layers\.0\.")
+        all_linears = [
+            n for n, m in model.named_modules() if isinstance(m, nn.Linear)
+        ]
+        all_tracked = [n for n in all_linears if inc.search(n)]
+        resident_linears = [
+            n for n in all_tracked
+            if not n.startswith("model.layers.0.")
+        ]
+        self.assertEqual(all_tracked, ["model.layers.0.q_proj"])
+        self.assertEqual(resident_linears, [])
+
+
 class TestIncrementalProbeMtp(unittest.TestCase):
     """MTP shard helpers, previously tested in `test_mtp_probe.py`,
     folded in here because MTP is just a shard type in the unified
