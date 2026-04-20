@@ -12,11 +12,11 @@ on the matching Linears, writes a per-shard pickle, then unloads.
 
 MTP is folded in as a built-in shard kind: when `--include-mtp` (default
 True), a shard's regex like `^mtp\\.layers\\.0\\.` triggers synthesis
-of an `MtpModule` (via `mtp_probe.MtpModule`), loading of `mtp.*`
-safetensors (via `_load_into_mtp`), enumeration of targets (via
-`_collect_mtp_targets`), then the same measurement pipeline against
-the MTP activation cache (the probe writes those activations to the
-same `--activation-cache-dir` when its own `--include-mtp` was set).
+of an `MtpModule` (via `mtp_module.MtpModule`), loading of `mtp.*`
+safetensors (via `_load_into_mtp`), enumeration of MTP Linears + packed
+experts, then the same measurement pipeline against the MTP activation
+cache (the probe writes those activations to the same
+`--activation-cache-dir` when its own `--include-mtp` was set).
 
 Small models pay the no-op cost of a cache that can hold every layer
 resident; large models drain the cache to disk as needed. The per-shard
@@ -350,7 +350,7 @@ def _run_mtp_cost_shard(
     model_name: str,
     probe_path: str,
 ):
-    from .mtp_probe import MtpModule, _load_into_mtp, _load_mtp_state_dict
+    from .mtp_module import MtpModule, _load_into_mtp, _load_mtp_state_dict
 
     inc = re.compile(linear_include)
     # Prune the probe stats to this MTP shard's regex before building

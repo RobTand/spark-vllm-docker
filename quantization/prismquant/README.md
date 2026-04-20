@@ -354,23 +354,9 @@ export TARGET_BITS=4.75
 ./quantization/prismquant/run-pipeline.sh
 ```
 
-That runs probe → cost → allocator → native export.  Extend the probe
-to cover MTP heads:
-
-```bash
-python -m quantization.prismquant.mtp_probe \
-  --model $MODEL_PATH --nsamples 4 --seqlen 256 \
-  --activation-cache-dir $WORK_DIR/act_mtp \
-  --output $WORK_DIR/artifacts/mtp_probe.pkl
-
-python -m quantization.prismquant.mtp_cost \
-  --model $MODEL_PATH \
-  --activation-cache-dir $WORK_DIR/act_mtp \
-  --output $WORK_DIR/artifacts/mtp_cost.pkl
-```
-
-Merge the MTP probe / cost into the body artifacts (see
-`run-pipeline.sh`), re-run the allocator and exporter, then serve:
+That runs probe → cost → allocator → native export. MTP heads are
+covered automatically by the incremental probe / cost as a built-in
+shard; no separate commands are needed. Serve with:
 
 ```bash
 vllm serve $WORK_DIR/exported \
@@ -477,18 +463,20 @@ Outputs:
   or corrected on the current model. Emits per-format `gain` factors
   that the allocator re-reads via `--calibration`.
 
-#### 7. MTP extensions — `mtp_probe.py`, `mtp_cost.py`
+#### 7. MTP extensions — built into the incremental probe + cost
 
 Transformers v5 drops `mtp.*` weights on load (they're in the class's
 `_keys_to_ignore_on_load_unexpected`) because MTP is a vLLM-only
-feature. PrismQuant instantiates a standalone `MtpModule` (HF
-`Qwen3_5MoeDecoderLayer` plus the `pre_fc_norm_*`, `fc`, and `norm`
-exactly per vLLM's `Qwen3_5MultiTokenPredictor` forward), loads the
-MTP weights directly from safetensors, then runs the standard Fisher
-probe against the MTP auxiliary objective
+feature. PrismQuant instantiates a standalone `MtpModule`
+(`mtp_module.py`: HF `Qwen3_5MoeDecoderLayer` plus the `pre_fc_norm_*`,
+`fc`, and `norm` exactly per vLLM's `Qwen3_5MultiTokenPredictor`
+forward), loads the MTP weights directly from safetensors, then runs
+the standard Fisher probe against the MTP auxiliary objective
 
     loss = CE( lm_head( MTP(embed_{t+1}, body_hidden_t) ), ids_{t+2} )
 
+This happens inline in `incremental_probe.py` / `incremental_measure_quant_cost.py`
+as a built-in shard kind (on by default, toggle with `--no-include-mtp`).
 The allocator treats MTP Linears identically to body Linears — same
 cost model, same knapsack, same fused-sibling rules. At export time,
 MTP per-expert tensors are split and emitted with `mtp.layers.X.mlp.experts.Y.{gate|up|down}_proj.*`

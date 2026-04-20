@@ -1433,7 +1433,7 @@ def _materialize_mtp_tensors(src_model: str,
     `mtp.layers.0.<rest>`). vLLM's `qwen3_5_mtp.load_weights` remaps
     `mtp.→model.` at load time.
     """
-    from .mtp_probe import MtpModule, _load_into_mtp, _load_mtp_state_dict
+    from .mtp_module import MtpModule, _load_into_mtp, _load_mtp_state_dict
     from transformers import AutoConfig
 
     # Build an MTP wrapper with source weights.
@@ -1541,8 +1541,9 @@ def validate_mtp_assignment_coverage(src_model: str,
         return
     raise RuntimeError(
         "source checkpoint contains mtp.* weights but the allocator recipe "
-        "contains no mtp.* entries. Run mtp_probe + mtp_cost, merge them "
-        "into the body probe/cost artifacts, then rerun allocator/export."
+        "contains no mtp.* entries. Re-run the incremental probe + cost "
+        "with --include-mtp (the default) so mtp.* tensors are measured, "
+        "then rerun allocator/export."
     )
 
 

@@ -745,7 +745,7 @@ def _run_mtp_streaming_shard(
     prefetch_lookahead: int = 3,
 ):
     # Lazy import to avoid depending on transformers subpath at module load.
-    from .mtp_probe import MtpModule, _load_into_mtp, _load_mtp_state_dict
+    from .mtp_module import MtpModule, _load_into_mtp, _load_mtp_state_dict
 
     device = ctx.device
     dtype = ctx.dtype
