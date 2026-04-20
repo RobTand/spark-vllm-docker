@@ -58,7 +58,6 @@ Model-agnostic:
 """
 from __future__ import annotations
 
-import argparse
 import json
 import pickle
 import random
@@ -1323,88 +1322,3 @@ def run_probe_pass(model: nn.Module,
             },
         }, f)
     print(f"[probe] wrote {out_path}", flush=True)
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-def main():
-    ap = argparse.ArgumentParser(
-        description="Measure per-Linear sensitivity (Fisher trace) with "
-                    "route-aware MoE weighting and per-token importance.")
-    ap.add_argument("--model", required=True)
-    ap.add_argument("--dataset", default="ultrachat_200k",
-                    help="HF dataset name, or path to .jsonl/.txt")
-    ap.add_argument("--nsamples", type=int, default=32)
-    ap.add_argument("--seqlen", type=int, default=1024)
-    ap.add_argument("--device", default="cuda")
-    ap.add_argument("--device-map", default=None,
-                    help="HF from_pretrained device_map. Defaults to --device. "
-                         "Use 'auto' to allow CPU/GPU model sharding while still "
-                         "running the probe on the embedding device.")
-    ap.add_argument("--offload-folder", default=None,
-                    help="Directory accelerate may use to spill weights to "
-                         "disk under `device_map=auto` when the model is "
-                         "larger than RAM. Required for models that exceed "
-                         "total available memory (e.g. Qwen3.5-122B on Spark).")
-    ap.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
-    ap.add_argument("--output", required=True,
-                    help="Pickle with per-Linear stats")
-    ap.add_argument("--activation-cache-dir", default=None,
-                    help="Save per-Linear input activation snapshots here "
-                         "(for measure_quant_cost.py)")
-    ap.add_argument("--linear-include", default=".*")
-    ap.add_argument("--linear-exclude",
-                    # Routers stay BF16 — quantizing per-token routing
-                    # decisions is high-risk for negligible memory gain.
-                    # `lm_head` is intentionally NOT excluded; the
-                    # allocator can pick a sensible format for it.
-                    default=r"(?:mlp\.gate$|mlp\..*gate$|"
-                            r"\.router(?:$|\.)|"
-                            r"block_sparse_moe\.gate$)")
-    ap.add_argument("--gradient-checkpointing", action="store_true",
-                    default=True)
-    ap.add_argument("--no-gradient-checkpointing", action="store_false",
-                    dest="gradient_checkpointing")
-    ap.add_argument("--importance-weighting", action="store_true", default=True)
-    ap.add_argument("--no-importance-weighting", action="store_false",
-                    dest="importance_weighting")
-    args = ap.parse_args()
-
-    dtype = {"bf16": torch.bfloat16, "fp16": torch.float16,
-             "fp32": torch.float32}[args.dtype]
-
-    print(f"[probe] loading {args.model}", flush=True)
-    t0 = time.time()
-    _, tokenizer, model, exec_device, load_device_map = load_probe_model_and_tokenizer(
-        args.model,
-        requested_device=args.device,
-        dtype=dtype,
-        device_map=args.device_map,
-        gradient_checkpointing=args.gradient_checkpointing,
-        offload_folder=args.offload_folder,
-    )
-    print(f"[probe] loaded in {time.time()-t0:.1f}s", flush=True)
-
-    calib = load_calibration(tokenizer, args.dataset, args.nsamples, args.seqlen)
-    run_probe_pass(
-        model=model,
-        tokenizer=tokenizer,
-        calib=calib,
-        model_name=args.model,
-        dataset_name=args.dataset,
-        seqlen=args.seqlen,
-        dtype_name=args.dtype,
-        requested_device=args.device,
-        load_device_map=load_device_map,
-        exec_device=exec_device,
-        linear_include=args.linear_include,
-        linear_exclude=args.linear_exclude,
-        importance_weighting=args.importance_weighting,
-        activation_cache_dir=args.activation_cache_dir,
-        output_path=args.output,
-    )
-
-
-if __name__ == "__main__":
-    main()

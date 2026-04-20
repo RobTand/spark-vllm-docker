@@ -22,7 +22,6 @@ rel_output_mse}.
 """
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import pickle
@@ -673,16 +672,6 @@ def measure_batched_gpu(model: nn.Module, act_cache: "ActivationIndex",
     return _finalize_results(accum)
 
 
-def load_cost_model(model_path: str,
-                    device: str,
-                    dtype: torch.dtype,
-                    device_map: str | None = None) -> nn.Module:
-    t0 = time.time()
-    model = _load_live_model(model_path, device, dtype, device_map=device_map)
-    print(f"[cost] model loaded in {time.time()-t0:.1f}s", flush=True)
-    return model
-
-
 def prepare_cost_context(probe_path: str,
                          activation_cache_dir: str,
                          formats_csv: str,
@@ -788,79 +777,3 @@ def run_cost_pass(model: nn.Module,
         }, f)
     print(f"[cost] wrote {out_path} ({len(results)} Linears)")
     return results
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--model", required=True)
-    ap.add_argument("--probe", required=True)
-    ap.add_argument("--activation-cache-dir", required=True)
-    ap.add_argument("--output", required=True)
-    ap.add_argument("--device", default="cuda")
-    ap.add_argument("--device-map", default=None,
-                    help="HF from_pretrained device_map. Defaults to --device.")
-    ap.add_argument("--dtype", choices=["bf16", "fp16", "fp32"], default="bf16")
-    ap.add_argument("--formats", default="",
-                    help="Comma-separated format names. Empty = all registered.")
-    ap.add_argument("--skip-missing-activations", action="store_true")
-    ap.add_argument("--threads", type=int, default=0,
-                    help="torch.set_num_threads for CPU path.")
-    ap.add_argument("--mode", choices=["auto", "batched", "unbatched"],
-                    default="auto",
-                    help="'auto' chooses batched on CUDA, unbatched on CPU. "
-                         "'batched' groups same-shape Linears for one bmm per "
-                         "group. 'unbatched' processes one Linear at a time.")
-    ap.add_argument("--chunk-size", type=int, default=256,
-                    help="Linears per batched chunk. Trades latency for VRAM.")
-    ap.add_argument("--swap-grow-limit-mb", type=int, default=256,
-                    help="Abort if swap used grows by more than this "
-                         "(MB) versus watchdog baseline. 0 to disable.")
-    ap.add_argument("--min-mem-available-mb", type=int, default=2048,
-                    help="Abort if MemAvailable drops below this (MB).")
-    ap.add_argument("--no-watchdog", action="store_true",
-                    help="Disable the memory-pressure watchdog.")
-    args = ap.parse_args()
-
-    # Watchdog is armed AFTER model load — the baseline is the post-load
-    # steady state, so the limit only flags growth during measurement
-    # (e.g. a leak in the activation-loading path), not transient churn
-    # from HF weight-loading / MoE unfuse.
-
-    dtype = {"bf16": torch.bfloat16, "fp16": torch.float16,
-             "fp32": torch.float32}[args.dtype]
-    if args.threads > 0:
-        torch.set_num_threads(args.threads)
-
-    _, _, act_cache, target_names, missing_act, _, specs = prepare_cost_context(
-        probe_path=args.probe,
-        activation_cache_dir=args.activation_cache_dir,
-        formats_csv=args.formats,
-        skip_missing_activations=args.skip_missing_activations,
-    )
-    model = load_cost_model(args.model, args.device, dtype,
-                            device_map=args.device_map)
-
-    if not args.no_watchdog:
-        start_mem_watchdog(swap_grow_limit_mb=args.swap_grow_limit_mb,
-                           min_mem_available_mb=args.min_mem_available_mb)
-    run_cost_pass(
-        model=model,
-        act_cache=act_cache,
-        target_names=target_names,
-        missing_act=missing_act,
-        specs=specs,
-        model_name=args.model,
-        probe_path=args.probe,
-        device=args.device,
-        dtype=dtype,
-        mode=args.mode,
-        chunk_size=args.chunk_size,
-        output_path=args.output,
-    )
-
-
-if __name__ == "__main__":
-    main()
