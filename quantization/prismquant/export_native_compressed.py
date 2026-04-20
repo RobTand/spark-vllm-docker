@@ -528,6 +528,7 @@ def materialize_tensors(
     assignment: dict[str, str],
     *,
     bf16_passthrough: set[str],
+    profile: "ModelProfile | None" = None,
 ) -> tuple[dict[str, torch.Tensor], dict]:
     """Walk the model and produce the dict of on-disk tensors plus a
     histogram of (kind, format) counts.
@@ -538,9 +539,18 @@ def materialize_tensors(
       - a packed-experts parameter qualified name
         (e.g. `model.layers.0.mlp.experts.gate_up_proj`)
 
+    `profile.live_to_recipe_name` maps live HF-module qnames (which
+    may be `model.language_model.layers.X.*` for multimodal classes)
+    to the recipe naming the allocator emitted (flat
+    `model.layers.X.*` from the text-only probe).
+
     Anything not in `assignment` is written verbatim as a passthrough
     tensor (norms, embeddings, lm_head, biases, conv1d weights, etc.).
     """
+    from .model_profiles import DefaultProfile
+    profile = profile or DefaultProfile()
+    remap = profile.live_to_recipe_name
+
     out: dict[str, torch.Tensor] = {}
     hist = Counter()
     covered: set[str] = set()
@@ -554,18 +564,20 @@ def materialize_tensors(
     for qname, mod in model.named_modules():
         if not isinstance(mod, nn.Linear):
             continue
-        fmt_key = qname  # assignment uses module qname (no .weight)
+        # Allocator recipe uses text-only-probe naming. Multimodal
+        # classes give live qnames with a `language_model.` infix.
+        fmt_key = remap(qname)
         fmt = assignment.get(fmt_key)
         if fmt is None:
             continue
-        if fmt == "BF16" or qname in bf16_passthrough:
+        if fmt == "BF16" or fmt_key in bf16_passthrough:
             out[f"{qname}.weight"] = mod.weight.detach().to(torch.bfloat16).cpu()
             if mod.bias is not None:
                 out[f"{qname}.bias"] = mod.bias.detach().to(torch.bfloat16).cpu()
             covered.add(qname)
             hist[("linear", "BF16")] += 1
             continue
-        joint = nvfp4_joint_global.get(qname) if fmt == "NVFP4" else None
+        joint = nvfp4_joint_global.get(fmt_key) if fmt == "NVFP4" else None
         compressed = _quantize_2d(
             mod.weight.detach().float(), fmt,
             nvfp4_global_real_override=joint,
@@ -588,7 +600,9 @@ def materialize_tensors(
             continue
         for pn in _packed_experts_param_names(mod):
             full_name = f"{qname}.{pn}" if qname else pn
-            fmt = assignment.get(full_name)
+            # Recipe naming is text-only; live may have language_model infix.
+            recipe_key = remap(full_name)
+            fmt = assignment.get(recipe_key)
             if fmt is None:
                 continue
             packed_param = getattr(mod, pn).detach().float()  # [E, M, N]
@@ -605,12 +619,25 @@ def materialize_tensors(
             else:
                 proj_split = [(pn, packed_param)]
 
-            if fmt == "BF16" or full_name in bf16_passthrough:
-                # BF16 passthrough preserves the original packed tensor
-                # name + shape (vLLM handles fused tensors fine in bf16).
-                out[full_name] = packed_param.to(torch.bfloat16).cpu()
+            is_bf16 = fmt == "BF16" or full_name in bf16_passthrough
+            disk_qname = profile.on_disk_expert_qname(qname)
+            # Profile chooses per-expert split vs packed 3D per-format.
+            # See `ModelProfile.split_packed_experts_for_format` for why:
+            # quantized formats universally want per-expert splits (with
+            # compressed suffixes), while BF16 varies by vLLM loader
+            # (Gemma 4's explodes 3D internally, Qwen 3.5/3.6's fused-
+            # expert path accepts either). Default = split for non-BF16,
+            # keep packed for BF16 — matches every vLLM loader we've
+            # tested against.
+            should_split = profile.split_packed_experts_for_format(fmt)
+
+            if not should_split:
+                # Emit a single 3D packed tensor. vLLM's
+                # architecture-specific load_weights will handle
+                # remapping and exploding into per-expert shards.
+                out[f"{disk_qname}.{pn}"] = packed_param.to(torch.bfloat16).cpu()
                 covered.add(full_name)
-                hist[("packed_moe", "BF16")] += 1
+                hist[("packed_moe", "BF16" if is_bf16 else fmt)] += 1
                 continue
 
             # When `gate_up_proj` was split into gate+up, the two
@@ -633,16 +660,21 @@ def materialize_tensors(
                 E_p, Mp, Np = sub_packed.shape
                 for e in range(E_p):
                     expert_2d = sub_packed[e]  # [Mp, N]
-                    compressed = _quantize_2d(
-                        expert_2d, fmt,
-                        nvfp4_global_real_override=per_expert_joint[e],
-                    )
-                    base = f"{qname}.{e}.{proj_name}"
-                    for suffix, tensor in compressed.items():
-                        key = base if suffix == "weight" else f"{base}.{suffix}"
-                        out[key] = tensor.cpu()
+                    base = f"{disk_qname}.{e}.{proj_name}"
+                    if is_bf16:
+                        # BF16 but profile opted in to split (e.g. Qwen
+                        # 3.5/3.6 variant). Single `.weight` tensor.
+                        out[f"{base}.weight"] = expert_2d.to(torch.bfloat16).cpu()
+                    else:
+                        compressed = _quantize_2d(
+                            expert_2d, fmt,
+                            nvfp4_global_real_override=per_expert_joint[e],
+                        )
+                        for suffix, tensor in compressed.items():
+                            key = base if suffix == "weight" else f"{base}.{suffix}"
+                            out[key] = tensor.cpu()
             covered.add(full_name)
-            hist[("packed_moe_per_expert", fmt)] += 1
+            hist[("packed_moe_per_expert", "BF16" if is_bf16 else fmt)] += 1
 
     # 3. Passthrough — everything else (norms, embeddings, biases on
     # non-quantized modules, conv1d, lm_head if not in assignment).
@@ -653,6 +685,24 @@ def materialize_tensors(
             continue
         out[name] = p.detach().to(torch.bfloat16).cpu()
         hist[("passthrough", "BF16")] += 1
+
+    # 4. Persistent buffers — some architectures register learned
+    # scalars (e.g. Gemma 4's per-layer `layer_scalar`) that aren't
+    # in `named_parameters()` but are required at inference. Drop
+    # non-persistent buffers (e.g. rotary inv_freq caches, attention
+    # masks) that vLLM recomputes on load.
+    for mod_name, mod in model.named_modules():
+        non_persistent = getattr(mod, "_non_persistent_buffers_set", set())
+        for buf_name, buf in mod.named_buffers(recurse=False):
+            if buf_name in non_persistent:
+                continue
+            full = f"{mod_name}.{buf_name}" if mod_name else buf_name
+            if any(full.startswith(c + ".") or full == c for c in covered):
+                continue
+            if full in out:
+                continue
+            out[full] = buf.detach().to(torch.bfloat16).cpu()
+            hist[("passthrough_buffer", "BF16")] += 1
 
     return out, dict(hist)
 
@@ -693,6 +743,88 @@ FP8_DYNAMIC_SCHEME = {
         "symmetric": True, "dynamic": True,
     },
 }
+def _bf16_packed_expert_ignore_regex(
+        recipe_key: str,
+        profile,
+) -> list[str]:
+    """If `recipe_key` names a BF16 packed-MoE tensor
+    (`...experts.gate_up_proj` or `...experts.down_proj`), return one or
+    more regex strings that match the corresponding per-expert Linear
+    qnames at scheme-dispatch time, so vLLM's `find_matched_target`
+    routes them to `ignore` instead of a config_groups target.
+
+    For `gate_up_proj` we emit two patterns (one for `gate_proj`, one
+    for `up_proj`) because the packed tensor splits into both at
+    materialize time. Returns `[]` if the recipe_key doesn't look
+    like a packed-expert entry or the profile has no vLLM class to
+    derive naming from."""
+    import re as _re
+
+    # Does this recipe key name a packed-expert tensor?
+    m = _re.match(r"^(.*\.)(experts)\.(gate_up_proj|down_proj|w\d|gate_proj|up_proj)$",
+                  recipe_key)
+    if not m:
+        return []
+    parent = m.group(1)          # `model.layers.X.`  or `model.layers.X.moe.`
+    pn = m.group(3)
+
+    # Convert the recipe parent prefix to a live-model prefix by
+    # asking the profile. `profile.live_to_recipe_name` is the
+    # opposite direction, so we'd need its inverse — instead emit a
+    # regex loose enough to match both live forms on both sides of
+    # the remap (text-only-style `...layers.X.experts.Y.*` and
+    # multimodal `language_model.model.layers.X.moe.experts.Y.*`).
+    # The profile's `per_expert_moe_regex` already encodes the live
+    # form; we narrow it to this specific layer by pinning the layer
+    # index.
+    layer_idx = None
+    lm = _re.search(r"\.layers\.(\d+)\.", recipe_key)
+    if lm:
+        layer_idx = lm.group(1)
+    # Build per-proj regex. `gate_up_proj` splits into `gate_proj`
+    # and `up_proj` on disk; `down_proj` stays as `down_proj`.
+    if pn == "gate_up_proj":
+        proj_options = "gate_proj|up_proj"
+    elif pn == "down_proj":
+        proj_options = "down_proj"
+    else:
+        proj_options = _re.escape(pn)
+
+    # Use the profile's own regex as the base; swap its `(gate|up|down)_proj`
+    # group with the exact projections we emit, and constrain to this
+    # layer.
+    base = profile.per_expert_moe_regex() if profile else None
+    if not base or not base.startswith("re:"):
+        # No profile regex — emit a conservative default spanning
+        # both common live-module conventions.
+        patterns = []
+        if layer_idx is None:
+            return patterns
+        # Try the multimodal (Gemma / Qwen3.6) layout first.
+        patterns.append(
+            rf"re:^language_model[.]model[.]layers[.]{layer_idx}[.]"
+            rf"(?:moe[.])?experts[.][0-9]+[.]({proj_options})$"
+        )
+        # And the text-only / dense layout.
+        patterns.append(
+            rf"re:^model[.]layers[.]{layer_idx}[.]"
+            rf"(?:moe[.])?experts[.][0-9]+[.]({proj_options})$"
+        )
+        return patterns
+
+    # Profile-provided regex. Strip the `re:` prefix, pin to this
+    # layer index, constrain to the emitted projections.
+    body = base[len("re:"):]
+    # Replace [0-9]+ between layers.X. and .experts. with the specific
+    # layer index. Fall back to leaving as-is if the pattern doesn't
+    # match our expectations.
+    pinned = _re.sub(r"layers\[\.\]\[0-9\]\+", f"layers[.]{layer_idx}", body, count=1)
+    # Replace `(gate|up|down)_proj` with only the split projections we
+    # actually emitted (so we don't over-ignore).
+    pinned = pinned.replace("(gate|up|down)_proj", f"({proj_options})")
+    return [f"re:{pinned}"]
+
+
 FORMAT_SCHEME = {
     "NVFP4": NVFP4_SCHEME,
     # Phase 1: route MXFP8 recipe entries through FP8_DYNAMIC. The
@@ -705,99 +837,94 @@ FORMAT_SCHEME = {
 }
 
 
-# Per-expert MoE pattern matching every per-expert per-projection
-# Linear vLLM constructs from compressed MoE checkpoints. This single
-# regex covers ~30k tensors that would otherwise need explicit entries.
-# Constrained to `language_model.model.layers.X.mlp.experts.Y.{gate,up,down}_proj`
-# so it doesn't accidentally match dense Linears or visual encoder
-# blocks.
-PER_EXPERT_MOE_REGEX = (
-    r"re:^language_model[.]model[.]layers[.][0-9]+"
-    r"[.]mlp[.]experts[.][0-9]+[.](gate|up|down)_proj$"
-)
-
-# Per-expert regex for MTP — vLLM constructs MTP experts as
-# `mtp.layers.X.mlp.experts.Y.{gate,up,down}_proj` (the prefix is `mtp`
-# because Qwen3_5MTP passes prefix="mtp" to its inner predictor, and
-# that prefix is NOT remapped at scheme-dispatch time).
-MTP_PER_EXPERT_REGEX = (
-    r"re:^mtp[.]layers[.][0-9]+"
-    r"[.]mlp[.]experts[.][0-9]+[.](gate|up|down)_proj$"
-)
-
-
-def _to_vllm_internal_name(name: str) -> str:
-    """Apply vLLM's name mappers so module names line up with what
-    `find_matched_target` compares against at scheme-dispatch time.
-
-    Body (qwen3_5 multimodal class, qwen3_5.py):
-      `model.visual.`        → `visual.`
-      `lm_head.`             → `language_model.lm_head.`
-      `model.language_model.`→ `language_model.model.`
-
-    MTP: vLLM's `Qwen3_5MTP` passes `prefix="mtp"` when building the inner
-    `Qwen3_5MultiTokenPredictor`, so every MTP Linear is constructed with
-    a `mtp.*` prefix (e.g. `mtp.fc`, `mtp.layers.0.self_attn.q_proj`).
-    That prefix is what `find_matched_target` compares against. The
-    `mtp.→model.` string replacement in `qwen3_5_mtp.load_weights` is a
-    *checkpoint-key* remap applied BEFORE weight loading, AFTER scheme
-    dispatch — so it does NOT affect target matching. Leave MTP names
-    as-is.
-
-    We accept recipe keys in any of these upstream conventions:
-      - body text-only probe form  `model.layers.X.*`
-      - body HF multimodal source  `model.language_model.layers.X.*`
-      - MTP probe / source form    `mtp.layers.X.*` (preserved)
-      - visual source              `model.visual.blocks.X.*`
-      - `lm_head`
-    """
-    # Body — multimodal source form.
-    if name.startswith("model.language_model."):
-        return "language_model.model." + name[len("model.language_model."):]
-    # Visual encoder.
-    if name.startswith("model.visual."):
-        return "visual." + name[len("model.visual."):]
-    # MTP — preserve the `mtp.` prefix. See docstring.
-    if name.startswith("mtp."):
-        return name
-    # Body — text-only recipe form.
-    if (name.startswith("model.layers.")
-            or name.startswith("model.embed_tokens")
-            or name.startswith("model.norm")
-            or name == "model"):
-        return "language_model.model." + name[len("model."):]
-    # lm_head — qwen3_5 multimodal class maps under language_model.
-    if name == "lm_head" or name.startswith("lm_head."):
-        return "language_model." + name
-    return name
-
-
 def build_quantization_config(
     assignment: dict[str, str],
     bf16_passthrough: set[str],
     extra_ignore: Iterable[str] = (),
+    *,
+    profile: "ModelProfile | None" = None,
 ) -> dict:
     """Emit a `quantization_config` dict with explicit per-name targets
     grouped by format. Targets and ignore are remapped to vLLM's
-    internal naming so `find_matched_target` matches.
+    internal naming via the supplied `profile` so `find_matched_target`
+    matches.
 
     `extra_ignore` is for module qnames that aren't in the recipe at
     all but should be excluded from any catch-all group (e.g. routers).
     The catch-all default group is the format with the most non-BF16
     members (typically NVFP4).
+
+    `profile` controls the architecture-specific bits: name remap,
+    per-expert MoE / MTP regexes. Defaults to `DefaultProfile()` (plain
+    names, no catch-all regexes) when omitted.
     """
+    from .model_profiles import DefaultProfile
+    from .model_profiles.vllm_registry import (
+        vllm_class_for_architecture, packed_modules_mapping_from_class,
+    )
+    profile = profile or DefaultProfile()
+
     by_fmt: dict[str, list[str]] = {}
     ignore: list[str] = []
     for n in bf16_passthrough:
-        ignore.append(_to_vllm_internal_name(n))
+        ignore.append(profile.to_vllm_internal_name(n))
     for n in extra_ignore:
-        ignore.append(_to_vllm_internal_name(n))
+        ignore.append(profile.to_vllm_internal_name(n))
     for name, fmt in sorted(assignment.items()):
-        vllm_name = _to_vllm_internal_name(name)
+        vllm_name = profile.to_vllm_internal_name(name)
         if fmt == "BF16":
             ignore.append(vllm_name)
+            # Packed MoE tensors in BF16 are emitted as per-expert
+            # per-projection splits (not as the 3D packed tensor). vLLM
+            # scheme-dispatches against the per-expert Linear qnames
+            # (e.g. `...experts.0.gate_proj`), not the packed parent —
+            # so the `ignore` for a BF16 packed-expert recipe entry
+            # must cover every per-expert per-projection for that layer.
+            # We emit a narrow regex per layer rather than enumerating
+            # hundreds of explicit names.
+            regex_list = _bf16_packed_expert_ignore_regex(name, profile)
+            for r in regex_list:
+                ignore.append(r)
             continue
         by_fmt.setdefault(fmt, []).append(vllm_name)
+
+    # Fill in fused-sibling members that exist in the live vLLM
+    # model but weren't in the probe assignment — e.g. Gemma 4's
+    # full_attention layers have no v_proj on disk, so the probe
+    # never saw it, but vLLM's QKVParallelLinear still instantiates
+    # a v_proj sub-module that gets k_proj's weights at load. Scheme
+    # dispatch requires all fused siblings to have consistent
+    # scheme. We infer missing siblings by walking the assignment for
+    # fused groups that landed in `ignore` and filling in every
+    # sibling from vLLM's `packed_modules_mapping` — including ones
+    # we never saw weights for.
+    vllm_cls = vllm_class_for_architecture(profile.vllm_architecture_class() or "")
+    packed_mapping = packed_modules_mapping_from_class(vllm_cls)
+    if packed_mapping:
+        # Reverse map: sibling-leaf-name -> fused-name (e.g.
+        # q_proj -> qkv_proj).
+        leaf_to_fused: dict[str, str] = {}
+        for fused_name, siblings in packed_mapping.items():
+            for s in siblings:
+                leaf_to_fused[s] = fused_name
+        # Set of leaf suffixes we should have. We'll only fill in
+        # siblings under names that match known fused patterns.
+        bf16_name_set = set(ignore)
+        for name, fmt in list(assignment.items()):
+            if fmt != "BF16":
+                continue
+            leaf = name.rsplit(".", 1)[-1]
+            if leaf not in leaf_to_fused:
+                continue
+            fused = leaf_to_fused[leaf]
+            expected_siblings = packed_mapping[fused]
+            parent = name[: -(len(leaf))]
+            for sib in expected_siblings:
+                full = parent + sib
+                vllm_name = profile.to_vllm_internal_name(full)
+                if vllm_name not in bf16_name_set:
+                    ignore.append(vllm_name)
+                    bf16_name_set.add(vllm_name)
 
     if not by_fmt:
         return {}
@@ -821,13 +948,16 @@ def build_quantization_config(
         # and short-circuits vLLM's fused-layer regex resolution, which
         # is needed to route the explicit per-component MXFP8 targets
         # to vLLM's fused parameter (in_proj_qkvz, qkv_proj, etc.).
-        # We additionally add a single pattern regex for per-expert
-        # MoE Linears so we don't have to enumerate ~30k entries.
+        # We additionally add architecture-specific per-expert regexes
+        # from the profile so ~30k per-expert MoE entries don't need
+        # explicit enumeration.
         explicit = sorted(by_fmt[catchall])
-        scheme["targets"] = (
-            [_explicit_regex(n) for n in explicit]
-            + [PER_EXPERT_MOE_REGEX, MTP_PER_EXPERT_REGEX]
-        )
+        expert_regexes = []
+        if (r := profile.per_expert_moe_regex()) is not None:
+            expert_regexes.append(r)
+        if (r := profile.per_expert_mtp_regex()) is not None:
+            expert_regexes.append(r)
+        scheme["targets"] = [_explicit_regex(n) for n in explicit] + expert_regexes
         config_groups[f"group_{idx}"] = scheme
 
     return {
@@ -902,6 +1032,15 @@ def main():
     # locate parameters in. The visual encoder + MTP heads we don't
     # quantize travel through as bf16 passthrough.
     from transformers import AutoModelForImageTextToText
+    # Load the FULL model (no text-only staging). Some multimodal
+    # architectures (Gemma 4) store their text body under a
+    # `model.language_model.*` prefix in safetensors, so loading a
+    # staged text-only sibling class (Gemma4ForCausalLM) would flag
+    # every text Linear as MISSING. We handle the live-vs-recipe
+    # naming mismatch in `materialize_tensors` below, which uses
+    # `profile.live_to_recipe_name()` to look up the allocator's
+    # assignment by the recipe convention regardless of which
+    # loader gave us the live module.
     print(f"[export] loading model from {args.model}", flush=True)
     t0 = time.time()
     load_kwargs = dict(
@@ -921,10 +1060,15 @@ def main():
         p.requires_grad_(False)
     print(f"[export] model loaded in {time.time() - t0:.1f}s", flush=True)
 
+    from .model_profiles import detect_profile as _detect
+    main_profile = _detect(args.model)
+    print(f"[export] model profile: {main_profile.name}", flush=True)
+
     print("[export] materializing compressed tensors ...", flush=True)
     t0 = time.time()
     tensors, hist = materialize_tensors(
         model, assignment, bf16_passthrough=bf16_passthrough,
+        profile=main_profile,
     )
     print(f"[export] materialized {len(tensors)} tensors in "
           f"{time.time() - t0:.1f}s", flush=True)
@@ -951,21 +1095,31 @@ def main():
     # materialize_tensors pass never sees them. We rebuild a standalone
     # MTP module, load source weights into it, and run the same quantize
     # pass for any `mtp.*` entries in the recipe.
-    print("[export] materializing MTP tensors per allocator ...", flush=True)
-    mtp_tensors = _materialize_mtp_tensors(args.model, assignment,
-                                           bf16_passthrough=bf16_passthrough,
-                                           hist=hist)
-    print(f"[export] MTP: {len(mtp_tensors)} tensors materialized", flush=True)
+    from .model_profiles import detect_profile
+    export_profile = detect_profile(args.model)
+    if export_profile.has_mtp():
+        print("[export] materializing MTP tensors per allocator ...", flush=True)
+        mtp_tensors = _materialize_mtp_tensors(args.model, assignment,
+                                               bf16_passthrough=bf16_passthrough,
+                                               hist=hist)
+        print(f"[export] MTP: {len(mtp_tensors)} tensors materialized", flush=True)
+    else:
+        print(f"[export] profile '{export_profile.name}' has no MTP — "
+              "skipping MTP materialization", flush=True)
+        mtp_tensors = {}
 
     # Visual encoder is still source passthrough (we deferred real
-    # calibration for it). MTP passthrough is now restricted to source
+    # calibration for it). MTP passthrough is restricted to source
     # keys NOT covered by our MTP materialization (layernorms, mtp.fc
-    # when allocator chose BF16, etc.).
-    print("[export] merging visual + residual mtp passthrough from source ...",
+    # when allocator chose BF16, etc.). Passthrough prefix list comes
+    # from the profile so multimodal arches (Gemma 4's vision+audio,
+    # Qwen 3.6's vision, etc.) each pull the right set.
+    print("[export] merging residual passthrough tensors from source ...",
           flush=True)
+    passthrough_prefixes = tuple(export_profile.source_passthrough_prefixes())
     src_extra = _load_source_passthrough(
         args.model,
-        prefix_filters=("model.visual.", "mtp."),
+        prefix_filters=passthrough_prefixes,
     )
     # Drop source tensors whose target name was already materialized.
     # The materialize pass produces vLLM-native names (`mtp.fc.weight_packed`
@@ -1093,6 +1247,25 @@ def write_sharded_safetensors(
     out_dir: Path,
     shard_bytes: int,
 ) -> None:
+    # Detach + clone any tensors that share underlying storage so
+    # safetensors' dedup check doesn't raise. This covers tied
+    # embeddings (Gemma 4: `lm_head.weight` ≡ `embed_tokens.weight`)
+    # and any other view-ties produced by HF's
+    # `_tied_weights_keys`. Cost: one extra copy of the embed matrix;
+    # correctness: identical bytes on disk, no runtime semantic change.
+    seen_storage: dict[int, str] = {}
+    for k, t in list(tensors.items()):
+        try:
+            sid = t.untyped_storage().data_ptr()
+        except Exception:
+            continue
+        if sid in seen_storage:
+            # This tensor shares storage with an earlier one.
+            # Deep-copy so safetensors treats them independently.
+            tensors[k] = t.detach().clone().contiguous()
+        else:
+            seen_storage[sid] = k
+
     keys = sorted(tensors.keys())
     sizes = {k: tensors[k].numel() * tensors[k].element_size() for k in keys}
     total = sum(sizes.values())
@@ -1142,9 +1315,12 @@ def write_config_with_quantization(
     bf16_passthrough: set[str],
     extra_ignore: Iterable[str] = (),
 ) -> None:
+    from .model_profiles import detect_profile
+    profile = detect_profile(src_model)
     src_cfg_path = Path(src_model) / "config.json"
     cfg = json.load(open(src_cfg_path))
-    qc = build_quantization_config(assignment, bf16_passthrough, extra_ignore)
+    qc = build_quantization_config(assignment, bf16_passthrough,
+                                   extra_ignore, profile=profile)
     if qc:
         cfg["quantization_config"] = qc
     with open(out_dir / "config.json", "w") as f:
