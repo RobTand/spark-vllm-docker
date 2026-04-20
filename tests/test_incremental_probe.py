@@ -9,6 +9,10 @@ import torch
 import torch.nn as nn
 
 from quantization.prismquant.incremental_probe import (
+    GlobalPrecompute,
+    _compute_precompute_key,
+    _load_precompute_cache,
+    _save_precompute_cache,
     build_extended_shard_regexes,
     build_layer_shard_regexes,
     merge_probe_pickles,
@@ -317,6 +321,100 @@ class TestIncrementalProbeMtp(unittest.TestCase):
             mtp.layers[0].mlp.experts.down_proj[1],
             raw["layers.0.mlp.experts.1.down_proj.weight"],
         ))
+
+
+class TestGlobalPrecomputeCache(unittest.TestCase):
+    """Global Phase-1 + Phase-2 artifacts are now hoisted out of the
+    per-shard loop and cached to disk so an interrupted run can resume
+    without redoing the body forward / CE backward. Exercise the cache
+    roundtrip here: save, then load, and verify the content is reused
+    only when the fingerprint matches.
+
+    (The full probe pipeline requires a real model + streaming weights,
+    so we don't drive `_compute_global_precompute` end-to-end here; a
+    TODO for that once a tiny fixture model is available.)
+    """
+
+    def _fake_precompute(self, num_layers: int = 3, T: int = 4, H: int = 6,
+                         N: int = 1) -> GlobalPrecompute:
+        acts = [torch.randn(N, T, H, dtype=torch.float32)
+                for _ in range(num_layers + 1)]
+        grad = torch.randn(N, T, H, dtype=torch.float32)
+        ids = torch.arange(N * T, dtype=torch.long).reshape(N, T)
+        return GlobalPrecompute(
+            activations_cpu=acts,
+            grad_at_tail=grad,
+            ids=ids,
+            resident_stats={"lm_head": {"h_trace_raw": 1.0}},
+            resident_h_full={"lm_head": torch.ones(2, 3, dtype=torch.float32)},
+            resident_act_snaps={"lm_head": [torch.zeros(2, 3)]},
+        )
+
+    def test_precompute_cache_reuses_when_meta_matches(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            path = td / "pre.pt"
+            pre = self._fake_precompute()
+            meta = _compute_precompute_key(
+                model_path="toy",
+                dataset_name="ds",
+                nsamples=1,
+                seqlen=4,
+                dtype_name="bf16",
+                device="cpu",
+                importance_weighting=True,
+                resident_include_union=r"^lm_head$",
+            )
+            _save_precompute_cache(path, pre, meta)
+            loaded = _load_precompute_cache(path, meta, torch.device("cpu"))
+            self.assertIsNotNone(loaded)
+            self.assertEqual(len(loaded.activations_cpu), len(pre.activations_cpu))
+            self.assertTrue(torch.equal(loaded.grad_at_tail, pre.grad_at_tail))
+            self.assertTrue(torch.equal(loaded.ids, pre.ids))
+            self.assertEqual(
+                set(loaded.resident_stats), set(pre.resident_stats))
+
+    def test_precompute_cache_rejects_meta_mismatch(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            path = td / "pre.pt"
+            pre = self._fake_precompute()
+            meta = _compute_precompute_key(
+                model_path="toy",
+                dataset_name="ds",
+                nsamples=1,
+                seqlen=4,
+                dtype_name="bf16",
+                device="cpu",
+                importance_weighting=True,
+                resident_include_union=r"^lm_head$",
+            )
+            _save_precompute_cache(path, pre, meta)
+            stale = dict(meta)
+            stale["nsamples"] = 2
+            loaded = _load_precompute_cache(path, stale, torch.device("cpu"))
+            self.assertIsNone(loaded)
+
+    def test_precompute_cache_missing_file_returns_none(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            path = td / "does_not_exist.pt"
+            meta = _compute_precompute_key(
+                model_path="toy",
+                dataset_name="ds",
+                nsamples=1,
+                seqlen=4,
+                dtype_name="bf16",
+                device="cpu",
+                importance_weighting=True,
+                resident_include_union=r"^lm_head$",
+            )
+            self.assertIsNone(
+                _load_precompute_cache(path, meta, torch.device("cpu")))
+
+    # TODO: once a tiny fixture model is available, add an end-to-end
+    # test that invokes the main orchestrator twice and asserts Phase-1
+    # is only run once (by spying on `_compute_global_precompute` calls).
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@ unchanged — the allocator consumes either.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import gc
 import json
 import os
@@ -294,27 +295,93 @@ def load_num_hidden_layers(model_path: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Per-shard body runner — phase-1 / phase-2 / phase-3 of streaming_probe,
-# scoped to the Linears matching this shard's regex. The non-matching
-# layers are forwarded without Fisher instrumentation so hidden-state
-# chains stay intact.
+# Global precompute — Phase-1 (streaming forward) and Phase-2 (chunked CE
+# backward) produce artifacts that are identical across every body shard:
+# only Phase-3 (per-layer Fisher hooks + reverse sweep) depends on the
+# shard's scope. Computing Phase-1 + Phase-2 once and reusing the cached
+# activations + grad_at_tail across all shards roughly halves wall time
+# on models with many body shards (e.g. Qwen3.5-122B).
+#
+# Resident linears (lm_head, root projections) must have their Fisher
+# hooks fire during Phase-2's chunked CE backward, because Phase-3's
+# reverse sweep doesn't re-invoke lm_head. So the global Phase-2 installs
+# hooks on the union of resident linears matched by ANY shard's include
+# regex; each per-shard runner later filters that union to its own scope.
 # ---------------------------------------------------------------------------
-def _run_body_streaming_shard(
+
+
+def _resident_linear_fqns(model: nn.Module, layers_prefix: str,
+                          num_layers: int) -> list[str]:
+    """All nn.Linear fqns NOT under a decoder-layer prefix (lm_head,
+    root-level projections). These are resident during streaming."""
+    resident: list[str] = []
+    for n, m in model.named_modules():
+        if not isinstance(m, nn.Linear):
+            continue
+        if any(n.startswith(f"{layers_prefix}{L}.") for L in range(num_layers)):
+            continue
+        resident.append(n)
+    return resident
+
+
+def _compute_precompute_key(model_path: str, dataset_name: str,
+                            nsamples: int, seqlen: int, dtype_name: str,
+                            device: str, importance_weighting: bool,
+                            resident_include_union: str) -> dict[str, Any]:
+    """Fingerprint for the global precompute cache. If any of these
+    inputs change, recompute; otherwise reuse the cached tensors."""
+    return {
+        "model": model_path,
+        "dataset": dataset_name,
+        "nsamples": nsamples,
+        "seqlen": seqlen,
+        "dtype": dtype_name,
+        "device": device,
+        "importance_weighting": importance_weighting,
+        "resident_include_union": resident_include_union,
+    }
+
+
+@dataclasses.dataclass
+class GlobalPrecompute:
+    """Shard-independent artifacts from Phase-1 + Phase-2.
+
+    - `activations_cpu[L]` is the hidden state at the entry to layer L;
+      `activations_cpu[num_layers]` is the final hidden state (input to
+      `base_model.norm`).
+    - `grad_at_tail` is the gradient of CE loss wrt the final hidden
+      state, used as the seed for Phase-3's reverse sweep.
+    - `resident_stats` / `resident_h_full` hold Fisher for every
+      resident linear matched by the union-of-shards regex. Each shard
+      runner filters these dicts to its own include regex.
+    - `resident_act_snaps` holds (per-fqn) CPU activation snapshots for
+      resident linears, used by the cost stage's ActivationIndex.
+    """
+    activations_cpu: list[torch.Tensor]
+    grad_at_tail: torch.Tensor
+    ids: torch.Tensor  # shape (N, T), dtype long, on device
+    resident_stats: dict[str, dict]
+    resident_h_full: dict[str, torch.Tensor]
+    resident_act_snaps: dict[str, list[torch.Tensor]]
+    # Reusable forward-state derivable from ids + model; recomputed on demand.
+
+
+def _compute_global_precompute(
     ctx: StreamingContext,
     *,
     calib: torch.Tensor,
-    linear_include: str,
-    linear_exclude: str,
     importance_weighting: bool,
+    prefetch_lookahead: int,
+    resident_include_union: str,
+    resident_exclude: str,
     activation_cache_dir: str | None,
-    h_detail_dir: str | None,
-    output_path: str,
-    dataset_name: str,
-    dtype_name: str,
-    seqlen: int,
-    model_path: str,
-    prefetch_lookahead: int = 3,
-):
+) -> GlobalPrecompute:
+    """Run Phase-1 (streaming forward, cache activations on CPU) and
+    Phase-2 (chunked CE backward through lm_head). Install resident
+    linear hooks BEFORE Phase-2 runs so their Fisher is captured here
+    — Phase-3 never re-invokes lm_head and so can't retroactively
+    collect them. Returns a `GlobalPrecompute` consumed by every
+    per-shard runner."""
     device = ctx.device
     dtype = ctx.dtype
     model = ctx.model
@@ -323,70 +390,11 @@ def _run_body_streaming_shard(
     num_layers = ctx.num_layers
     layers_prefix = ctx.layers_prefix
 
-    inc = re.compile(linear_include)
-    exc = re.compile(linear_exclude)
-    all_linears = [n for n, m in model.named_modules() if isinstance(m, nn.Linear)]
-    all_tracked = [n for n in all_linears
-                   if inc.search(n) and not exc.search(n)]
-    layer_linear_names: list[list[str]] = []
-    for L in range(num_layers):
-        pref = f"{layers_prefix}{L}."
-        layer_linear_names.append([n for n in all_tracked if n.startswith(pref)])
-    total_tracked = sum(len(x) for x in layer_linear_names)
-    # Linears not in any decoder layer (lm_head, root-level projections,
-    # visual/audio encoders wired into the model top-level) are resident
-    # on device during streaming. They still need Fisher hooks installed
-    # and stats recorded if the shard's regex matches them. We collect
-    # them here so the shard can install hooks around Phase-2 (whose
-    # chunked CE backward invokes lm_head) and skip Phase-3 when the
-    # shard is purely resident-scoped.
-    resident_linears: list[str] = [
-        n for n in all_tracked
-        if not any(n.startswith(f"{layers_prefix}{L}.") for L in range(num_layers))
-    ]
-    if total_tracked == 0 and not resident_linears:
-        print(f"[incremental] shard has no Linears matching "
-              f"{linear_include!r} under {layers_prefix}* or model root; "
-              "writing empty pickle",
-              flush=True)
-        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        with open(output_path, "wb") as f:
-            pickle.dump({
-                "stats": {},
-                "router_counts": {},
-                "router_totals": {},
-                "expert_info": {},
-                "meta": {
-                    "model": model_path,
-                    "dataset": dataset_name,
-                    "nsamples": int(calib.size(0)),
-                    "seqlen": seqlen,
-                    "dtype": dtype_name,
-                    "device_map": "streaming-layerwise",
-                    "execution_device": str(device),
-                    "top_k": read_top_k(model, default=2),
-                    "importance_weighting": importance_weighting,
-                    "activation_cache_dir": activation_cache_dir,
-                    "linear_include": linear_include,
-                    "linear_exclude": linear_exclude,
-                },
-            }, f)
-        return
-    print(f"[incremental] body shard: tracking {total_tracked} body Linears "
-          f"across {sum(1 for x in layer_linear_names if x)} layers "
-          f"+ {len(resident_linears)} resident Linears "
-          f"(include={linear_include!r})", flush=True)
-
-    top_k = read_top_k(model, default=2)
-
-    merged_stats: dict[str, dict] = {}
-    merged_h_full: dict[str, torch.Tensor] = {}
-
     tokens_in_sample = calib.size(-1)
     batch_size = calib.size(0)
-
     ids = calib.to(device)
     position_ids = torch.arange(tokens_in_sample, device=device).unsqueeze(0)
+    causal_mask = _make_causal_mask(tokens_in_sample, device, dtype)
 
     prefetch_depth = prefetch_lookahead
 
@@ -394,10 +402,9 @@ def _run_body_streaming_shard(
     t_phase = time.time()
     with torch.no_grad():
         hidden = base_model.embed_tokens(ids).to(dtype)
-    causal_mask = _make_causal_mask(tokens_in_sample, device, dtype)
     position_embeddings = _compute_position_embeddings(
         base_model, hidden, position_ids)
-    print(f"[incremental] phase-1 N={batch_size} T={tokens_in_sample} "
+    print(f"[incremental/global] phase-1 N={batch_size} T={tokens_in_sample} "
           f"hidden={tuple(hidden.shape)}", flush=True)
 
     for d in range(prefetch_depth):
@@ -421,33 +428,29 @@ def _run_body_streaming_shard(
         activations_cpu.append(hidden.detach().cpu())
         ctx.unload(L)
         if L % 8 == 0 or L == num_layers - 1:
-            print(f"[incremental] fwd L{L:02d}  src={src}  load={load_s:.2f}s  "
-                  f"fwd={fwd_s:.2f}s", flush=True)
-    print(f"[incremental] phase-1 forward: {time.time()-t_phase:.1f}s  "
+            print(f"[incremental/global] fwd L{L:02d}  src={src}  "
+                  f"load={load_s:.2f}s  fwd={fwd_s:.2f}s", flush=True)
+    print(f"[incremental/global] phase-1 forward: {time.time()-t_phase:.1f}s  "
           f"{ctx.layer_cache.summary()}", flush=True)
 
-    # ---- Phase 2: final norm + lm_head + loss; grad at final hidden ----
+    # ---- Phase 2: final norm + lm_head + CE loss; grad at final hidden ----
     ctx.layer_cache.clear()
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    # Install Fisher hooks on resident linears (lm_head, root projections)
-    # BEFORE Phase-2 runs: the chunked CE backward pass invokes
-    # `model.lm_head(...)` inside this block, so a forward+full-backward
-    # hook on the resident Linear naturally captures (inputs, grad_output)
-    # pairs and lets us accumulate the standard Linear Fisher:
-    #     grad_w = grad_out.t() @ x_in     → sum of grad_w^2 = Fisher diag
-    # The hook implementation mirrors the body loop below so downstream
-    # finalization + h-detail paths treat resident and body Linears
-    # identically.
+    # Resident-linear Fisher hooks. We collect the union of all shards'
+    # resident-scope linears here; each per-shard runner later filters to
+    # its own regex. The machinery mirrors the body-layer Phase-3 hooks.
+    inc = re.compile(resident_include_union)
+    exc = re.compile(resident_exclude)
+    all_resident = _resident_linear_fqns(model, layers_prefix, num_layers)
+    resident_tracked = [n for n in all_resident
+                        if inc.search(n) and not exc.search(n)]
+
     resident_stats: dict[str, dict] = {}
     resident_h_full: dict[str, torch.Tensor] = {}
     resident_saved_inputs: dict[str, torch.Tensor] = {}
     resident_handles: list = []
-    # Activation snapshot for resident linears feeds the cost stage's
-    # ActivationIndex just like body Linears — capture up to
-    # `input_rows_limit` rows of flattened inputs across the Phase-2
-    # chunk loop.
     resident_act_snaps: dict[str, list[torch.Tensor]] = defaultdict(list)
     resident_act_rows: dict[str, int] = defaultdict(int)
     resident_input_rows_limit = 256
@@ -495,7 +498,7 @@ def _run_body_streaming_shard(
             resident_stats[name]["n_tokens_seen"] += x2.size(0)
         return hook
 
-    for fqn in resident_linears:
+    for fqn in resident_tracked:
         mod = model.get_submodule(fqn)
         if not isinstance(mod, nn.Linear):
             continue
@@ -547,8 +550,6 @@ def _run_body_streaming_shard(
     else:
         ce_mean = None
 
-    # Phase-2 chunked CE backward through lm_head (via norm_out_d) — if
-    # resident hooks are installed, each chunk's backward populates them.
     for start in range(0, T - 1, chunk_T):
         end = min(start + chunk_T, T)
         cut = end - 1 - start if end >= T else end - start
@@ -568,10 +569,7 @@ def _run_body_streaming_shard(
         grad_buf.add_(g)
         del preds, lp_c, tok_ce, chunk_loss, g
     norm_out.backward(grad_buf)
-    grad_at_tail = final_hidden.grad.detach().clone()
-    # Remove resident hooks now that Phase-2 is complete — Phase-3 reverse
-    # sweep does not re-invoke lm_head, so keeping them live would only
-    # risk double-counting if anything downstream touched the module.
+    grad_at_tail = final_hidden.grad.detach().cpu().clone()
     for h in resident_handles:
         h.remove()
     resident_handles.clear()
@@ -580,17 +578,202 @@ def _run_body_streaming_shard(
     gc.collect()
     if device.type == "cuda":
         torch.cuda.empty_cache()
-    print(f"[incremental] phase-2 loss+head bwd: {time.time()-t_phase:.1f}s  "
+    print(f"[incremental/global] phase-2 loss+head bwd: {time.time()-t_phase:.1f}s  "
           f"(resident stats collected: {len(resident_stats)})",
           flush=True)
+
+    return GlobalPrecompute(
+        activations_cpu=activations_cpu,
+        grad_at_tail=grad_at_tail,
+        ids=ids,
+        resident_stats=resident_stats,
+        resident_h_full=resident_h_full,
+        resident_act_snaps=dict(resident_act_snaps),
+    )
+
+
+def _save_precompute_cache(path: Path, pre: GlobalPrecompute,
+                           meta: dict[str, Any]) -> None:
+    """Persist Phase-1 + Phase-2 artifacts to disk so an interrupted
+    probe run can resume without redoing them. Tensors stay in CPU
+    format; this file is on the order of (num_layers+1) * act_size,
+    typically hundreds of MB for 122B with N=4 T=256."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({
+        "activations_cpu": pre.activations_cpu,
+        "grad_at_tail": pre.grad_at_tail,
+        "ids_cpu": pre.ids.detach().cpu(),
+        "resident_stats": pre.resident_stats,
+        "resident_h_full": pre.resident_h_full,
+        "resident_act_snaps": pre.resident_act_snaps,
+        "meta": meta,
+    }, str(path))
+
+
+def _load_precompute_cache(path: Path, expected_meta: dict[str, Any],
+                           device: torch.device) -> GlobalPrecompute | None:
+    """Load cached precompute if meta matches; return None otherwise."""
+    if not path.exists():
+        return None
+    try:
+        data = torch.load(str(path), map_location="cpu", weights_only=False)
+    except Exception as e:
+        print(f"[incremental/global] cache load failed ({e}); recomputing",
+              flush=True)
+        return None
+    cached_meta = data.get("meta") or {}
+    for key, expected in expected_meta.items():
+        if cached_meta.get(key) != expected:
+            print(f"[incremental/global] cache meta mismatch on {key!r}: "
+                  f"cached={cached_meta.get(key)!r} expected={expected!r}; "
+                  "recomputing", flush=True)
+            return None
+    return GlobalPrecompute(
+        activations_cpu=data["activations_cpu"],
+        grad_at_tail=data["grad_at_tail"],
+        ids=data["ids_cpu"].to(device),
+        resident_stats=data["resident_stats"],
+        resident_h_full=data["resident_h_full"],
+        resident_act_snaps=data["resident_act_snaps"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-shard body runner — phase-3 of streaming_probe, scoped to the
+# Linears matching this shard's regex. Phase-1 + Phase-2 are now global
+# (see `_compute_global_precompute`); the caller passes in the cached
+# `activations_cpu` + `grad_at_tail` + resident Fisher dicts.
+# ---------------------------------------------------------------------------
+def _run_body_streaming_shard(
+    ctx: StreamingContext,
+    *,
+    calib: torch.Tensor,
+    linear_include: str,
+    linear_exclude: str,
+    importance_weighting: bool,
+    activation_cache_dir: str | None,
+    h_detail_dir: str | None,
+    output_path: str,
+    dataset_name: str,
+    dtype_name: str,
+    seqlen: int,
+    model_path: str,
+    prefetch_lookahead: int = 3,
+    precomputed: GlobalPrecompute | None = None,
+):
+    if precomputed is None:
+        raise ValueError(
+            "_run_body_streaming_shard requires precomputed Phase-1/Phase-2 "
+            "artifacts; call _compute_global_precompute first")
+    device = ctx.device
+    dtype = ctx.dtype
+    model = ctx.model
+    base_model = ctx.base_model
+    layers = ctx.layers
+    num_layers = ctx.num_layers
+    layers_prefix = ctx.layers_prefix
+
+    inc = re.compile(linear_include)
+    exc = re.compile(linear_exclude)
+    all_linears = [n for n, m in model.named_modules() if isinstance(m, nn.Linear)]
+    all_tracked = [n for n in all_linears
+                   if inc.search(n) and not exc.search(n)]
+    layer_linear_names: list[list[str]] = []
+    for L in range(num_layers):
+        pref = f"{layers_prefix}{L}."
+        layer_linear_names.append([n for n in all_tracked if n.startswith(pref)])
+    total_tracked = sum(len(x) for x in layer_linear_names)
+    # Linears not in any decoder layer (lm_head, root-level projections,
+    # visual/audio encoders wired into the model top-level) are resident
+    # on device during streaming. Their Fisher was collected once during
+    # the global Phase-2 (resident hooks were installed on the union of
+    # shard regexes); here we filter the cached resident dicts to the
+    # scope of this shard's include regex.
+    resident_linears: list[str] = [
+        n for n in all_tracked
+        if not any(n.startswith(f"{layers_prefix}{L}.") for L in range(num_layers))
+    ]
+    if total_tracked == 0 and not resident_linears:
+        print(f"[incremental] shard has no Linears matching "
+              f"{linear_include!r} under {layers_prefix}* or model root; "
+              "writing empty pickle",
+              flush=True)
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "wb") as f:
+            pickle.dump({
+                "stats": {},
+                "router_counts": {},
+                "router_totals": {},
+                "expert_info": {},
+                "meta": {
+                    "model": model_path,
+                    "dataset": dataset_name,
+                    "nsamples": int(calib.size(0)),
+                    "seqlen": seqlen,
+                    "dtype": dtype_name,
+                    "device_map": "streaming-layerwise",
+                    "execution_device": str(device),
+                    "top_k": read_top_k(model, default=2),
+                    "importance_weighting": importance_weighting,
+                    "activation_cache_dir": activation_cache_dir,
+                    "linear_include": linear_include,
+                    "linear_exclude": linear_exclude,
+                },
+            }, f)
+        return
+    print(f"[incremental] body shard: tracking {total_tracked} body Linears "
+          f"across {sum(1 for x in layer_linear_names if x)} layers "
+          f"+ {len(resident_linears)} resident Linears "
+          f"(include={linear_include!r})", flush=True)
+
+    top_k = read_top_k(model, default=2)
+
+    merged_stats: dict[str, dict] = {}
+    merged_h_full: dict[str, torch.Tensor] = {}
+
+    tokens_in_sample = calib.size(-1)
+    batch_size = calib.size(0)
+
+    position_ids = torch.arange(tokens_in_sample, device=device).unsqueeze(0)
+    causal_mask = _make_causal_mask(tokens_in_sample, device, dtype)
+
+    prefetch_depth = prefetch_lookahead
+
+    # ---- Phase 1 + Phase 2 are precomputed globally (see main()). -------
+    # Use the cached activations_cpu + grad_at_tail directly and filter
+    # the resident Fisher dicts down to this shard's include scope.
+    activations_cpu = precomputed.activations_cpu
+    grad_at_tail = precomputed.grad_at_tail.to(device)
+    with torch.no_grad():
+        # position_embeddings derived from the same embed output that
+        # produced activations_cpu[0]; call on an on-device copy once.
+        embed0 = activations_cpu[0].to(device).to(dtype)
+        position_embeddings = _compute_position_embeddings(
+            base_model, embed0, position_ids)
+        del embed0
+    print(f"[incremental] shard reuses global precompute "
+          f"N={batch_size} T={tokens_in_sample} "
+          f"layers_cached={len(activations_cpu)}", flush=True)
+
+    # Activation snapshots for resident linears populated by the global
+    # Phase-2 run. We only emit the entries whose fqn is in this shard's
+    # scope (others will be claimed by another shard, or already are).
+    resident_act_snaps: dict[str, list[torch.Tensor]] = {
+        n: list(snaps)
+        for n, snaps in precomputed.resident_act_snaps.items()
+        if n in resident_linears
+    }
 
     # Fold resident Fisher stats + H-diag into the main accumulators so
     # downstream finalization / h-detail / pickle write paths are agnostic
     # to whether a Linear was body-scoped or resident.
-    for fqn, s in resident_stats.items():
-        merged_stats[fqn] = dict(s)
-    for fqn, h in resident_h_full.items():
-        merged_h_full[fqn] = h
+    for fqn in resident_linears:
+        s = precomputed.resident_stats.get(fqn)
+        if s is not None:
+            merged_stats[fqn] = dict(s)
+        h = precomputed.resident_h_full.get(fqn)
+        if h is not None:
+            merged_h_full[fqn] = h.clone()
 
     # Activation snap accumulators (populated during Phase-3 for body
     # Linears; resident snaps were populated during Phase-2 hooks above).
@@ -612,7 +795,10 @@ def _run_body_streaming_shard(
         print(f"[incremental] shard has only resident Linears "
               f"(n={len(resident_linears)}); skipping Phase-3 reverse sweep",
               flush=True)
-        del activations_cpu, grad_at_tail
+        # `activations_cpu` is a shared reference into the global
+        # precompute; do not free it here — the caller reuses across
+        # shards. `grad_at_tail` is a per-shard device copy.
+        del grad_at_tail
     else:
         # ---- Phase 3: reverse sweep, Fisher collection only on tracked Linears ----
         t_phase = time.time()
@@ -806,7 +992,10 @@ def _run_body_streaming_shard(
         print(f"[incremental] phase-3 reverse sweep: {time.time()-t_phase:.1f}s  "
               f"{ctx.layer_cache.summary()}", flush=True)
 
-        del activations_cpu, grad_at_tail, grad_out
+        # `activations_cpu` is a shared reference into the global
+        # precompute; do not free it here — the caller reuses across
+        # shards. `grad_at_tail` / `grad_out` are per-shard device copies.
+        del grad_at_tail, grad_out
 
     # ---- Finalize ----
     for s in merged_stats.values():
@@ -890,61 +1079,38 @@ def _run_mtp_streaming_shard(
     seqlen: int,
     model_path: str,
     prefetch_lookahead: int = 3,
+    precomputed: GlobalPrecompute | None = None,
 ):
     # Lazy import to avoid depending on transformers subpath at module load.
     from .mtp_module import MtpModule, _load_into_mtp, _load_mtp_state_dict
+
+    if precomputed is None:
+        raise ValueError(
+            "_run_mtp_streaming_shard requires precomputed Phase-1 activations; "
+            "call _compute_global_precompute first")
 
     device = ctx.device
     dtype = ctx.dtype
     model = ctx.model
     base_model = ctx.base_model
-    layers = ctx.layers
-    num_layers = ctx.num_layers
 
-    # --- Body forward to final hidden states, streaming layer-by-layer ---
     tokens_in_sample = calib.size(-1)
     batch_size = calib.size(0)
-    ids = calib.to(device)
-    position_ids = torch.arange(tokens_in_sample, device=device).unsqueeze(0)
-    causal_mask = _make_causal_mask(tokens_in_sample, device, dtype)
 
+    # --- Reuse globally-cached body forward activations ------------------
+    # `activations_cpu[0]` is the embed output (== inputs_embeds).
+    # `activations_cpu[-1]` is the hidden state at the tail of the body
+    # (pre-`base_model.norm`). MTP needs the post-norm body hidden — cheap
+    # to compute on CPU/device without re-running the body forward.
     t_phase = time.time()
+    inputs_embeds_cpu = precomputed.activations_cpu[0]
     with torch.no_grad():
-        inputs_embeds = base_model.embed_tokens(ids).to(dtype)
-        hidden = inputs_embeds
-    position_embeddings = _compute_position_embeddings(
-        base_model, hidden, position_ids)
+        pre_norm = precomputed.activations_cpu[-1].to(device).to(dtype)
+        body_final_cpu = base_model.norm(pre_norm).detach().cpu()
+        del pre_norm
+    print(f"[incremental/mtp] body forward reused from global precompute "
+          f"(norm only: {time.time()-t_phase:.1f}s)", flush=True)
 
-    prefetch_depth = prefetch_lookahead
-    for d in range(prefetch_depth):
-        ctx.schedule_prefetch(d)
-    for L in range(num_layers):
-        load_t0 = time.time()
-        src = ctx.install(L)
-        ctx.schedule_prefetch(L + prefetch_depth)
-        load_s = time.time() - load_t0
-        with torch.no_grad():
-            hidden = _call_layer(
-                layers[L], hidden,
-                position_embeddings=position_embeddings,
-                attention_mask=causal_mask,
-                position_ids=position_ids,
-            )
-        ctx.unload(L)
-        if L % 8 == 0 or L == num_layers - 1:
-            print(f"[incremental/mtp] body fwd L{L:02d}  src={src}  "
-                  f"load={load_s:.2f}s", flush=True)
-    with torch.no_grad():
-        body_final = base_model.norm(hidden)
-    print(f"[incremental/mtp] body forward: {time.time()-t_phase:.1f}s",
-          flush=True)
-
-    # Hold these on CPU between body and MTP so we free GPU memory
-    # before allocating the MTP module.
-    inputs_embeds_cpu = inputs_embeds.detach().cpu()
-    body_final_cpu = body_final.detach().cpu()
-    del inputs_embeds, hidden, body_final
-    gc.collect()
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
@@ -1214,6 +1380,61 @@ def main():
             log_prefix="[incremental]",
         )
 
+    # Union of all shard regexes — used for the global Phase-2 resident
+    # Fisher hooks. We install hooks on every resident linear that ANY
+    # shard's include regex would match; each per-shard runner filters
+    # the captured dicts down to its own scope.
+    linear_exclude = (
+        r"(?:mlp\.gate$|mlp\..*gate$|\.router(?:$|\.)|"
+        r"block_sparse_moe\.gate$)"
+    )
+    resident_include_union = (
+        "(?:" + "|".join(f"(?:{r})" for r in shard_regexes) + ")"
+        if shard_regexes else r"(?!x)x"  # never-match fallback
+    )
+
+    precomputed: GlobalPrecompute | None = None
+    precompute_cache_path = work_dir / "work" / "precomputed.pt"
+    precompute_meta = _compute_precompute_key(
+        model_path=args.model,
+        dataset_name=args.dataset,
+        nsamples=args.nsamples,
+        seqlen=args.seqlen,
+        dtype_name=args.dtype,
+        device=str(device),
+        importance_weighting=args.importance_weighting,
+        resident_include_union=resident_include_union,
+    )
+
+    def _ensure_precompute() -> GlobalPrecompute:
+        """Load Phase-1/Phase-2 artifacts from the on-disk cache if the
+        fingerprint matches; otherwise compute + persist + return."""
+        nonlocal precomputed
+        if precomputed is not None:
+            return precomputed
+        cached = _load_precompute_cache(
+            precompute_cache_path, precompute_meta, device)
+        if cached is not None:
+            print(f"[incremental/global] reused precompute cache at "
+                  f"{precompute_cache_path}", flush=True)
+            precomputed = cached
+            return precomputed
+        _ensure_ready()
+        precomputed = _compute_global_precompute(
+            ctx,
+            calib=calib,
+            importance_weighting=args.importance_weighting,
+            prefetch_lookahead=args.prefetch_lookahead,
+            resident_include_union=resident_include_union,
+            resident_exclude=linear_exclude,
+            activation_cache_dir=args.activation_cache_dir,
+        )
+        _save_precompute_cache(
+            precompute_cache_path, precomputed, precompute_meta)
+        print(f"[incremental/global] wrote precompute cache to "
+              f"{precompute_cache_path}", flush=True)
+        return precomputed
+
     try:
         if not all_reusable:
             _ensure_ready()
@@ -1234,14 +1455,12 @@ def main():
             _ensure_ready()
 
             if kind == "body":
+                pre = _ensure_precompute()
                 _run_body_streaming_shard(
                     ctx,
                     calib=calib,
                     linear_include=linear_include,
-                    linear_exclude=(
-                        r"(?:mlp\.gate$|mlp\..*gate$|\.router(?:$|\.)|"
-                        r"block_sparse_moe\.gate$)"
-                    ),
+                    linear_exclude=linear_exclude,
                     importance_weighting=args.importance_weighting,
                     activation_cache_dir=args.activation_cache_dir,
                     h_detail_dir=args.h_detail_dir,
@@ -1251,16 +1470,15 @@ def main():
                     seqlen=args.seqlen,
                     model_path=args.model,
                     prefetch_lookahead=args.prefetch_lookahead,
+                    precomputed=pre,
                 )
             elif kind == "mtp":
+                pre = _ensure_precompute()
                 _run_mtp_streaming_shard(
                     ctx,
                     calib=calib,
                     linear_include=linear_include,
-                    linear_exclude=(
-                        r"(?:mlp\.gate$|mlp\..*gate$|\.router(?:$|\.)|"
-                        r"block_sparse_moe\.gate$)"
-                    ),
+                    linear_exclude=linear_exclude,
                     importance_weighting=args.importance_weighting,
                     activation_cache_dir=args.activation_cache_dir,
                     output_path=str(shard_path),
@@ -1269,20 +1487,21 @@ def main():
                     seqlen=args.seqlen,
                     model_path=args.model,
                     prefetch_lookahead=args.prefetch_lookahead,
+                    precomputed=pre,
                 )
             elif kind == "lm_head":
-                # The lm_head Fisher is collected naturally as a body
-                # shard with the regex pinned to `^lm_head$`: phase-2 runs
-                # lm_head's forward+backward, and we install a Fisher hook
-                # on it. Reuse the body runner for that.
+                # The lm_head Fisher is collected naturally during the
+                # global Phase-2 run: its chunked CE backward runs
+                # lm_head's forward+backward, and the resident Fisher
+                # hooks (installed before Phase-2) capture it. The body
+                # runner then filters the cached resident dicts to this
+                # shard's regex and writes the shard pickle.
+                pre = _ensure_precompute()
                 _run_body_streaming_shard(
                     ctx,
                     calib=calib,
                     linear_include=linear_include,
-                    linear_exclude=(
-                        r"(?:mlp\.gate$|mlp\..*gate$|\.router(?:$|\.)|"
-                        r"block_sparse_moe\.gate$)"
-                    ),
+                    linear_exclude=linear_exclude,
                     importance_weighting=args.importance_weighting,
                     activation_cache_dir=args.activation_cache_dir,
                     h_detail_dir=args.h_detail_dir,
@@ -1292,6 +1511,7 @@ def main():
                     seqlen=args.seqlen,
                     model_path=args.model,
                     prefetch_lookahead=args.prefetch_lookahead,
+                    precomputed=pre,
                 )
             else:
                 # visual blocks are stripped by text-only staging, so the
