@@ -81,6 +81,7 @@ if [[ ! -f "${COST_PATH}" ]]; then
     --mode batched --chunk-size 256 \
     --layers-per-shard "$LAYERS_PER_SHARD" \
     --skip-missing-activations \
+    --swap-grow-limit-mb "${SWAP_GROW_LIMIT_MB:-2048}" \
     2>&1 | tee "${WORK_DIR}/logs/cost.log"
 else
   echo "[pipeline] [2/4] cost.pkl exists, skipping"

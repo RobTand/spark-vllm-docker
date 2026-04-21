@@ -155,7 +155,7 @@ class StreamingContext:
 def _build_streaming_context(model_path: str, *,
                              device: torch.device, dtype: torch.dtype,
                              offload_folder: str,
-                             cache_headroom_gb: float = 50.0,
+                             cache_headroom_gb: float = 75.0,
                              log_prefix: str = "[streaming]") -> StreamingContext:
     """One-time setup: AutoConfig + empty skeleton, from_pretrained with an
     explicit device_map that pins the head resident and every decoder layer

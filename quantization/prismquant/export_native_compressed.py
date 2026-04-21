@@ -1570,7 +1570,8 @@ def main():
         print("[export-stream] materializing MTP tensors ...", flush=True)
         mtp_tensors = _materialize_mtp_tensors(
             args.model, assignment,
-            bf16_passthrough=bf16_passthrough, hist=hist)
+            bf16_passthrough=bf16_passthrough, hist=hist,
+            device=device)
         print(f"[export-stream] MTP: {len(mtp_tensors)} tensors", flush=True)
     else:
         print(f"[export-stream] profile '{profile.name}' has no MTP — "
@@ -1756,7 +1757,8 @@ def _materialize_mtp_tensors(src_model: str,
                              assignment: dict[str, str],
                              *,
                              bf16_passthrough: set[str],
-                             hist: dict) -> dict[str, torch.Tensor]:
+                             hist: dict,
+                             device: torch.device | str = "cpu") -> dict[str, torch.Tensor]:
     """Quantize MTP weights per the allocator recipe.
 
     Transformers v5 does not instantiate MTP modules when loading
@@ -1783,6 +1785,11 @@ def _materialize_mtp_tensors(src_model: str,
     wrapper.to(dtype=torch.bfloat16)
     raw = _load_mtp_state_dict(src_model)
     _load_into_mtp(inner, raw)
+    # Move the whole MTP module to the export device so
+    # _materialize_tensors_inmemory's per-linear quant runs on GPU when
+    # EXPORT_DEVICE=cuda. Previously defaulted to CPU, costing ~10× on
+    # MTP quant. The input weights (raw) are CPU, so we move after load.
+    wrapper.to(device=device)
     wrapper.eval()
     for p in wrapper.parameters():
         p.requires_grad_(False)

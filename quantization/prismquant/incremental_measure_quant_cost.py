@@ -722,6 +722,12 @@ def main():
             annotate_cost_shard(shard_path, expected_meta)
             if args.device.startswith("cuda"):
                 torch.cuda.empty_cache()
+            # Per-shard intermediates (activation snapshots, H-detail tensors,
+            # result dicts) accumulate pinned CPU memory. The CUDA allocator
+            # catch-frees back to the pool, but Python/CPU lingers — swap
+            # grows ~40 MB/shard on 122B without this gc sweep.
+            import gc as _gc
+            _gc.collect()
     finally:
         if ctx is not None:
             ctx.shutdown()
