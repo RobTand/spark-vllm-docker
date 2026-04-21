@@ -194,6 +194,28 @@ _ACT_AWARE_FLAGS: dict[str, bool] = {
     "awq_round": False,
 }
 
+# Proper-AWQ fold scales: maps target Linear recipe name -> float32 1D
+# tensor `s[in_features]` that was folded into the predecessor RMSNorm
+# γ and simultaneously multiplied into the target's weight IN-PLACE by
+# `_awq_fold_layer_predecessors`. Populated per-layer by the streaming
+# loop. The entry is only used downstream to DIVIDE the cached
+# activations for GPTQ and activation-weighted rounding — at runtime
+# vLLM will feed `a/s` into the Linear because γ already has 1/s folded
+# in, so for any error-minimization pass that references cached
+# activations, we must divide by `s` to match the runtime distribution.
+# The weight path does not consult this dict: weights have already been
+# pre-scaled in-place by the fold pass.
+_AWQ_PROPER_SCALES: dict[str, torch.Tensor] = {}
+
+# Targets whose predecessor is a non-linearity (softmax, silu*up, linear-
+# attn recurrent state, etc.). Proper AWQ cannot fold into these, so we
+# fall back to PURE RTN.
+_AWQ_SKIP_LEAF_NAMES = frozenset({
+    "o_proj",          # attention V->softmax@V->o_proj path
+    "down_proj",       # silu(gate) * up nonlinear product
+    "out_proj",        # DeltaNet internal recurrent state
+})
+
 
 # ---------------------------------------------------------------------------
 # Activation-aware quantization passes (closed-form, no iterative search).
@@ -251,6 +273,326 @@ def _awq_rescale_weight(weight: torch.Tensor, activations: torch.Tensor
     s = _awq_channel_scale(activations).to(weight.device)
     W_scaled = weight.to(torch.float32) * s.unsqueeze(0)
     return W_scaled, s
+
+
+def _awq_joint_channel_scale(
+    activations_list: list[torch.Tensor], eps: float = 1e-6,
+) -> torch.Tensor:
+    """Compute a single AWQ per-input-channel scale from a list of
+    cached activations that all feed through the SAME predecessor
+    (e.g. q/k/v all read from the same input_layernorm output, so all
+    three share identical activations at that tap — but callers still
+    pass the list for defensive stacking in case only a subset is
+    present). Returns a normalized 1D tensor `s[in_features]` with
+    `max(s) = 1`.
+    """
+    combined = torch.cat(
+        [a.detach().to(torch.float32).reshape(-1, a.shape[-1])
+         for a in activations_list],
+        dim=0,
+    )
+    mean_abs = combined.abs().mean(dim=0)
+    s = mean_abs.clamp_min(eps).pow(0.5)
+    s = s / s.max().clamp_min(eps)
+    s = s.clamp_min(eps)
+    return s
+
+
+# ---------------------------------------------------------------------------
+# Proper AWQ: fold reciprocal into predecessor (RMSNorm γ) with weight
+# pre-scaling of EVERY reader of that γ. This is the only way to preserve
+# the math invariant across mixed-format readers and packed-expert tensors.
+#
+# Invariant (per γ we fold):
+#   γ_new := γ / s
+#   For every reader M of γ:   M.W_new[:, in] := M.W[:, in] * s[in]
+# then at runtime:    M(γ_new · x) = M.W_new · (γ/s · x) = (M.W * s) · (γ/s · x)
+#                   = M.W · γ · x  =  M_original(γ · x)           (identity)
+#
+# The scale `s` is computed from the NVFP4 readers' cached activations
+# (those are the readers we want to minimize quant error for). But the
+# fold applies to ALL readers — NVFP4, MXFP8, BF16, packed experts.
+# Missing this for any reader breaks the identity: γ feeds `x/s` but the
+# reader still uses `W`, producing `(γ/s·x) · W` ≠ `γ·x · W`.
+# ---------------------------------------------------------------------------
+
+# Maps a layer-relative submodule path (or packed-expert param name) to
+# the name of its predecessor RMSNorm on the decoder layer. Readers
+# whose predecessor is nonlinear ("skip") do NOT participate in AWQ —
+# neither the γ nor the reader's weight are touched.
+#
+# The mapping is indexed by LEAF NAME (last dotted segment) because both
+# dense Linears and packed-expert param names share a flat leaf-name
+# space at their respective containers. Submodule-path prefixes are used
+# to disambiguate (e.g. `self_attn.q_proj` vs a hypothetical top-level
+# `q_proj`).
+_AWQ_PREDECESSOR_KIND: dict[str, str] = {
+    # Full-attention path.
+    "q_proj": "input_layernorm",
+    "k_proj": "input_layernorm",
+    "v_proj": "input_layernorm",
+    "o_proj": "skip",
+    # Linear-attention (DeltaNet) path.
+    "in_proj_qkv": "input_layernorm",
+    "in_proj_z": "input_layernorm",
+    "in_proj_a": "input_layernorm",
+    "in_proj_b": "input_layernorm",
+    "out_proj": "skip",
+    # MLP path (dense, shared_expert, and packed-expert readers that
+    # sit directly on `post_attention_layernorm(hidden)` — gate_proj /
+    # up_proj / gate_up_proj / w1 / w3 all read the LN output).
+    "gate_proj": "post_attention_layernorm",
+    "up_proj": "post_attention_layernorm",
+    "gate_up_proj": "post_attention_layernorm",
+    "w1": "post_attention_layernorm",
+    "w3": "post_attention_layernorm",
+    # MoE router — also reads directly from post_attention_layernorm.
+    # Qwen variants call it `gate`, Gemma/Mixtral call it `router`,
+    # DeepSeek calls it `router.classifier`. We catch the common leaf
+    # names here; `_awq_discover_layer_readers` adds a positional
+    # check so other aliases still fold correctly.
+    "gate": "post_attention_layernorm",
+    "router": "post_attention_layernorm",
+    # Nonlinear predecessors — do not fold.
+    "down_proj": "skip",
+    "w2": "skip",
+}
+
+# Packed-expert param names that read from `post_attention_layernorm`
+# (i.e. their input dim is the LN output dim) vs those that don't.
+_PACKED_READERS_OF_POST_LN = frozenset({
+    "gate_proj", "up_proj", "gate_up_proj", "w1", "w3",
+})
+
+
+def _awq_discover_layer_readers(
+    layer_mod: "nn.Module",
+) -> dict["nn.Module", list[dict]]:
+    """Enumerate every reader of every RMSNorm predecessor in the layer.
+
+    Returns a dict mapping each predecessor module (γ-holder) to a list
+    of reader records. Each reader record is one of:
+
+      linear reader:
+        {"kind": "linear", "sub_name": "self_attn.q_proj",
+         "leaf": "q_proj", "mod": <nn.Linear>, "in_features": int}
+
+      packed-expert reader:
+        {"kind": "packed", "sub_name": "mlp.experts", "leaf": "gate_proj",
+         "mod": <ExpertsModule>, "param_name": "gate_proj",
+         "in_features": int}
+
+    All modules that read the γ are included — regardless of their
+    assigned format (NVFP4 / MXFP8 / BF16). The caller decides which
+    readers contribute ACTIVATIONS (NVFP4 only) to compute the scale,
+    but every reader is still weight-scaled by that scale.
+
+    Predecessors whose kind is "skip" (post-nonlinearity readers like
+    o_proj, down_proj) are excluded: those are not in the returned dict
+    because there's no γ we can fold into on that path.
+    """
+    buckets: dict["nn.Module", list[dict]] = defaultdict(list)
+    # First pass: nn.Linear readers.
+    for sub_name, mod in layer_mod.named_modules():
+        if not isinstance(mod, nn.Linear):
+            continue
+        leaf = sub_name.rsplit(".", 1)[-1]
+        kind = _AWQ_PREDECESSOR_KIND.get(leaf)
+        if kind is None or kind == "skip":
+            continue
+        try:
+            pred_mod = layer_mod.get_submodule(kind)
+        except AttributeError:
+            continue
+        if getattr(pred_mod, "weight", None) is None:
+            continue
+        buckets[pred_mod].append({
+            "kind": "linear",
+            "sub_name": sub_name,
+            "leaf": leaf,
+            "mod": mod,
+            "in_features": int(mod.weight.shape[1]),
+        })
+    # Second pass: packed-experts readers. Params whose in-dim is the
+    # post_attention_layernorm output participate; params after a
+    # nonlinearity (down_proj / w2) are skipped.
+    for sub_name, mod in layer_mod.named_modules():
+        if not _is_packed_experts_module(mod):
+            continue
+        try:
+            post_ln = layer_mod.get_submodule("post_attention_layernorm")
+        except AttributeError:
+            continue
+        if getattr(post_ln, "weight", None) is None:
+            continue
+        for pn in _packed_experts_param_names(mod):
+            if pn not in _PACKED_READERS_OF_POST_LN:
+                continue
+            p = getattr(mod, pn)
+            if p.dim() != 3:
+                continue
+            in_features = int(p.shape[2])
+            # Sanity: the γ we're about to fold into has dim matching the
+            # reader's input dim. If not, skip this reader — folding would
+            # corrupt. This guards against exotic layouts (e.g. gate_up_proj
+            # shaped [E, 2*hidden, in] where in != hidden).
+            if int(post_ln.weight.shape[-1]) != in_features:
+                continue
+            buckets[post_ln].append({
+                "kind": "packed",
+                "sub_name": sub_name,
+                "leaf": pn,
+                "mod": mod,
+                "param_name": pn,
+                "in_features": in_features,
+            })
+    return buckets
+
+
+def _awq_fold_layer_predecessors(
+    layer_mod: "nn.Module",
+    layer_qname: str,
+    assignment: dict[str, str],
+    profile,
+    activation_lookup: dict[str, torch.Tensor],
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """Apply the proper-AWQ fold pass in-place on one resident decoder
+    layer.
+
+    Invariant established per predecessor γ:
+        γ      ← γ / s
+        M.W    ← M.W * s  (for every reader M of γ — Linear or packed)
+
+    For each predecessor γ we:
+      1. Enumerate every reader (all formats: NVFP4, MXFP8, BF16, packed
+         experts). The `_awq_discover_layer_readers` helper finds them.
+      2. Compute the joint scale `s` from cached activations of the
+         NVFP4 readers ONLY. The scale represents "which channels need
+         more FP4 quant grid budget" — an NVFP4-specific quantity. Non-
+         NVFP4 readers don't contribute to the scale but ARE scaled by
+         it so the identity holds.
+      3. If no NVFP4 reader has cached activations (e.g. only BF16
+         readers), skip this γ entirely — no fold.
+      4. Fold `γ /= s` once, and multiply every reader's weight by `s`
+         on the input dim in-place. For nn.Linear, scale `.weight.data`
+         on columns (dim 1). For packed experts, scale the 3D param
+         `.data` on dim 2 (`[E, out, in]`).
+
+    Returns `{recipe_key -> s}` for every NVFP4 LINEAR reader (only —
+    packed experts and non-NVFP4 readers don't appear). This dict is
+    used downstream by `_quantize_2d` to divide cached activations by
+    `s` when running GPTQ / activation-weighted rounding: at runtime
+    the reader sees `a/s`, so the importance weighting and covariance
+    must match.
+    """
+    readers_by_pred = _awq_discover_layer_readers(layer_mod)
+    if not readers_by_pred:
+        return {}
+
+    per_target_scale: dict[str, torch.Tensor] = {}
+    for pred_mod, readers in readers_by_pred.items():
+        # Gather NVFP4-reader activations for scale computation. Non-
+        # NVFP4 readers' activations are not loaded and the scale is
+        # a weighting designed for 4-bit quant error — using non-NVFP4
+        # readers' inputs would dilute the signal.
+        nvfp4_readers: list[dict] = []
+        acts_for_scale: list[torch.Tensor] = []
+        for r in readers:
+            # Build full qname. For Linear readers, sub_name already
+            # ends in the leaf (e.g. `self_attn.q_proj`). For packed
+            # experts, sub_name is the experts module (`mlp.experts`)
+            # and the param_name is the suffix (`gate_proj`).
+            if layer_qname:
+                full = f"{layer_qname}.{r['sub_name']}"
+            else:
+                full = r["sub_name"]
+            if r["kind"] == "packed":
+                full = f"{full}.{r['param_name']}"
+            recipe_key = profile.live_to_recipe_name(full)
+            r["recipe_key"] = recipe_key
+            r["full"] = full
+            if assignment.get(recipe_key) != "NVFP4":
+                continue
+            if r["kind"] != "linear":
+                # Packed-expert activations are keyed by the experts
+                # module qname (not per-param), and the recipe key for
+                # the param itself doesn't match that cache key. Skip
+                # packed experts in the scale computation; they still
+                # get scaled below.
+                nvfp4_readers.append(r)
+                continue
+            acts = activation_lookup.get(recipe_key)
+            if acts is None:
+                nvfp4_readers.append(r)
+                continue
+            acts_for_scale.append(acts)
+            nvfp4_readers.append(r)
+
+        if not acts_for_scale:
+            # No NVFP4 Linear with cached activations reads this γ —
+            # nothing to fold. (Purely-BF16 or purely-packed buckets
+            # land here; that's fine, fold is an optional optimization
+            # for NVFP4 quant error.)
+            continue
+
+        # Sanity-check dim agreement across readers. `acts_for_scale`
+        # all have `a.shape[-1] == in_features_nvfp4`. All other readers
+        # must agree on in_features (because they all read the same γ).
+        in_features = acts_for_scale[0].shape[-1]
+        for r in readers:
+            if r["in_features"] != in_features:
+                raise RuntimeError(
+                    f"[awq-fold] inconsistent in_features in layer "
+                    f"{layer_qname!r}: γ at {type(pred_mod).__name__} "
+                    f"feeds reader {r['sub_name']!r}.{r['leaf']} "
+                    f"(in={r['in_features']}) but NVFP4 reader has "
+                    f"in={in_features}. Aborting — fold would corrupt.")
+
+        s = _awq_joint_channel_scale(acts_for_scale).to(device)
+        s_safe = s.clamp_min(1e-12)
+
+        # 1) Fold γ /= s (in-place on the layer-resident RMSNorm).
+        gamma = pred_mod.weight
+        g = gamma.detach().to(torch.float32).to(device)
+        g_folded = g / s_safe
+        gamma.data.copy_(g_folded.to(device=gamma.device, dtype=gamma.dtype))
+
+        # 2) Scale every reader's weight on the input dim. In-place on
+        # the resident weight storage. Both nn.Linear (2D) and packed
+        # experts (3D [E, out, in]) receive the same logical update.
+        for r in readers:
+            if r["kind"] == "linear":
+                lin_mod: nn.Linear = r["mod"]
+                w = lin_mod.weight
+                w_scaled = (w.detach().to(torch.float32).to(device)
+                            * s.unsqueeze(0))
+                w.data.copy_(w_scaled.to(device=w.device, dtype=w.dtype))
+            elif r["kind"] == "packed":
+                experts_mod = r["mod"]
+                pn = r["param_name"]
+                param = getattr(experts_mod, pn)
+                # Scale on the in dim (index 2). Broadcast to [E, out, in].
+                p_scaled = (param.detach().to(torch.float32).to(device)
+                            * s.reshape(1, 1, -1))
+                param.data.copy_(
+                    p_scaled.to(device=param.device, dtype=param.dtype))
+            else:
+                raise RuntimeError(f"unknown reader kind: {r['kind']!r}")
+
+        # 3) Report scale for each NVFP4 LINEAR reader so `_quantize_2d`
+        # can divide cached activations by `s` for GPTQ / act-round.
+        # Packed experts don't have per-param cached activations (they
+        # share a single `experts`-module cache under a different key),
+        # so emitting a scale for them would mislead `_quantize_2d`'s
+        # lookup. The weight is already pre-scaled via the in-place
+        # fold; when the packed path runs downstream it just quantizes
+        # the scaled weights directly.
+        for r in nvfp4_readers:
+            if r["kind"] == "linear":
+                per_target_scale[r["recipe_key"]] = s
+
+    return per_target_scale
 
 
 def _gptq_obs_rounding_nvfp4(
@@ -828,6 +1170,16 @@ def _quantize_2d(
             and _CACHED_ACTIVATIONS is not None):
         acts = _CACHED_ACTIVATIONS.get(linear_name)
 
+    # Device fix: cached activations are stored on CPU (float32) to
+    # amortize load cost across many quant calls; weights land on the
+    # export device (typically CUDA). Move activations to the weight's
+    # device here so every downstream op (_awq_*, GPTQ H matrix,
+    # act-weighted rounding) runs on a consistent device. Repairs
+    # `Expected all tensors to be on the same device, but found at
+    # least two devices, cuda:0 and cpu!` in live Qwen3.6-35B export.
+    if acts is not None and acts.device != weight.device:
+        acts = acts.to(weight.device, non_blocking=True)
+
     # Resolve act-aware flags from the module-level config when none
     # were explicitly enabled via kwargs — lets main() turn them on
     # once without threading through every call site. Kwargs still
@@ -839,65 +1191,72 @@ def _quantize_2d(
 
     if fmt == "NVFP4":
         w_work = weight.to(torch.float32)
-        # Step 1: quasi-AWQ per-channel rescale. We do W' = W*s, quantize
-        # W', then divide out s from the dequantized result — this
-        # redistributes quant noise toward low-activation channels
-        # without needing to fold the reciprocal back into a prior
-        # layer (which we can't do at export time).
+        # Proper AWQ contract: when the per-layer fold pass
+        # `_awq_fold_layer_predecessors` has run, it has ALREADY
+        # multiplied `W *= s` in-place on the caller's weight storage
+        # (and divided the predecessor γ by the same `s`). The
+        # `weight` argument we received here already carries that
+        # scaling, so we do NOT re-scale inside `_quantize_2d`. The
+        # `_AWQ_PROPER_SCALES[linear_name]` entry (if present) exists
+        # solely to tell us "runtime activations for this module will
+        # be `a/s` after γ-fold, so divide cached activations by `s`
+        # when computing GPTQ covariance and activation-weighted
+        # rounding importance."
+        #
+        # Test-path / inline callers that don't run the fold pass
+        # simply leave `_AWQ_PROPER_SCALES` empty, in which case the
+        # cached activations are used verbatim. AWQ by itself then
+        # contributes nothing here — the rescaling IS the fold. GPTQ
+        # and activation-weighted rounding still run unchanged.
+        leaf_name = (linear_name or "").rsplit(".", 1)[-1]
+        skip_awq = leaf_name in _AWQ_SKIP_LEAF_NAMES
         awq_s: torch.Tensor | None = None
-        if awq_enabled and acts is not None and acts.shape[-1] == w_work.shape[1]:
-            w_work, awq_s = _awq_rescale_weight(w_work, acts)
+        if (awq_enabled and not skip_awq and linear_name is not None
+                and linear_name in _AWQ_PROPER_SCALES):
+            s_cand = _AWQ_PROPER_SCALES[linear_name]
+            if s_cand.numel() == w_work.shape[1]:
+                awq_s = s_cand.to(device=w_work.device, dtype=torch.float32)
+
+        def _acts_for_error_passes() -> torch.Tensor | None:
+            """Return cached activations adjusted for the runtime
+            distribution seen by this Linear. Under proper AWQ the
+            predecessor now emits `a/s`, so GPTQ's H matrix and act-
+            rounding's column importance must be computed from `a/s`.
+            Without AWQ, use the raw cached activations directly."""
+            if acts is None or acts.shape[-1] != w_work.shape[1]:
+                return None
+            if awq_s is None:
+                return acts
+            a2 = acts.to(torch.float32).reshape(-1, acts.shape[-1])
+            return a2 / awq_s.clamp_min(1e-12).unsqueeze(0)
 
         # Step 2: GPTQ one-shot OBS rounding (block-wise error prop).
         # Produces an already-dequantized tensor living on the NVFP4
         # grid; subsequent packing is lossless wrt this tensor.
-        if (gptq_enabled and acts is not None
-                and acts.shape[-1] == w_work.shape[1]):
-            # When AWQ pre-scaled, use the scaled activations too so
-            # the covariance matches the weight we're quantizing.
-            if awq_s is not None:
-                acts_work = acts.to(torch.float32).reshape(-1, acts.shape[-1])
-                acts_work = acts_work / awq_s.clamp_min(1e-12).unsqueeze(0)
-            else:
-                acts_work = acts
-            w_work = _gptq_obs_rounding_nvfp4(
-                w_work, acts_work, group_size=16,
-                global_real_override=nvfp4_global_real_override,
-            )
+        if gptq_enabled and not skip_awq:
+            acts_work = _acts_for_error_passes()
+            if acts_work is not None:
+                w_work = _gptq_obs_rounding_nvfp4(
+                    w_work, acts_work, group_size=16,
+                    global_real_override=nvfp4_global_real_override,
+                )
 
         # Step 3: activation-weighted rounding polish. If GPTQ already
         # placed every weight on the grid this is a no-op; otherwise
         # it's the cheap closed-form refinement.
-        if (awq_round_enabled and acts is not None
-                and acts.shape[-1] == w_work.shape[1]):
-            if awq_s is not None and not gptq_enabled:
-                # AWQ scaled weights but GPTQ didn't run. Use scaled
-                # activations so the importance matches the weight
-                # space we're rounding in.
-                acts_work = acts.to(torch.float32).reshape(-1, acts.shape[-1])
-                acts_work = acts_work / awq_s.clamp_min(1e-12).unsqueeze(0)
-            elif gptq_enabled and awq_s is not None:
-                acts_work = acts.to(torch.float32).reshape(-1, acts.shape[-1])
-                acts_work = acts_work / awq_s.clamp_min(1e-12).unsqueeze(0)
-            else:
-                acts_work = acts
-            w_work = _activation_weighted_round_nvfp4(
-                w_work, acts_work, group_size=16,
-                global_real_override=nvfp4_global_real_override,
-            )
+        if awq_round_enabled and not skip_awq:
+            acts_work = _acts_for_error_passes()
+            if acts_work is not None:
+                w_work = _activation_weighted_round_nvfp4(
+                    w_work, acts_work, group_size=16,
+                    global_real_override=nvfp4_global_real_override,
+                )
 
-        # Step 4: final NVFP4 pack. `w_work` has been transformed — we
-        # still run the standard packer to get the wire-format triple.
-        # If AWQ was active, undo the rescale post-pack so the stored
-        # weight matches the original `weight` semantically (see
-        # _awq_rescale_weight docstring). We achieve this by passing
-        # `w_work / s` through the packer.
-        if awq_s is not None:
-            w_to_pack = w_work / awq_s.clamp_min(1e-12).unsqueeze(0)
-        else:
-            w_to_pack = w_work
+        # Step 4: final NVFP4 pack. `w_work` is the post-AWQ,
+        # post-GPTQ, post-act-round weight. Store it as-is — the fold
+        # pass preserved the matmul identity externally.
         wp, ws, wg = quantize_dequantize_nvfp4(
-            w_to_pack, group_size=16,
+            w_work, group_size=16,
             global_real_override=nvfp4_global_real_override,
         )
         input_scale = input_global_scale_override
@@ -918,26 +1277,14 @@ def _quantize_2d(
             ),
         }
     if fmt == "MXFP8":
-        # AWQ rescale optional on MXFP8. GPTQ + act-weighted rounding
-        # are skipped — 8-bit quant noise is already <0.05 PPL at
-        # worst, the closed-form passes add more compute than they
-        # buy. We apply AWQ by going through the full quant-dequant
-        # cycle in scaled space, then dividing the dequantized result
-        # by `s` and re-quantizing normally so the wire format stays
-        # canonical. This is one extra round trip but MXFP8 is fast.
+        # MXFP8 is pure RTN. AWQ/GPTQ/act-weighted-round are all
+        # disabled on MXFP8: at 8-bit quant noise is already well
+        # below 0.05 PPL and the quasi-AWQ cycle that previously
+        # ran was mathematically equivalent to RTN at the stored
+        # weight (rescale → dequant → divide out). Proper AWQ on
+        # 8-bit would require the same predecessor-fold machinery
+        # as NVFP4 but the marginal benefit doesn't justify it.
         w_work = weight.to(torch.float32)
-        if awq_enabled and acts is not None and acts.shape[-1] == w_work.shape[1]:
-            w_scaled, awq_s = _awq_rescale_weight(w_work, acts)
-            # Dequantize the scaled weight using the same E8M0 + fp8
-            # decoding the kernel does, then divide out s.
-            grouped = w_scaled.reshape(
-                w_scaled.shape[0], w_scaled.shape[1] // 32, 32)
-            quant_fp8, e8m0 = _mxfp8_quantize_grouped(grouped)
-            scales = torch.pow(2.0,
-                               e8m0.to(torch.float32) - 127.0).unsqueeze(-1)
-            dq_scaled = (quant_fp8.to(torch.float32) * scales
-                         ).reshape(w_scaled.shape)
-            w_work = dq_scaled / awq_s.clamp_min(1e-12).unsqueeze(0)
         w, ws = quantize_dequantize_mxfp8(w_work, group_size=32)
         return {"weight": w, "weight_scale": ws}
     if fmt == "BF16":
@@ -998,6 +1345,13 @@ def _compute_layer_joint_nvfp4(layer_mod: nn.Module,
     groups inside this decoder layer. Only keys assigned NVFP4 get an
     override entry; the rest compute per-Linear scales at quantize time.
 
+    Under proper AWQ, fused siblings' weights have already been
+    pre-scaled in-place by `_awq_fold_layer_predecessors` (q/k/v or
+    gate/up share a γ, so they all receive the same `s`). Reading
+    `mod.weight` here returns the already-scaled weight, so
+    `compute_nvfp4_global_real` naturally produces the correct joint
+    global for the post-AWQ stored weight.
+
     Semantically equivalent to a scoped `_compute_nvfp4_joint_global`
     across just this layer's modules."""
     groups: dict[tuple[str, str], list[tuple[str, nn.Linear]]] = defaultdict(list)
@@ -1022,10 +1376,11 @@ def _compute_layer_joint_nvfp4(layer_mod: nn.Module,
         fmts = {f for _, _, f, _ in fqn_fmt}
         if fmts != {"NVFP4"}:
             continue
-        candidates = []
-        for _, _, _, mod in fqn_fmt:
-            w = mod.weight.detach().float()
-            candidates.append(compute_nvfp4_global_real(w, group_size=16))
+        candidates = [
+            compute_nvfp4_global_real(mod.weight.detach().float(),
+                                      group_size=16)
+            for _, _, _, mod in fqn_fmt
+        ]
         joint = torch.stack(candidates).max()
         for full, recipe_key, _, _ in fqn_fmt:
             out[recipe_key] = joint
@@ -1204,9 +1559,35 @@ def materialize_tensors_streaming(
 
         layer_mod = model.get_submodule(layer_qname)
 
-        # 3b. Joint NVFP4 scales across fused siblings in this layer.
+        # 3b. Proper-AWQ fold pass — modifies predecessor RMSNorm γ
+        # AND every reader's weight (nn.Linear + packed experts)
+        # IN-PLACE so the matmul identity `(W*s) @ (γ/s · x) = W·γ·x`
+        # holds at runtime regardless of each reader's assigned format.
+        # Must run BEFORE the fused-sibling joint NVFP4 pass and BEFORE
+        # any `_quantize_2d` call so downstream passes see post-AWQ
+        # weights. Returned dict maps NVFP4 Linear recipe_keys → `s`,
+        # used only for dividing cached activations in GPTQ / act-
+        # weighted rounding (runtime sees `a/s` after γ-fold, so the
+        # error-minimization passes must too).
+        global _AWQ_PROPER_SCALES
+        if (_ACT_AWARE_FLAGS.get("awq")
+                and _CACHED_ACTIVATIONS is not None):
+            layer_scales = _awq_fold_layer_predecessors(
+                layer_mod, layer_qname, assignment, profile,
+                _CACHED_ACTIVATIONS, device,
+            )
+            _AWQ_PROPER_SCALES.update(layer_scales)
+        else:
+            layer_scales = {}
+
+        # 3b'. Joint NVFP4 scales across fused siblings in this layer.
+        # Proper-AWQ pre-scaling has already been applied in-place by
+        # `_awq_fold_layer_predecessors`, so `mod.weight` is the post-
+        # AWQ weight. `_compute_layer_joint_nvfp4` reads those
+        # weights directly — no separate awq_scales kwarg needed.
         joint_globals = _compute_layer_joint_nvfp4(
-            layer_mod, layer_qname, assignment, profile)
+            layer_mod, layer_qname, assignment, profile,
+        )
 
         # 3c. Emit Linears.
         covered: set[str] = set()

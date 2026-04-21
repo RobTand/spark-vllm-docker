@@ -891,19 +891,26 @@ class TestActivationAwarePasses(unittest.TestCase):
         self.assertFalse(_ACT_AWARE_FLAGS["awq_round"])
 
     def test_quantize_2d_picks_up_module_flags(self):
-        """When `_ACT_AWARE_FLAGS` is set and cached activations are
-        present for the given linear_name, `_quantize_2d` runs the
-        act-aware pipeline transparently."""
+        """When `_ACT_AWARE_FLAGS` is set, GPTQ/activation-weighted
+        rounding are selected by `_quantize_2d` based on the module-
+        level flag bundle. We use GPTQ here (which measurably reshapes
+        the packed weight via block-wise error propagation) to verify
+        the flag dispatch works independently of AWQ."""
         import torch
         import quantization.prismaquant.export_native_compressed as m
         torch.manual_seed(11)
         W = torch.randn(32, 64) * 0.2
-        X = torch.randn(128, 64) * 0.3
+        # Imbalanced activations so GPTQ's block-wise error propagation
+        # has something to work with — uniform X yields the same per-
+        # block scales across blocks and GPTQ's update becomes a near-
+        # no-op vs RTN.
+        X = torch.randn(256, 64) * 0.1
+        X[:, :16] *= 10.0
         saved_flags = dict(m._ACT_AWARE_FLAGS)
         saved_cache = m._CACHED_ACTIVATIONS
         try:
             m._ACT_AWARE_FLAGS.update({
-                "awq": True, "gptq": False, "awq_round": True,
+                "awq": False, "gptq": True, "awq_round": False,
             })
             m._CACHED_ACTIVATIONS = {"demo.linear": X}
             out_with = m._quantize_2d(
@@ -919,13 +926,186 @@ class TestActivationAwarePasses(unittest.TestCase):
             m._ACT_AWARE_FLAGS.clear()
             m._ACT_AWARE_FLAGS.update(saved_flags)
             m._CACHED_ACTIVATIONS = saved_cache
-        # The weight_packed should differ because AWQ rearranges the
-        # quantization grid budget across channels.
+        # The weight_packed should differ because GPTQ reshapes the
+        # weight via block-wise error propagation.
         self.assertFalse(
             torch.equal(out_with["weight_packed"],
                         out_without["weight_packed"]),
             "act-aware flags had no effect on output",
         )
+
+    def test_awq_fold_end_to_end_matches_baseline_on_mixed_readers(self):
+        """Full invariant: after `_awq_fold_layer_predecessors` runs on
+        a layer with BOTH a dense NVFP4 Linear and a packed expert
+        sharing `post_attention_layernorm`, the module's forward must
+        still match the pre-fold forward bit-for-bit (modulo tiny
+        fp roundoff). The fold is an identity transformation — any
+        drift means a reader wasn't properly weight-scaled.
+
+        Layout:
+            RMSNorm(post_attention_layernorm) → feeds both
+                (a) a dense nn.Linear named `gate_proj`
+                    (known reader in `_AWQ_PREDECESSOR_KIND`)
+                (b) a packed-experts module with `gate_proj` param
+                    shaped [E, M, N] reading the SAME γ.
+        """
+        import torch
+        import torch.nn as nn
+        from quantization.prismaquant.export_native_compressed import (
+            _awq_fold_layer_predecessors,
+        )
+        torch.manual_seed(101)
+
+        class _PackedExperts(nn.Module):
+            """Mirrors the shape contract `_is_packed_experts_module`
+            expects: class name contains 'expert', 3D parameters in the
+            recognized name set."""
+
+            def __init__(self, E, M, N):
+                super().__init__()
+                self.gate_proj = nn.Parameter(torch.randn(E, M, N) * 0.1)
+
+            def forward(self, x):
+                # x: [B, N]; out: [B, E, M]
+                return torch.einsum("bn,emn->bem", x, self.gate_proj)
+
+        class _Layer(nn.Module):
+            def __init__(self, hidden, inter, n_experts):
+                super().__init__()
+                self.post_attention_layernorm = nn.RMSNorm(
+                    hidden, eps=1e-5)
+                with torch.no_grad():
+                    # Non-trivial γ to exercise the 1/s fold.
+                    self.post_attention_layernorm.weight.copy_(
+                        1.0 + 0.3 * torch.randn(hidden))
+                # Dense Linear reader — name matches _AWQ_PREDECESSOR_KIND.
+                self.gate_proj = nn.Linear(hidden, inter, bias=False)
+                self.mlp = nn.Module()
+                self.mlp.experts = _PackedExperts(n_experts, inter, hidden)
+
+            def forward(self, x):
+                h = self.post_attention_layernorm(x)
+                dense = self.gate_proj(h)                    # [B, inter]
+                packed = self.mlp.experts(h)                 # [B, E, inter]
+                return dense, packed
+
+        hidden, inter, E = 32, 48, 4
+        layer = _Layer(hidden, inter, E).eval()
+        # Imbalanced activation cache to exercise non-trivial s.
+        acts = torch.randn(200, hidden) * 0.1
+        acts[:, :6] *= 15.0
+
+        # Baseline forward (pre-fold).
+        x = torch.randn(5, hidden)
+        with torch.no_grad():
+            dense_ref, packed_ref = layer(x)
+            dense_ref = dense_ref.clone()
+            packed_ref = packed_ref.clone()
+
+        # Both readers are NVFP4 per assignment. The Linear drives scale
+        # computation (its cached activations); the packed experts don't
+        # have a separate cache entry (experts share one cache key in the
+        # real probe), so the fold relies on the Linear's activations
+        # while still scaling the packed params.
+        profile = _IdentityProfile()
+        assignment = {
+            "gate_proj": "NVFP4",
+            "mlp.experts.gate_proj": "NVFP4",
+        }
+        act_cache = {"gate_proj": acts}
+
+        _ = _awq_fold_layer_predecessors(
+            layer, "", assignment, profile, act_cache,
+            torch.device("cpu"),
+        )
+
+        with torch.no_grad():
+            dense_after, packed_after = layer(x)
+
+        max_rel_dense = ((dense_after - dense_ref).abs()
+                         / (dense_ref.abs().clamp_min(1e-6))).max().item()
+        max_rel_packed = ((packed_after - packed_ref).abs()
+                          / (packed_ref.abs().clamp_min(1e-6))).max().item()
+        # Threshold = 2e-3 accounts for fp32 roundoff in the RMSNorm
+        # forward with non-trivial γ + large activation imbalance.
+        # The fold is an analytical identity, so drift is floating-
+        # point noise only; runs show ~1e-4 typical.
+        self.assertLess(
+            max_rel_dense, 2e-3,
+            f"dense reader drift after fold: rel={max_rel_dense:.3e}")
+        self.assertLess(
+            max_rel_packed, 2e-3,
+            f"packed reader drift after fold: rel={max_rel_packed:.3e}")
+
+    def test_awq_fold_scales_bf16_readers_alongside_nvfp4(self):
+        """γ-fold invariant across mixed-format readers: an NVFP4
+        Linear and a BF16 Linear BOTH read the same γ. After fold,
+        both Linears must have had their weights scaled, and the
+        module's output must match baseline.
+        """
+        import torch
+        import torch.nn as nn
+        from quantization.prismaquant.export_native_compressed import (
+            _awq_fold_layer_predecessors,
+        )
+        torch.manual_seed(202)
+
+        class _Layer(nn.Module):
+            def __init__(self, hidden):
+                super().__init__()
+                self.post_attention_layernorm = nn.RMSNorm(hidden, eps=1e-5)
+                with torch.no_grad():
+                    self.post_attention_layernorm.weight.copy_(
+                        1.0 + 0.2 * torch.randn(hidden))
+                # NVFP4-assigned reader.
+                self.gate_proj = nn.Linear(hidden, hidden, bias=False)
+                # BF16-assigned reader sharing γ — the router.
+                self.gate = nn.Linear(hidden, 8, bias=False)
+
+            def forward(self, x):
+                h = self.post_attention_layernorm(x)
+                return self.gate_proj(h), self.gate(h)
+
+        hidden = 32
+        layer = _Layer(hidden).eval()
+        acts = torch.randn(150, hidden) * 0.1
+        acts[:, :4] *= 20.0
+
+        x = torch.randn(7, hidden)
+        with torch.no_grad():
+            gp_ref, g_ref = layer(x)
+            gp_ref = gp_ref.clone()
+            g_ref = g_ref.clone()
+            bf16_weight_before = layer.gate.weight.detach().clone()
+
+        profile = _IdentityProfile()
+        assignment = {
+            "gate_proj": "NVFP4",
+            "gate": "BF16",        # BF16 reader must still get W *= s
+        }
+        act_cache = {"gate_proj": acts}
+        _ = _awq_fold_layer_predecessors(
+            layer, "", assignment, profile, act_cache,
+            torch.device("cpu"),
+        )
+
+        # BF16 reader's weight must have changed — the fold is required
+        # to multiply by `s` regardless of target format.
+        self.assertFalse(
+            torch.equal(layer.gate.weight.detach(), bf16_weight_before),
+            "BF16 reader weight was not scaled — invariant broken")
+
+        with torch.no_grad():
+            gp_after, g_after = layer(x)
+
+        gp_rel = ((gp_after - gp_ref).abs()
+                  / gp_ref.abs().clamp_min(1e-6)).max().item()
+        g_rel = ((g_after - g_ref).abs()
+                 / g_ref.abs().clamp_min(1e-6)).max().item()
+        # Threshold = 2e-3 for fp32 roundoff under large-magnitude
+        # activation imbalance. Fold is analytical identity modulo fp.
+        self.assertLess(gp_rel, 2e-3, f"NVFP4 reader drift {gp_rel:.3e}")
+        self.assertLess(g_rel, 2e-3, f"BF16 reader drift {g_rel:.3e}")
 
     def test_mxfp8_awq_roundtrip_preserves_scale(self):
         """MXFP8 with AWQ enabled: the stored weight should still

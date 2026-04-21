@@ -1624,7 +1624,21 @@ def main():
     if visual_probe_path is not None and visual_probe_path.exists():
         all_pickles.append(visual_probe_path)
     merge_probe_pickles(all_pickles, Path(args.output))
-    print(f"[incremental] wrote merged probe to {args.output}", flush=True)
+    # Annotate the merged pickle with the calibration modality so
+    # run-pipeline.sh's reuse guard (and any downstream tooling) can
+    # reject a stale probe whose activations don't match the currently
+    # requested modality. Written under the top-level `meta` dict so a
+    # simple `pickle.load(...)['meta']['calibration_modality']` lookup
+    # works.
+    with open(args.output, "rb") as _f:
+        _merged = pickle.load(_f)
+    _meta = dict(_merged.get("meta", {}))
+    _meta["calibration_modality"] = args.calibration_modality
+    _merged["meta"] = _meta
+    with open(args.output, "wb") as _f:
+        pickle.dump(_merged, _f)
+    print(f"[incremental] wrote merged probe to {args.output} "
+          f"(calibration_modality={args.calibration_modality})", flush=True)
 
 
 if __name__ == "__main__":

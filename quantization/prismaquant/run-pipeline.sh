@@ -105,7 +105,44 @@ if [[ ! -f "${PROBE_PATH}" ]]; then
     --mm-nsamples 8 --mm-max-text-len 128 \
     2>&1 | tee "${WORK_DIR}/logs/probe.log"
 else
-  echo "[pipeline] [1/4] probe.pkl exists, skipping"
+  # Reuse guard: make sure the pre-existing probe.pkl matches the
+  # currently-requested calibration modality. Silently reusing a
+  # text-only probe under multimodal (or vice versa) would produce
+  # an assignment calibrated for the wrong activation distribution
+  # — visible later as bad PPL that's hard to root-cause. Fail loud
+  # and point the user at the file to delete.
+  probe_modality=$(python3 -c "
+import pickle, sys
+try:
+    with open(sys.argv[1], 'rb') as f:
+        blob = pickle.load(f)
+    meta = blob.get('meta', {}) if isinstance(blob, dict) else {}
+    m = meta.get('calibration_modality') or meta.get('modality') or 'text-only'
+    print(m)
+except Exception as e:
+    print(f'__error__:{e}', file=sys.stderr)
+    sys.exit(2)
+" "${PROBE_PATH}" 2>/dev/null || echo "__unknown__")
+  if [[ "${probe_modality}" == "__unknown__" ]]; then
+    echo "[pipeline] [1/4] probe.pkl exists but its calibration_modality"
+    echo "             could not be read. Aborting to avoid mixing probes."
+    echo "             Delete it explicitly to regenerate:"
+    echo "               rm ${PROBE_PATH}"
+    exit 2
+  fi
+  if [[ "${probe_modality}" != "${CALIBRATION_MODALITY}" ]]; then
+    echo "[pipeline] [1/4] ABORT: probe.pkl was calibrated for"
+    echo "             modality='${probe_modality}' but this run requests"
+    echo "             CALIBRATION_MODALITY='${CALIBRATION_MODALITY}'."
+    echo "             Reusing the probe would silently produce an"
+    echo "             assignment calibrated on the wrong activations."
+    echo ""
+    echo "             Delete the stale probe to regenerate:"
+    echo "               rm ${PROBE_PATH}"
+    echo "             Or unset CALIBRATION_MODALITY to match the probe."
+    exit 2
+  fi
+  echo "[pipeline] [1/4] probe.pkl exists (modality=${probe_modality}), skipping"
 fi
 
 # -----------------------------------------------------------------------
