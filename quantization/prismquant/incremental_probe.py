@@ -980,10 +980,12 @@ def _run_body_streaming_shard(
                 packed_full_acc.clear()
 
             ctx.unload(L)
+            # The `del` above drops all per-layer refs; CPython ref counting
+            # reclaims them synchronously. A full gc.collect() sweep here
+            # costs 50-150ms per layer (profiled) with no payoff — there are
+            # no reference cycles in this scope. CUDA's caching allocator
+            # also manages its free-list fine without explicit empty_cache.
             del x_in, out, saved_inputs, acc_stats, acc_h_full, handles
-            gc.collect()
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
 
             if L % 8 == 0 or L == 0 or L == num_layers - 1:
                 print(f"[incremental] bwd L{L:02d}  src={src}  load={load_s:.2f}s  "

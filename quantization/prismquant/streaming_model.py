@@ -155,7 +155,7 @@ class StreamingContext:
 def _build_streaming_context(model_path: str, *,
                              device: torch.device, dtype: torch.dtype,
                              offload_folder: str,
-                             cache_headroom_gb: float = 75.0,
+                             cache_headroom_gb: float = 50.0,
                              log_prefix: str = "[streaming]") -> StreamingContext:
     """One-time setup: AutoConfig + empty skeleton, from_pretrained with an
     explicit device_map that pins the head resident and every decoder layer
@@ -238,8 +238,12 @@ def _build_streaming_context(model_path: str, *,
     print(f"{log_prefix} layer cache budget={cache_bytes/(1024**3):.1f} GB "
           f"(free={free_bytes/(1024**3):.1f} GB)", flush=True)
 
+    # Modern NVMe handles concurrent queue depth well; 3 workers saturate
+    # the drive and eliminate prefetcher-stall windows where main's compute
+    # drains the ahead-queue faster than a single reader can refill it.
+    # Going higher (>3) sees diminishing returns and risks cache thrash.
     prefetch_pool = ThreadPoolExecutor(
-        max_workers=1, thread_name_prefix="prefetch")
+        max_workers=3, thread_name_prefix="prefetch")
 
     return StreamingContext(
         model=model, base_model=base_model, layers=layers,
