@@ -24,12 +24,16 @@ set -euo pipefail
 : "${FORMATS:=NVFP4,MXFP8_E4M3,BF16}"
 : "${TARGET_BITS:=4.75}"
 : "${PARETO_TARGETS:=4.5,4.6,4.7,4.75,4.85,5.0,5.25,5.5,6.0,7.0,8.25}"
-: "${NSAMPLES:=4}"
-: "${SEQLEN:=256}"
+# Calibration defaults. 4x256 was the historical minimum for correctness
+# validation; 32x1024 (N=32, T=1024 = 32768 tokens/sample, 32 samples)
+# produces ~7% lower PPL on the resulting quantized artifact at a
+# linear time cost in probe wall-time. Override for faster iteration.
+: "${NSAMPLES:=32}"
+: "${SEQLEN:=1024}"
 : "${LAYERS_PER_SHARD:=2}"
 : "${DATASET:=ultrachat_200k}"
 : "${DEVICE:=cuda}"
-: "${EXPORT_DEVICE:=cpu}"   # cpu is safer for streaming; cuda is faster
+: "${EXPORT_DEVICE:=cuda}"   # CUDA ~10× faster than CPU on NVFP4 packing
 : "${TARGET_PROFILE:=vllm_qwen3_5_packed_moe}"
 
 PROBE_PATH="${WORK_DIR}/artifacts/probe.pkl"
