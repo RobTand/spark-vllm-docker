@@ -419,3 +419,41 @@ class TestGlobalPrecomputeCache(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestMoEPairPromotion(unittest.TestCase):
+    """Regression: vLLM FusedMoE requires gate_up_proj + down_proj to
+    share a quantization scheme within a single layer. The allocator's
+    `promote_moe_pair` enforces this after per-layer super-candidate
+    selection."""
+
+    def test_mixed_pair_is_promoted(self):
+        from quantization.prismquant.allocator import promote_moe_pair
+        assign = {
+            "model.layers.46.mlp.experts.gate_up_proj": "NVFP4",
+            "model.layers.46.mlp.experts.down_proj": "BF16",
+        }
+        rank = {"BF16": 0, "MXFP8": 1, "NVFP4": 2}
+        out = promote_moe_pair(assign, rank)
+        self.assertEqual(out["model.layers.46.mlp.experts.gate_up_proj"], "NVFP4")
+        self.assertEqual(out["model.layers.46.mlp.experts.down_proj"], "NVFP4")
+
+    def test_matched_pair_is_stable(self):
+        from quantization.prismquant.allocator import promote_moe_pair
+        assign = {
+            "model.layers.5.mlp.experts.gate_up_proj": "MXFP8",
+            "model.layers.5.mlp.experts.down_proj": "MXFP8",
+        }
+        rank = {"BF16": 0, "MXFP8": 1, "NVFP4": 2}
+        out = promote_moe_pair(assign, rank)
+        self.assertEqual(out, assign)
+
+    def test_unrelated_names_untouched(self):
+        from quantization.prismquant.allocator import promote_moe_pair
+        assign = {
+            "model.layers.0.self_attn.q_proj": "NVFP4",
+            "model.layers.0.mlp.experts.gate_up_proj": "NVFP4",
+        }
+        rank = {"BF16": 0, "MXFP8": 1, "NVFP4": 2}
+        out = promote_moe_pair(assign, rank)
+        self.assertEqual(out, assign)

@@ -127,6 +127,43 @@ def fused_siblings(name: str, profile=None) -> tuple[tuple[str, ...], str] | Non
     return (name,), key
 
 
+def promote_moe_pair(assignment: dict[str, str],
+                     format_rank: dict[str, int]) -> dict[str, str]:
+    """Couple MoE packed-expert projections within a layer to share a format.
+
+    vLLM's FusedMoE layer requires `experts.gate_up_proj` and
+    `experts.down_proj` to use identical quantization schemes — it
+    raises 'All MoE projections need to have same quantization scheme
+    but found multiple' at load time otherwise. The per-layer MoE
+    super-candidate aggregation (`_aggregate_packed_moe_experts`) picks
+    them independently, so the allocator can end up with L46 gate_up=
+    NVFP4 / L46 down=BF16 and produce an unservable artifact.
+
+    This post-pass groups `(layer_prefix, "experts")` across both
+    projections and promotes the lower-rank sibling to match the
+    higher. Idempotent; safe to stack with `promote_fused`."""
+    out = dict(assignment)
+    # Group by (everything up to .experts., projection-family) so
+    # gate_up_proj and down_proj of the same layer end up together.
+    groups: dict[str, list[str]] = {}
+    for name in assignment:
+        m = re.search(r"^(.+\.experts)\.(gate_up_proj|down_proj)$", name)
+        if not m:
+            continue
+        prefix = m.group(1)
+        groups.setdefault(prefix, []).append(name)
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        ranks = [format_rank[out[m]] for m in members]
+        best = max(ranks)
+        best_fmt = next(k for k, v in format_rank.items() if v == best)
+        for m in members:
+            if format_rank[out[m]] < best:
+                out[m] = best_fmt
+    return out
+
+
 def promote_fused(assignment: dict[str, str],
                   format_rank: dict[str, int],
                   profile=None) -> dict[str, str]:
@@ -215,6 +252,12 @@ def solve_with_promotion(
             return last_assign, last_achieved
         if not no_fused_promote:
             assign = promote_fused(assign, format_rank, profile=profile)
+        # MoE pair coupling: gate_up_proj + down_proj within the same
+        # layer must share a format (vLLM FusedMoE requirement). Run
+        # unconditionally — there's no "skip promote" flag for this
+        # because it's a hard correctness constraint, not an
+        # optimization; the unservable artifact is silent otherwise.
+        assign = promote_moe_pair(assign, format_rank)
         achieved, _ = compute_achieved(stats, assign, format_specs)
         last_assign = assign
         last_achieved = achieved
