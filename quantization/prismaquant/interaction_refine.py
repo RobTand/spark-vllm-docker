@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from itertools import combinations
 
-from .allocator import Candidate, _shape_from_stats, fused_siblings
+from .allocator import Candidate, _shape_from_stats, _group_by_profile
 
 
 @dataclass(frozen=True)
@@ -74,9 +74,56 @@ def _layer_group_for_name(name: str, present: set[str]) -> tuple[str, ...] | Non
     return members if len(members) > 1 else None
 
 
+_SIBLING_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (".self_attn.", ("q_proj", "k_proj", "v_proj")),
+    (".mlp.", ("gate_proj", "up_proj")),
+    (".mlp.shared_expert.", ("gate_proj", "up_proj")),
+    (".linear_attn.", ("in_proj_qkv", "in_proj_z")),
+    (".linear_attn.", ("in_proj_a", "in_proj_b")),
+)
+
+
+def _name_pattern_siblings(name: str, present: set[str]) -> tuple[str, ...] | None:
+    """Heuristic sibling detector by name pattern. Covers the serving-
+    fused families (q/k/v, gate/up, in_proj_qkvz/ba) across all Qwen/
+    LLaMA/DeltaNet variants we ship. Used when a profile-based classifier
+    isn't available (e.g. bare-name test inputs)."""
+    for parent_marker, leaves in _SIBLING_PATTERNS:
+        idx = name.rfind(parent_marker)
+        if idx < 0:
+            continue
+        parent = name[:idx + len(parent_marker)]
+        leaf = name[idx + len(parent_marker):]
+        if leaf not in leaves:
+            continue
+        members = tuple(sorted(
+            f"{parent}{cand}" for cand in leaves if f"{parent}{cand}" in present
+        ))
+        if len(members) > 1:
+            return members
+    return None
+
+
 def _unit_groups(names: list[str], unit_scope: str = "sibling") -> list[tuple[str, ...]]:
     present = set(names)
-    groups = {}
+    # Build the sibling-key → [names] map once. `_group_by_profile` uses
+    # the profile's `fused_sibling_group` classifier (derived from the
+    # vLLM class's `packed_modules_mapping`), which is the same key the
+    # native exporter uses for joint NVFP4 globals — so a refinement
+    # unit groups exactly what vLLM fuses at serve time. We fall back
+    # to the pattern detector below when the profile can't classify a
+    # name (happens with bare-name test inputs, or legacy Linears that
+    # don't appear in a vLLM packed_modules_mapping).
+    from .model_profiles import DefaultProfile
+    profile = DefaultProfile()
+    sibling_key_to_names = _group_by_profile(list(present), profile)
+    name_to_fusion = {
+        name: tuple(sorted(members))
+        for members in sibling_key_to_names.values()
+        for name in members
+    }
+
+    groups: dict[tuple[str, ...], tuple[str, ...]] = {}
     for name in names:
         if ".__fused__." in name:
             key = (name,)
@@ -89,12 +136,13 @@ def _unit_groups(names: list[str], unit_scope: str = "sibling") -> list[tuple[st
             if unit_scope == "layer" and key is None:
                 key = _layer_group_for_name(name, present)
             if key is None:
-                sib = fused_siblings(name)
-                if sib is not None:
-                    siblings, _kind = sib
-                    key = tuple(sorted(m for m in siblings if m in present))
-                    if len(key) <= 1:
-                        key = None
+                sibs = name_to_fusion.get(name)
+                if sibs is not None and len(sibs) > 1:
+                    key = sibs
+            if key is None:
+                sibs = _name_pattern_siblings(name, present)
+                if sibs is not None:
+                    key = sibs
             if key is None:
                 key = (name,)
             else:

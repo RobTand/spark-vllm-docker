@@ -55,20 +55,38 @@ class TestExportMixedNative(unittest.TestCase):
             "model.layers.0.self_attn.o_proj": "NVFP4",
             "model.layers.0.mlp.down_proj": "BF16",
         }
-        groups, ignore = build_config_groups(
+        groups, ignore, default_format = build_config_groups(
             assignment,
             ignore=["lm_head"],
             mxfp8_flavor="W8A8",
             fp8_flavor="dynamic",
         )
+        # Two groups emitted: one explicit for the non-default format
+        # (MXFP8 — q/k/v), one "Linear" catchall for the default
+        # (NVFP4 — o_proj). BF16 + ignored live in `ignore`.
+        # Default is the lowest-rank format present (NVFP4 ranks 0 per
+        # FORMAT_RANK; MXFP8 ranks 2) — it gets the catchall target.
         self.assertEqual(set(groups.keys()), {"group_0", "group_1"})
+        self.assertEqual(default_format, "NVFP4")
         self.assertIn("model.layers.0.mlp.down_proj", ignore)
         self.assertIn("lm_head", ignore)
+        # Explicit MXFP8 targets land in the non-catchall group.
+        explicit_targets = []
+        for group in groups.values():
+            if group["targets"] != ["Linear"]:
+                explicit_targets.extend(group["targets"])
+        self.assertIn(explicit_regex("model.layers.0.self_attn.q_proj"),
+                      explicit_targets)
+        self.assertIn(explicit_regex("model.layers.0.self_attn.v_proj"),
+                      explicit_targets)
+        # NVFP4 (the default) goes into the "Linear" catchall group —
+        # o_proj gets picked up there, not via an explicit regex.
         all_targets = []
         for group in groups.values():
             all_targets.extend(group["targets"])
-        self.assertIn(explicit_regex("model.layers.0.self_attn.q_proj"), all_targets)
-        self.assertIn(explicit_regex("model.layers.0.self_attn.o_proj"), all_targets)
+        self.assertIn("Linear", all_targets)
+        self.assertNotIn(explicit_regex("model.layers.0.self_attn.o_proj"),
+                         explicit_targets)
 
 
 if __name__ == "__main__":
