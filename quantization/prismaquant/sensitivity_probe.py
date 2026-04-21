@@ -1592,11 +1592,35 @@ def run_multimodal_visual_probe_pass(
               "skipping multimodal pass", flush=True)
         return False
 
+    # Load the DECLARED arch directly, bypassing AutoModelForCausalLM's
+    # silent text-only downgrade path. `AutoModelForCausalLM` resolves
+    # Qwen3_5MoeConfig → Qwen3_5MoeForCausalLM (text-only), which
+    # matches `config.sub_configs["text_config"]` and triggers
+    # transformers/auto_factory.py:132-134 to swap the composite config
+    # for just the text sub-config. The visual tower tensors in the
+    # safetensors are then silently dropped, and `named_modules()`
+    # returns 0 Linears under `model.visual.*`. Use
+    # `config.architectures[0]` to instantiate the multimodal class
+    # (Qwen3_5MoeForConditionalGeneration), which keeps the visual
+    # tower wired.
     try:
-        model = AutoModelForCausalLM.from_pretrained(
-            staged, torch_dtype=dtype, device_map=requested_device,
-            low_cpu_mem_usage=False, trust_remote_code=True,
-        )
+        import transformers
+        from transformers import AutoConfig
+        cfg = AutoConfig.from_pretrained(staged, trust_remote_code=True)
+        arch_names = getattr(cfg, "architectures", None) or []
+        if arch_names and hasattr(transformers, arch_names[0]):
+            model_cls = getattr(transformers, arch_names[0])
+            model = model_cls.from_pretrained(
+                staged, torch_dtype=dtype, device_map=requested_device,
+                low_cpu_mem_usage=False, trust_remote_code=True,
+            )
+        else:
+            # No declared arch (or not importable) — fall back to the
+            # auto class. Works for non-composite-config text-only models.
+            model = AutoModelForCausalLM.from_pretrained(
+                staged, torch_dtype=dtype, device_map=requested_device,
+                low_cpu_mem_usage=False, trust_remote_code=True,
+            )
     except (torch.cuda.OutOfMemoryError, RuntimeError, MemoryError) as e:
         msg = str(e).lower()
         if ("out of memory" in msg or "oom" in msg
