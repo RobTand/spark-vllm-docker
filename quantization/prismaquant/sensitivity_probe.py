@@ -144,6 +144,209 @@ def stage_text_only(model_path: str) -> str:
     return str(staged)
 
 
+# ---------------------------------------------------------------------------
+# Multimodal staging — Phase 2 visual calibration (mirror of stage_text_only)
+# ---------------------------------------------------------------------------
+def stage_multimodal(model_path: str) -> str:
+    """Stage a multimodal model PRESERVING `vision_config` (and `audio_config`
+    where present). This is the mirror of `stage_text_only`, used by the
+    Phase 2 visual Fisher probe path: AutoModelForCausalLM.from_pretrained
+    must see the complete multimodal config so the visual tower actually
+    materializes; AutoProcessor must see the preprocessor_config shard
+    to tokenize image+text pairs.
+
+    Unlike `stage_text_only` we don't strip multimodal keys, don't promote
+    `text_config.model_type`, and don't rewrite architectures. We symlink
+    every source file (including preprocessor_config.json,
+    video_preprocessor_config.json, processor_config.json) into the
+    staged dir verbatim.
+
+    When the source has no multimodal config keys, this is effectively a
+    no-op and we return the source path unchanged — matching
+    `stage_text_only`'s fast path.
+    """
+    src = Path(model_path)
+    cfg_path = src / "config.json"
+    if not cfg_path.exists():
+        return str(src)
+    with open(cfg_path) as f:
+        cfg = json.load(f)
+    # If this checkpoint has no multimodal bits, nothing to do — return
+    # the source directly so the caller doesn't pay for a symlink tree
+    # on pure-text checkpoints.
+    if not any(k in cfg for k in ("vision_config", "audio_config",
+                                  "speech_config")):
+        return str(src)
+
+    import tempfile
+    staged = Path(tempfile.mkdtemp(prefix="prismaquant_mm_stage_"))
+    for p in src.iterdir():
+        if p.name == "config.json":
+            continue
+        (staged / p.name).symlink_to(p.resolve())
+    # Write the source config through verbatim. We intentionally do NOT
+    # strip vision_config/audio_config, do NOT rewrite architectures,
+    # and do NOT promote text_config.model_type — the multimodal loader
+    # needs the full config as-is.
+    with open(staged / "config.json", "w") as f:
+        json.dump(cfg, f, indent=2)
+    return str(staged)
+
+
+# ---------------------------------------------------------------------------
+# Multimodal calibration loader — Phase 2 visual Fisher
+# ---------------------------------------------------------------------------
+def _synthetic_multimodal_calibration_samples(
+    processor, n_samples: int, max_text_len: int,
+) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Offline synthetic fallback: n small PIL images + short captions
+    fed through the processor. Exercises the visual Fisher path without
+    needing network access. Real COCO/HF datasets replace this when
+    `--mm-dataset` is a HuggingFace id.
+
+    Each sample is a 224x224 RGB image with a deterministic flat color
+    (enough to make patch-embed + attention gradients non-trivial) and
+    a short caption matched to its index.
+    """
+    try:
+        from PIL import Image
+    except Exception:
+        return []
+    captions = [
+        "a red apple on a wooden table",
+        "a blue sky with scattered clouds",
+        "a cat sleeping on a patterned rug",
+        "a yellow sunflower in a green field",
+        "a coffee mug next to an open book",
+        "a golden retriever chasing a frisbee",
+        "a mountain lake reflecting tall peaks",
+        "a busy city street at night",
+    ]
+    out: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    for i in range(n_samples):
+        size = 224
+        img = Image.new("RGB", (size, size),
+                        color=(30 + (i * 37) % 220,
+                               40 + (i * 53) % 200,
+                               50 + (i * 67) % 180))
+        caption = captions[i % len(captions)]
+        prompt = f"<|image|>Describe: {caption}"
+        # Processor may be None (e.g. tests without a real processor) —
+        # in that case we build the triple directly as a rank-4 pixel
+        # tensor + a random integer id sequence. This keeps the
+        # calibration shape + dtype contract intact for unit tests.
+        if processor is None:
+            import torch as _t
+            pixel_values = _t.rand(1, 3, size, size, dtype=_t.float32)
+            # Tiny fake id sequence (ids in [1, 100] so both labels and
+            # vocab-index masking behave sensibly even without a real
+            # tokenizer).
+            input_ids = _t.randint(1, 100, (1, min(max_text_len, 16)),
+                                   dtype=_t.long)
+            out.append((pixel_values, input_ids, input_ids.clone()))
+            continue
+        enc = None
+        try:
+            enc = processor(text=prompt, images=img, return_tensors="pt")
+        except Exception:
+            # Some processors need chat-template messages. Try that shape.
+            try:
+                messages = [{
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": img},
+                        {"type": "text", "text": f"Describe: {caption}"},
+                    ],
+                }]
+                enc = processor.apply_chat_template(
+                    messages, add_generation_prompt=False,
+                    tokenize=True, return_dict=True, return_tensors="pt")
+            except Exception:
+                continue
+        if enc is None:
+            continue
+        pixel_values = enc.get("pixel_values")
+        input_ids = enc.get("input_ids")
+        if pixel_values is None or input_ids is None:
+            continue
+        if input_ids.size(1) > max_text_len:
+            input_ids = input_ids[:, :max_text_len]
+        out.append((pixel_values, input_ids, input_ids.clone()))
+    return out
+
+
+def load_multimodal_calibration(
+    processor,
+    dataset_name: str,
+    n_samples: int,
+    max_text_len: int,
+) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Build a list of (pixel_values, input_ids, labels) triples for
+    multimodal Fisher calibration.
+
+    `processor` is an `AutoProcessor` — usually loaded via
+    `AutoProcessor.from_pretrained(model_path, trust_remote_code=True)`.
+
+    `dataset_name`:
+      - `"synthetic"` (default): built-in offline stub. No network, no
+        HF datasets dependency beyond what transformers itself needs.
+        Used to exercise the visual Fisher code path under unit tests
+        and in environments without dataset access.
+      - any other string: treated as a HuggingFace dataset id. We stream
+        up to `n_samples * 4` rows and filter for rows that have an
+        image (+ a caption/text field). Falls back to the synthetic
+        stub on any load failure (offline, rate-limited, schema
+        mismatch, etc.) so the probe always makes forward progress.
+
+    Labels default to `input_ids.clone()` (teacher-forced CE on the
+    joint image+text sequence). Processors that emit `-100` sentinel
+    ids for masked positions are handled by the probe's CE backward —
+    not by this loader.
+    """
+    triples: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    if dataset_name == "synthetic":
+        return _synthetic_multimodal_calibration_samples(
+            processor, n_samples, max_text_len)
+    try:
+        from datasets import load_dataset
+        ds = load_dataset(dataset_name, split="train", streaming=True)
+        iterator = iter(ds)
+        for _ in range(n_samples * 4):
+            try:
+                row = next(iterator)
+            except StopIteration:
+                break
+            img = row.get("image")
+            caption = (row.get("caption")
+                       or row.get("sentences", [{}])[0].get("raw")
+                       or row.get("text")
+                       or "describe this image")
+            if img is None:
+                continue
+            prompt = f"<|image|>Describe: {caption}"
+            try:
+                enc = processor(text=prompt, images=img, return_tensors="pt")
+            except Exception:
+                continue
+            pixel_values = enc.get("pixel_values")
+            input_ids = enc.get("input_ids")
+            if pixel_values is None or input_ids is None:
+                continue
+            if input_ids.size(1) > max_text_len:
+                input_ids = input_ids[:, :max_text_len]
+            triples.append((pixel_values, input_ids, input_ids.clone()))
+            if len(triples) >= n_samples:
+                break
+    except Exception as e:
+        print(f"[probe/mm] dataset {dataset_name!r} unreachable ({e}); "
+              f"falling back to synthetic stub", flush=True)
+    if len(triples) < n_samples:
+        synth = _synthetic_multimodal_calibration_samples(
+            processor, n_samples - len(triples), max_text_len)
+        triples.extend(synth)
+    return triples[:n_samples]
+
+
 class _GradNormCapture(torch.autograd.Function):
     """Identity in forward; in backward, accumulates packed-expert Fisher
     statistics at up to three granularities and returns None for the
@@ -1322,3 +1525,185 @@ def run_probe_pass(model: nn.Module,
             },
         }, f)
     print(f"[probe] wrote {out_path}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 multimodal visual Fisher probe — non-streaming second pass
+# ---------------------------------------------------------------------------
+def run_multimodal_visual_probe_pass(
+    model_path: str,
+    *,
+    dataset_name: str,
+    n_samples: int,
+    max_text_len: int,
+    requested_device: str,
+    dtype: torch.dtype,
+    linear_include: str,
+    linear_exclude: str,
+    activation_cache_dir: str | None,
+    output_path: str,
+    h_detail_dir: str | None = None,
+) -> bool:
+    """Non-streaming multimodal Fisher probe focused on the visual encoder.
+
+    Loads the FULL multimodal model via `AutoModelForCausalLM` (so the
+    visual tower materializes alongside the body), runs each
+    (pixel_values, input_ids, labels) triple through forward + supervised
+    CE backward, and captures per-visual-Linear Fisher via
+    `FisherAccumulator`. Activation snapshots go to the same
+    `activation_cache_dir` the streaming body path uses, so the cost
+    stage and export stage both see visual Linears under their canonical
+    recipe names.
+
+    Visual tower on Qwen3.6-35B is ~1 GB BF16 plus ~70 GB body weights —
+    fits under a 128 GB budget. For very large VLMs (e.g. 122B) where the
+    body alone exceeds RAM, this function catches the OOM / load error,
+    logs a warning, returns False, and the caller falls back to the Phase
+    1 uniform `--visual-format` override. No partial calibration is
+    written on failure.
+
+    Returns True on successful probe completion (output pickle written),
+    False on graceful fallback. Raises only on unexpected errors
+    (not OOM / resource shortage).
+    """
+    from transformers import AutoModelForCausalLM, AutoProcessor
+
+    staged = stage_multimodal(model_path)
+    try:
+        processor = AutoProcessor.from_pretrained(model_path,
+                                                  trust_remote_code=True)
+    except Exception:
+        try:
+            processor = AutoProcessor.from_pretrained(staged,
+                                                      trust_remote_code=True)
+        except Exception as e:
+            print(f"[probe/mm] AutoProcessor.from_pretrained failed "
+                  f"({type(e).__name__}: {e}); skipping multimodal pass. "
+                  f"Falling back to --visual-format Phase 1 override.",
+                  flush=True)
+            return False
+
+    triples = load_multimodal_calibration(
+        processor, dataset_name, n_samples, max_text_len)
+    print(f"[probe/mm] loaded {len(triples)} multimodal samples "
+          f"(dataset={dataset_name!r})", flush=True)
+    if not triples:
+        print("[probe/mm] load_multimodal_calibration returned 0 samples; "
+              "skipping multimodal pass", flush=True)
+        return False
+
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            staged, torch_dtype=dtype, device_map=requested_device,
+            low_cpu_mem_usage=False, trust_remote_code=True,
+        )
+    except (torch.cuda.OutOfMemoryError, RuntimeError, MemoryError) as e:
+        msg = str(e).lower()
+        if ("out of memory" in msg or "oom" in msg
+                or isinstance(e, (torch.cuda.OutOfMemoryError, MemoryError))):
+            print(f"[probe/mm] whole-model multimodal load OOM "
+                  f"({type(e).__name__}); falling back to --visual-format "
+                  f"Phase 1 override. On 122B-scale models this is expected.",
+                  flush=True)
+            return False
+        # Other RuntimeError (weight mismatch, etc.) isn't OOM — re-raise.
+        raise
+    model.eval()
+    exec_device = resolve_execution_device(model, requested_device)
+
+    for p in model.parameters():
+        p.requires_grad_(False)
+
+    inc = re.compile(linear_include)
+    exc = re.compile(linear_exclude)
+    tracked = [n for n, m in model.named_modules()
+               if isinstance(m, nn.Linear)
+               and inc.search(n) and not exc.search(n)]
+    print(f"[probe/mm] tracking {len(tracked)} Linear layers "
+          f"(include={linear_include!r})", flush=True)
+
+    expert_info_all = discover_moe_structure(model)
+    expert_info = {k: v for k, v in expert_info_all.items() if k in tracked}
+    top_k = read_top_k(model, default=2)
+    routers = sorted({r for r, _ in expert_info.values()})
+    tracker = RouterTracker(model, routers, top_k) if routers else None
+
+    cache_dir = Path(activation_cache_dir) if activation_cache_dir else None
+    detail_dir = Path(h_detail_dir) if h_detail_dir else None
+    acc = FisherAccumulator(model, tracked, expert_info, cache_dir,
+                            h_detail_dir=detail_dir)
+
+    model.train()
+    t_fwd = t_bwd = 0.0
+    for i, (pixel_values, input_ids, labels) in enumerate(triples):
+        pixel_values = pixel_values.to(exec_device, dtype=dtype)
+        input_ids = input_ids.to(exec_device)
+        labels = labels.to(exec_device)
+        t0 = time.time()
+        try:
+            out = model(pixel_values=pixel_values,
+                        input_ids=input_ids,
+                        labels=labels)
+        except Exception as e:
+            print(f"[probe/mm] sample {i}: forward raised {type(e).__name__}: "
+                  f"{e}; skipping", flush=True)
+            acc._saved_inputs.clear()
+            continue
+        logits = out.logits
+        t_fwd += time.time() - t0
+
+        t0 = time.time()
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        lp = F.log_softmax(
+            shift_logits.reshape(-1, shift_logits.size(-1)), dim=-1)
+        valid = shift_labels.reshape(-1)
+        mask = (valid >= 0) & (valid < shift_logits.size(-1))
+        if not mask.any():
+            acc._saved_inputs.clear()
+            continue
+        gather = -lp[mask.nonzero(as_tuple=True)[0]].gather(
+            1, valid[mask].reshape(-1, 1)).squeeze(1)
+        loss = gather.sum()
+        loss.backward()
+        t_bwd += time.time() - t0
+
+        print(f"[probe/mm] sample {i + 1}/{len(triples)} "
+              f"loss={float(loss) / max(gather.numel(), 1):.3f} "
+              f"fwd_avg={t_fwd / (i + 1):.2f}s "
+              f"bwd_avg={t_bwd / (i + 1):.2f}s", flush=True)
+
+        del out, loss, logits
+        acc._saved_inputs.clear()
+
+    acc.finalize(tracker)
+    acc.remove_hooks()
+    if tracker is not None:
+        tracker.remove_hooks()
+
+    out_path = Path(output_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "wb") as f:
+        pickle.dump({
+            "stats": acc.stats,
+            "router_counts": dict(tracker.counts) if tracker else {},
+            "router_totals": dict(tracker.total_tokens) if tracker else {},
+            "expert_info": expert_info,
+            "meta": {
+                "model": model_path,
+                "dataset": dataset_name,
+                "nsamples": len(triples),
+                "seqlen": max_text_len,
+                "dtype": str(dtype),
+                "device_map": requested_device,
+                "execution_device": str(exec_device),
+                "top_k": top_k,
+                "importance_weighting": False,
+                "activation_cache_dir": str(cache_dir) if cache_dir else None,
+                "linear_include": linear_include,
+                "linear_exclude": linear_exclude,
+                "calibration_modality": "multimodal",
+            },
+        }, f)
+    print(f"[probe/mm] wrote {out_path}", flush=True)
+    return True

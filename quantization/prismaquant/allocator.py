@@ -940,16 +940,26 @@ def main():
                     choices=["BF16", "NVFP4", "MXFP8"],
                     default="BF16",
                     help="Uniform format for all visual-encoder Linears "
-                         "(`model.visual.blocks.*`). Phase 1 override: the "
-                         "text-only probe does not exercise the visual "
-                         "tower, so per-Linear Fisher is zero and the "
-                         "knapsack DP has no signal. Default BF16 matches "
-                         "the previous passthrough behavior; NVFP4 / MXFP8 "
-                         "uniformly quantize every visual Linear via the "
-                         "existing RTN math at export time. Phase 2 "
-                         "(multimodal Fisher with image calibration data) "
-                         "will replace this override with per-Linear "
-                         "sensitivity-driven allocation.")
+                         "(`model.visual.blocks.*`). Phase 1 fallback: "
+                         "assigned to every visual Linear when "
+                         "--visual-sensitivity=uniform OR when --visual-"
+                         "sensitivity=fisher but the probe / cost pickles "
+                         "don't carry real visual Fisher data. BF16 (default) "
+                         "reproduces passthrough behavior; NVFP4 / MXFP8 "
+                         "shrink the tower to quantized storage via the "
+                         "existing RTN math at export time.")
+    ap.add_argument("--visual-sensitivity",
+                    choices=["fisher", "uniform"],
+                    default="fisher",
+                    help="How visual-encoder Linears enter the allocator. "
+                         "'fisher' (default) treats them as regular DP "
+                         "candidates when the probe pickle carries real "
+                         "multimodal Fisher stats (produced by "
+                         "`incremental_probe --calibration-modality="
+                         "multimodal`). If those stats are missing, falls "
+                         "back to uniform --visual-format. 'uniform' forces "
+                         "the Phase 1 path: every visual Linear gets "
+                         "--visual-format regardless of what's in the probe.")
     args = ap.parse_args()
 
     if args.threads > 0:
@@ -1147,28 +1157,71 @@ def main():
     else:
         assignment_expanded = assignment
 
-    # Inject visual-encoder Linears under the uniform --visual-format
-    # override. Visual Linears never appear in stats/costs (text-only
-    # probe strips the visual tower), so we scan the source checkpoint
-    # here and append synthetic entries to the expanded assignment. The
-    # exporter then quantizes them via its normal _quantize_2d path.
-    # We always write an explicit recipe entry so downstream tooling has
-    # a deterministic record of the decision, even for the BF16 default.
+    # Visual-encoder Linear handling. Two paths:
+    #
+    # 1. --visual-sensitivity=fisher (default) + probe/cost have real
+    #    visual entries → visual Linears already participated in the
+    #    knapsack DP above with their own per-Linear Fisher + per-format
+    #    RTN cost. No override needed; just make sure every discoverable
+    #    visual Linear has an assignment entry (fall back to --visual-
+    #    format for any that the probe missed, e.g. patch_embed Linears
+    #    that the probe's regex didn't hit).
+    #
+    # 2. --visual-sensitivity=uniform OR Fisher missing → Phase 1 path:
+    #    scan source checkpoint for visual Linears and stamp them all
+    #    with --visual-format.
     visual_format = args.visual_format
-    if probe_model_path:
-        visual_names = discover_visual_linears_from_source(probe_model_path)
-    else:
-        visual_names = []
-    if visual_names:
-        for vname in visual_names:
-            assignment_expanded[vname] = visual_format
-        print(f"[alloc] --visual-format={visual_format}: assigned "
-              f"{len(visual_names)} visual Linears uniformly "
-              f"(source={probe_model_path})", flush=True)
-    elif visual_format != "BF16":
-        print(f"[alloc] --visual-format={visual_format}: no visual "
-              f"Linears found in source checkpoint — override is a no-op",
+    visual_sensitivity = args.visual_sensitivity
+
+    def _visual_fisher_available(stats_d: dict, costs_d: dict) -> bool:
+        """True when both the probe and cost pickles carry real visual
+        entries — the signal a multimodal calibration pass ran."""
+        any_visual_stats = any(_is_visual_linear(n) for n in stats_d)
+        any_visual_costs = any(_is_visual_linear(n) for n in costs_d)
+        return any_visual_stats and any_visual_costs
+
+    fisher_visual_ok = (visual_sensitivity == "fisher"
+                        and _visual_fisher_available(stats, costs))
+    if visual_sensitivity == "fisher" and not fisher_visual_ok:
+        print("[alloc] --visual-sensitivity=fisher requested but probe / "
+              "cost pickles have no visual Linear entries; falling back "
+              f"to --visual-format={visual_format} (Phase 1 uniform).",
               flush=True)
+
+    if probe_model_path:
+        visual_names_src = discover_visual_linears_from_source(probe_model_path)
+    else:
+        visual_names_src = []
+
+    if fisher_visual_ok:
+        # Fisher path: DP already placed visual Linears. Fill in any
+        # discoverable visual Linear that the DP missed (e.g. the probe
+        # regex matched only `visual.blocks.*` but the source has
+        # `visual.merger.*` or `visual.patch_embed.*` too) with the
+        # uniform --visual-format as a safety net.
+        dp_visual_count = sum(1 for n in assignment_expanded
+                              if _is_visual_linear(n))
+        filled = 0
+        for vname in visual_names_src:
+            if vname not in assignment_expanded:
+                assignment_expanded[vname] = visual_format
+                filled += 1
+        print(f"[alloc] --visual-sensitivity=fisher: DP placed "
+              f"{dp_visual_count} visual Linears via per-Linear Fisher; "
+              f"{filled} additional visual Linears (un-probed) stamped "
+              f"with --visual-format={visual_format}.", flush=True)
+    else:
+        # Uniform path (Phase 1): stamp every discoverable visual Linear.
+        if visual_names_src:
+            for vname in visual_names_src:
+                assignment_expanded[vname] = visual_format
+            print(f"[alloc] --visual-format={visual_format}: assigned "
+                  f"{len(visual_names_src)} visual Linears uniformly "
+                  f"(source={probe_model_path})", flush=True)
+        elif visual_format != "BF16":
+            print(f"[alloc] --visual-format={visual_format}: no visual "
+                  f"Linears found in source checkpoint — override is a "
+                  f"no-op", flush=True)
 
     layer_cfg = {}
     for name, fmt in assignment_expanded.items():

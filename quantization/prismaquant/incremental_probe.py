@@ -54,6 +54,8 @@ from .sensitivity_probe import (
     load_calibration,
     per_token_ce,
     read_top_k,
+    run_multimodal_visual_probe_pass,
+    stage_multimodal,
     stage_text_only,
 )
 from .streaming_model import (
@@ -1303,6 +1305,34 @@ def main():
                     help="Number of layers to queue ahead in the disk "
                          "prefetch pool. Bump up when per-layer compute "
                          "time >> per-layer disk read time (e.g. batch>=32).")
+    ap.add_argument("--calibration-modality",
+                    choices=["text-only", "multimodal"],
+                    default="text-only",
+                    help="'text-only' (default) runs only the streaming body "
+                         "Fisher probe; visual shards emit empty pickles and "
+                         "the allocator's --visual-format override takes over. "
+                         "'multimodal' also runs a second, non-streaming "
+                         "pass that loads the full multimodal model "
+                         "(vision_config preserved) and runs pixel_values + "
+                         "text through a supervised CE backward. Real "
+                         "per-visual-Linear Fisher + activation snapshots "
+                         "land in the probe pickle + activation cache, so "
+                         "the allocator treats visual Linears as regular DP "
+                         "candidates and the exporter's AWQ/GPTQ/AR passes "
+                         "apply. Multimodal requires enough RAM for the full "
+                         "model; on 122B-scale models it falls back to the "
+                         "Phase 1 --visual-format override automatically on "
+                         "OOM / load failure.")
+    ap.add_argument("--mm-dataset", default="synthetic",
+                    help="Dataset source for multimodal calibration. Accepts "
+                         "a HuggingFace dataset id (e.g. `HuggingFaceM4/COCO`) "
+                         "or `synthetic` (default: offline stub that exercises "
+                         "the code path without network access).")
+    ap.add_argument("--mm-nsamples", type=int, default=8,
+                    help="Number of (image, caption) samples for the "
+                         "multimodal calibration pass.")
+    ap.add_argument("--mm-max-text-len", type=int, default=128,
+                    help="Max text tokens per multimodal calibration sample.")
     args = ap.parse_args()
 
     n_layers = load_num_hidden_layers(args.model)
@@ -1519,9 +1549,12 @@ def main():
                 # visual blocks are stripped by text-only staging, so the
                 # streaming body never installs them. Emit an empty pickle
                 # so the shard slot stays in the merged output with matching
-                # metadata (and future visual-aware runs can fill it in).
+                # metadata. When --calibration-modality=multimodal the
+                # post-loop multimodal probe pass fills these in with real
+                # visual Linear Fisher + activation snapshots.
                 print(f"[incremental] skip shard {shard_idx} ({kind}): "
-                      f"not supported in streaming path", flush=True)
+                      f"streaming path text-only; multimodal second pass "
+                      f"will overlay visual stats if enabled", flush=True)
                 Path(shard_path).parent.mkdir(parents=True, exist_ok=True)
                 with open(shard_path, "wb") as f:
                     pickle.dump({
@@ -1554,7 +1587,43 @@ def main():
         if ctx is not None:
             ctx.shutdown()
 
-    merge_probe_pickles(shard_paths, Path(args.output))
+    # ---- Phase 2 multimodal visual probe (non-streaming second pass) ----
+    # Runs after the streaming body / MTP / lm_head shards complete. Loads
+    # the FULL multimodal model (vision_config preserved via stage_multimodal)
+    # and captures per-visual-Linear Fisher + activation snapshots under the
+    # same activation_cache_dir. The captured stats merge into the merged
+    # probe pickle below so the allocator sees visual Linears as regular
+    # DP candidates (if --visual-sensitivity=fisher).
+    visual_probe_path: Path | None = None
+    if args.calibration_modality == "multimodal":
+        dtype_map = {"bf16": torch.bfloat16, "fp16": torch.float16,
+                     "fp32": torch.float32}
+        mm_dtype = dtype_map[args.dtype]
+        visual_probe_path = work_dir / "shards" / "probe_visual_mm.pkl"
+        visual_include = r"^(?:model\.)?visual\."
+        ok = run_multimodal_visual_probe_pass(
+            args.model,
+            dataset_name=args.mm_dataset,
+            n_samples=args.mm_nsamples,
+            max_text_len=args.mm_max_text_len,
+            requested_device=args.device,
+            dtype=mm_dtype,
+            linear_include=visual_include,
+            linear_exclude=linear_exclude,
+            activation_cache_dir=args.activation_cache_dir,
+            output_path=str(visual_probe_path),
+            h_detail_dir=args.h_detail_dir,
+        )
+        if not ok:
+            print("[incremental] multimodal visual probe skipped / failed; "
+                  "allocator will need --visual-format for visual Linears",
+                  flush=True)
+            visual_probe_path = None
+
+    all_pickles = list(shard_paths)
+    if visual_probe_path is not None and visual_probe_path.exists():
+        all_pickles.append(visual_probe_path)
+    merge_probe_pickles(all_pickles, Path(args.output))
     print(f"[incremental] wrote merged probe to {args.output}", flush=True)
 
 

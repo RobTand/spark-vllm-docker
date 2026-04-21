@@ -8,12 +8,26 @@
 #   FORMATS=NVFP4,MXFP8_E4M3,BF16 \
 #   TARGET_BITS=4.75 \
 #   VISUAL_FORMAT=BF16 \
+#   CALIBRATION_MODALITY=text-only \
 #   ./quantization/prismaquant/run-pipeline.sh
 #
 # VISUAL_FORMAT (BF16 | NVFP4 | MXFP8) applies to visual-encoder Linears
-# on multimodal models. Default BF16 leaves the visual tower at
-# passthrough — the Phase 1 override only activates when a non-BF16
-# value is supplied.
+# on multimodal models. In text-only calibration mode it's the Phase 1
+# uniform override for every visual Linear. In multimodal mode it's the
+# fallback applied to un-probed visual Linears the allocator's Fisher-
+# driven DP didn't touch (plus the graceful OOM fallback on 122B-scale
+# VLMs that can't fit the whole model in RAM for the multimodal pass).
+#
+# CALIBRATION_MODALITY (text-only | multimodal):
+#   - text-only (default): body-only streaming probe + cost. Visual
+#     shards emit empty pickles; allocator stamps all visual Linears
+#     with --visual-format uniformly.
+#   - multimodal: also runs a non-streaming second probe pass with
+#     image+text calibration (synthetic stub by default; set MM_DATASET
+#     to a HuggingFace dataset id to use real images). The allocator
+#     treats visual Linears as regular DP candidates when real Fisher
+#     stats are present. Requires ~full-model RAM; falls back to
+#     text-only behavior automatically on OOM.
 #
 # Memory note: probe + cost peak around 90 GB on a 35B model under
 # BF16 calibration. The watchdog in incremental_measure_quant_cost
@@ -41,13 +55,21 @@ set -euo pipefail
 : "${DEVICE:=cuda}"
 : "${EXPORT_DEVICE:=cuda}"   # CUDA ~10× faster than CPU on NVFP4 packing
 : "${TARGET_PROFILE:=vllm_qwen3_5_packed_moe}"
-# Visual encoder format (Phase 1): uniform override for all visual Linears
-# (`model.visual.blocks.*`). Text-only probe cannot inform per-Linear
-# sensitivity, so the allocator forces a single format uniformly. BF16 is
-# safe and matches pre-Phase-1 passthrough; NVFP4 / MXFP8 shrink the tower
-# on disk at export time via the existing RTN math. Ignored for non-
-# multimodal checkpoints (no visual Linears → override is a no-op).
+# Visual encoder format: fallback for visual Linears. See header docstring
+# for the full text-only vs multimodal semantics. BF16 (default) is
+# passthrough; NVFP4 / MXFP8 uniformly quantize non-Fisher-allocated
+# visual Linears via the existing RTN math at export time.
 : "${VISUAL_FORMAT:=BF16}"
+# Calibration modality. `text-only` (default) is the streaming body probe
+# alone; `multimodal` adds a second non-streaming pass over the full
+# model with image+text calibration so visual Linears get real Fisher
+# stats. See header docstring.
+: "${CALIBRATION_MODALITY:=text-only}"
+# Multimodal dataset. `synthetic` is the offline stub that exercises the
+# code path without network. Set to an HF dataset id (e.g.
+# `HuggingFaceM4/COCO`) for real image calibration when
+# CALIBRATION_MODALITY=multimodal.
+: "${MM_DATASET:=synthetic}"
 
 PROBE_PATH="${WORK_DIR}/artifacts/probe.pkl"
 COST_PATH="${WORK_DIR}/artifacts/cost.pkl"
@@ -60,6 +82,7 @@ echo "  WORK_DIR=$WORK_DIR"
 echo "  FORMATS=$FORMATS  TARGET_BITS=$TARGET_BITS"
 echo "  NSAMPLES=$NSAMPLES SEQLEN=$SEQLEN LAYERS_PER_SHARD=$LAYERS_PER_SHARD"
 echo "  VISUAL_FORMAT=$VISUAL_FORMAT"
+echo "  CALIBRATION_MODALITY=$CALIBRATION_MODALITY  MM_DATASET=$MM_DATASET"
 echo
 
 # -----------------------------------------------------------------------
@@ -77,6 +100,9 @@ if [[ ! -f "${PROBE_PATH}" ]]; then
     --activation-cache-dir "${WORK_DIR}/act" \
     --work-dir "${WORK_DIR}/work" \
     --layers-per-shard "$LAYERS_PER_SHARD" \
+    --calibration-modality "$CALIBRATION_MODALITY" \
+    --mm-dataset "$MM_DATASET" \
+    --mm-nsamples 8 --mm-max-text-len 128 \
     2>&1 | tee "${WORK_DIR}/logs/probe.log"
 else
   echo "[pipeline] [1/4] probe.pkl exists, skipping"
@@ -109,6 +135,16 @@ fi
 # 3. Allocator (multi-choice knapsack over per-layer formats)
 # -----------------------------------------------------------------------
 echo "[pipeline] [3/4] running allocator at target=${TARGET_BITS} bpp ..."
+# Choose visual-sensitivity mode from calibration modality:
+#   text-only → uniform (Phase 1 --visual-format path, as before)
+#   multimodal → fisher (Phase 2: DP places visual Linears from real
+#                        multimodal Fisher; --visual-format acts as a
+#                        fallback for un-probed visual Linears only)
+if [[ "$CALIBRATION_MODALITY" == "multimodal" ]]; then
+  VISUAL_SENSITIVITY=fisher
+else
+  VISUAL_SENSITIVITY=uniform
+fi
 python3 -m quantization.prismaquant.allocator \
   --probe "${PROBE_PATH}" \
   --costs "${COST_PATH}" \
@@ -117,6 +153,7 @@ python3 -m quantization.prismaquant.allocator \
   --target-profile "$TARGET_PROFILE" \
   --pareto-targets "$PARETO_TARGETS" \
   --visual-format "$VISUAL_FORMAT" \
+  --visual-sensitivity "$VISUAL_SENSITIVITY" \
   --layer-config "${WORK_DIR}/artifacts/layer_config.json" \
   --pareto-csv "${WORK_DIR}/artifacts/pareto.csv" \
   2>&1 | tee "${WORK_DIR}/logs/allocator.log"

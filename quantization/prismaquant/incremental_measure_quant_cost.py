@@ -504,6 +504,141 @@ def _write_empty_cost_shard(
 
 
 # ---------------------------------------------------------------------------
+# Visual cost shard runner — Phase 2 multimodal support.
+# Loads the multimodal-staged model (vision_config preserved) and runs
+# `measure_batched_gpu` / `measure_unbatched` against cached activations
+# for the visual Linears matched by this shard's regex. The 35B visual
+# tower is ~1 GB BF16; the full 35B model fits in 128 GB. On 122B-scale
+# models the whole-model load OOMs and we gracefully emit an empty shard
+# so the allocator's --visual-format override can take over.
+# ---------------------------------------------------------------------------
+def _run_visual_cost_shard(
+    *,
+    model_path: str,
+    linear_include: str,
+    probe_stats: dict[str, dict],
+    act_cache: "ActivationIndex",
+    specs: list[fr.FormatSpec],
+    device: str,
+    dtype: torch.dtype,
+    mode: str,
+    chunk_size: int,
+    h_detail: "HDetailIndex | None",
+    output_path: str,
+    model_name: str,
+    probe_path: str,
+) -> bool:
+    """Measure per-(visual-Linear, format) cost. Loads the multimodal
+    model (visual tower intact), intersects `linear_include` with the
+    probe stats and with live visual Linears, runs the shared measurement
+    pipeline, writes the shard pickle.
+
+    Returns True on success, False on whole-model load failure (OOM etc.),
+    in which case an empty cost shard is written so the merge layout
+    stays consistent and the allocator's --visual-format override can
+    still apply.
+    """
+    from .sensitivity_probe import stage_multimodal
+
+    inc = re.compile(linear_include)
+    shard_targets = {n for n in probe_stats if inc.search(n)}
+    if not shard_targets:
+        print(f"[incremental-cost/visual] shard has no matching visual "
+              f"tensors in probe stats (include={linear_include!r}); "
+              f"writing empty pickle", flush=True)
+        _write_empty_cost_shard(
+            output_path, shard_kind="visual", specs=specs,
+            model_name=model_name, probe_path=probe_path,
+        )
+        return True
+
+    staged = stage_multimodal(model_path)
+    from transformers import AutoModelForCausalLM
+
+    print(f"[incremental-cost/visual] loading full multimodal model for "
+          f"{len(shard_targets)} visual tensors (shard={linear_include!r})",
+          flush=True)
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            staged, torch_dtype=dtype, device_map=device,
+            low_cpu_mem_usage=False, trust_remote_code=True,
+        )
+    except (torch.cuda.OutOfMemoryError, RuntimeError, MemoryError) as e:
+        msg = str(e).lower()
+        if ("out of memory" in msg or "oom" in msg
+                or isinstance(e, (torch.cuda.OutOfMemoryError, MemoryError))):
+            print(f"[incremental-cost/visual] whole-model load OOM "
+                  f"({type(e).__name__}); writing empty pickle. The "
+                  f"allocator's --visual-format override will assign a "
+                  f"uniform format to visual Linears.", flush=True)
+            _write_empty_cost_shard(
+                output_path, shard_kind="visual", specs=specs,
+                model_name=model_name, probe_path=probe_path,
+            )
+            return False
+        raise
+
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
+
+    live_linears = {n for n, m in model.named_modules()
+                    if isinstance(m, nn.Linear)}
+    target_names = shard_targets & live_linears
+    if not target_names:
+        print(f"[incremental-cost/visual] probe stats matched the include "
+              f"regex but no live visual Linears with the same name; "
+              f"writing empty pickle", flush=True)
+        _write_empty_cost_shard(
+            output_path, shard_kind="visual", specs=specs,
+            model_name=model_name, probe_path=probe_path,
+        )
+        del model
+        gc.collect()
+        if device.startswith("cuda"):
+            torch.cuda.empty_cache()
+        return True
+
+    try:
+        results = _run_cost_measurement(
+            model,
+            act_cache=act_cache,
+            target_names=target_names,
+            specs=specs,
+            device=device,
+            dtype=dtype,
+            mode=mode,
+            chunk_size=chunk_size,
+            h_detail=h_detail,
+            log_prefix="[incremental-cost/visual]",
+        )
+    finally:
+        del model
+        gc.collect()
+        if device.startswith("cuda"):
+            torch.cuda.empty_cache()
+
+    out_path = Path(output_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "wb") as f:
+        pickle.dump({
+            "costs": results,
+            "formats": [s.name for s in specs],
+            "meta": {
+                "model": model_name,
+                "probe": probe_path,
+                "n_linears": len(results),
+                "mode": ("batched" if mode == "auto" and device.startswith("cuda")
+                         else ("unbatched" if mode == "auto" else mode)),
+                "shard_kind": "visual",
+            },
+        }, f)
+    print(f"[incremental-cost/visual] wrote {out_path} "
+          f"({len(results)} entries)", flush=True)
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -708,19 +843,35 @@ def main():
                     model_name=args.model,
                     probe_path=args.probe,
                 )
+            elif kind == "visual":
+                # Phase 2 multimodal path: if the probe's multimodal pass
+                # populated visual Linear stats + activations, measure
+                # them the same way body Linears are measured. If the
+                # probe ran text-only (visual stats empty) or the
+                # whole-model load OOMs (122B scale), fall back to an
+                # empty pickle and let the allocator's --visual-format
+                # override take over.
+                _run_visual_cost_shard(
+                    model_path=args.model,
+                    linear_include=linear_include,
+                    probe_stats=stats,
+                    act_cache=act_cache,
+                    specs=specs,
+                    device=args.device,
+                    dtype=dtype,
+                    mode=args.mode,
+                    chunk_size=args.chunk_size,
+                    h_detail=h_detail,
+                    output_path=str(shard_path),
+                    model_name=args.model,
+                    probe_path=args.probe,
+                )
             else:
-                # visual blocks: text-only staging strips them, so we
-                # emit an empty pickle slot to mirror the probe's shard
-                # layout. The allocator does NOT consume a visual cost
-                # entry — Phase 1 visual-encoder support forces all
-                # visual Linears to one uniform format via the
-                # allocator's `--visual-format` override, bypassing the
-                # per-Linear cost/DP decision that text-only calibration
-                # couldn't inform anyway. Phase 2 (multimodal Fisher)
-                # will replace this skip with real measurements.
-                print(f"[incremental-cost] skip shard {shard_idx} ({kind}): "
-                      f"visual handled by allocator's --visual-format "
-                      f"override, not per-Linear cost DP", flush=True)
+                # Other unclassified shard kinds — keep the empty-pickle
+                # fallback for safety.
+                print(f"[incremental-cost] unknown shard kind {kind!r} "
+                      f"(include={linear_include!r}); writing empty pickle",
+                      flush=True)
                 _write_empty_cost_shard(
                     str(shard_path), shard_kind=kind, specs=specs,
                     model_name=args.model, probe_path=args.probe,
