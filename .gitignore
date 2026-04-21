@@ -1,2 +1,11 @@
 .env
 build-metadata.yaml
+# Local exports + caches (multi-GB, not source)
+dq-runs-new/
+dq-runs/
+__pycache__/
+*.pyc
+# Local claude-code state
+.claude/
+# Scratch directory for overnight experiments + throwaway artifacts
+.tmp_artifacts/
