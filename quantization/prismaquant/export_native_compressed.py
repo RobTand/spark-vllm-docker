@@ -225,17 +225,40 @@ _AWQ_SKIP_LEAF_NAMES = frozenset({
 # `_quantize_2d`:  AWQ rescale → per-group RTN → GPTQ error prop →
 # activation-weighted rounding polish.
 # ---------------------------------------------------------------------------
-def _awq_channel_scale(activations: torch.Tensor, eps: float = 1e-6
+def _awq_channel_scale(activations: torch.Tensor, eps: float = 1e-4,
+                       clamp_ratio: float = 10.0,
                        ) -> torch.Tensor:
     """Compute AWQ per-input-channel scale `s[c] = mean|a[:, c]|^0.5`,
-    normalized so `max(s) = 1`. See AWQ paper (Lin et al. 2023).
+    normalized by the geometric mean of its max and min (AutoAWQ /
+    LMQuant convention), and HARD-CLAMPED to a log-symmetric window
+    `[1/clamp_ratio, clamp_ratio]` for bf16-runtime numerical safety.
+
+    Why geomean not max: max-normalization pushes low-activation
+    channels toward `eps`, making `γ/s` blow up by 1/eps at inference
+    time. In bf16 runtime the cancellation `(W*s)·(γ/s) = W·γ` loses
+    precision catastrophically when the ratio is extreme. Geomean
+    normalization centers `s` around 1 in log space; the extra hard
+    clamp at 10× caps bf16 error accumulation on real-world channel
+    imbalance (some Qwen layers have max/min activation-mean ratios
+    of ~1e4 which the geomean alone only tames to ~100×).
+
     Returns a float32 1D tensor of length `in_features`.
     """
     a = activations.detach().to(torch.float32).reshape(-1, activations.shape[-1])
     mean_abs = a.abs().mean(dim=0)                       # [in_features]
     s = mean_abs.clamp_min(eps).pow(0.5)                 # α = 0.5
-    s = s / s.max().clamp_min(eps)                       # normalize to [eps, 1]
-    s = s.clamp_min(eps)                                 # avoid div-by-zero
+    # Geomean normalization: s / sqrt(s_max * s_min) — centers around 1
+    # in log space. See AutoAWQ `quantize/quantizer.py:406` and llm-awq
+    # `auto_scale.py:130`.
+    norm = (s.max() * s.min()).sqrt().clamp_min(eps)
+    s = s / norm
+    # Hard clamp on the ratio — bf16 mantissa is 8 bits, so per-product
+    # error is ~0.4%. Keeping max(s)/min(s) ≤ clamp_ratio² bounds the
+    # accumulated matmul error from the cancellation pattern `W*s · γ/s`.
+    s = s.clamp(1.0 / clamp_ratio, clamp_ratio)
+    # Defensive nan/inf guard — a constant-zero activation channel can
+    # otherwise poison the entire scale vector.
+    s = torch.nan_to_num(s, nan=1.0, posinf=1.0, neginf=1.0)
     return s
 
 
@@ -276,15 +299,19 @@ def _awq_rescale_weight(weight: torch.Tensor, activations: torch.Tensor
 
 
 def _awq_joint_channel_scale(
-    activations_list: list[torch.Tensor], eps: float = 1e-6,
+    activations_list: list[torch.Tensor], eps: float = 1e-4,
+    clamp_ratio: float = 10.0,
 ) -> torch.Tensor:
     """Compute a single AWQ per-input-channel scale from a list of
     cached activations that all feed through the SAME predecessor
     (e.g. q/k/v all read from the same input_layernorm output, so all
     three share identical activations at that tap — but callers still
     pass the list for defensive stacking in case only a subset is
-    present). Returns a normalized 1D tensor `s[in_features]` with
-    `max(s) = 1`.
+    present).
+
+    Applies the same geomean normalization + hard clamp as
+    `_awq_channel_scale`. See that function's docstring for the
+    bf16-numerical-safety rationale.
     """
     combined = torch.cat(
         [a.detach().to(torch.float32).reshape(-1, a.shape[-1])
@@ -293,8 +320,10 @@ def _awq_joint_channel_scale(
     )
     mean_abs = combined.abs().mean(dim=0)
     s = mean_abs.clamp_min(eps).pow(0.5)
-    s = s / s.max().clamp_min(eps)
-    s = s.clamp_min(eps)
+    norm = (s.max() * s.min()).sqrt().clamp_min(eps)
+    s = s / norm
+    s = s.clamp(1.0 / clamp_ratio, clamp_ratio)
+    s = torch.nan_to_num(s, nan=1.0, posinf=1.0, neginf=1.0)
     return s
 
 
