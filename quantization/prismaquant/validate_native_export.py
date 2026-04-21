@@ -4,7 +4,7 @@ vLLM and do a single forward + greedy decode. Binary check: either
 vLLM accepts the format and produces tokens, or it doesn't.
 
 Usage (from inside a vllm-node container):
-    python -m quantization.prismquant.validate_native_export \\
+    python -m quantization.prismaquant.validate_native_export \\
         --model dq-runs-new/qwen36-fresh/exported \\
         --prompt "The capital of France is" \\
         --max-new-tokens 16

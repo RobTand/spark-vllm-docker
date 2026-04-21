@@ -9,7 +9,7 @@ feature. To get real Fisher stats / cost measurements / export on MTP
 Linears we synthesize one here from HF primitives.
 
 This file holds only the reusable building blocks that several
-PrismQuant stages (incremental probe, incremental cost, export) share:
+PrismaQuant stages (incremental probe, incremental cost, export) share:
 
   - `MtpModule`           — the single-layer MTP decoder, mirroring
                             vLLM's `Qwen3_5MultiTokenPredictor.forward`.

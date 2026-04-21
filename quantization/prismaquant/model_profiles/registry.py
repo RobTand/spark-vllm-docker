@@ -2,13 +2,13 @@
 
 Usage:
 
-    from prismquant.model_profiles import detect_profile
+    from prismaquant.model_profiles import detect_profile
     profile = detect_profile("/path/to/Qwen3.6-35B-A3B")
     # profile is a Qwen3_5Profile instance.
 
 External architectures can register their own profile at runtime:
 
-    from prismquant.model_profiles import register_profile, ModelProfile
+    from prismaquant.model_profiles import register_profile, ModelProfile
 
     class MyArchProfile(ModelProfile):
         ...

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run-pipeline.sh — end-to-end PrismQuant pipeline: probe → cost →
+# run-pipeline.sh — end-to-end PrismaQuant pipeline: probe → cost →
 # allocator → native compressed-tensors export → vLLM validate.
 #
 # Usage:
@@ -7,7 +7,7 @@
 #   WORK_DIR=./dq-runs/qwen36 \
 #   FORMATS=NVFP4,MXFP8_E4M3,BF16 \
 #   TARGET_BITS=4.75 \
-#   ./quantization/prismquant/run-pipeline.sh
+#   ./quantization/prismaquant/run-pipeline.sh
 #
 # Memory note: probe + cost peak around 90 GB on a 35B model under
 # BF16 calibration. The watchdog in incremental_measure_quant_cost
@@ -54,7 +54,7 @@ echo
 # -----------------------------------------------------------------------
 if [[ ! -f "${PROBE_PATH}" ]]; then
   echo "[pipeline] [1/4] running sensitivity probe ..."
-  python3 -m quantization.prismquant.incremental_probe \
+  python3 -m quantization.prismaquant.incremental_probe \
     --model "$MODEL_PATH" \
     --dataset "$DATASET" \
     --nsamples "$NSAMPLES" --seqlen "$SEQLEN" \
@@ -74,7 +74,7 @@ fi
 # -----------------------------------------------------------------------
 if [[ ! -f "${COST_PATH}" ]]; then
   echo "[pipeline] [2/4] measuring per-(layer, format) cost ..."
-  python3 -m quantization.prismquant.incremental_measure_quant_cost \
+  python3 -m quantization.prismaquant.incremental_measure_quant_cost \
     --model "$MODEL_PATH" \
     --probe "${PROBE_PATH}" \
     --activation-cache-dir "${WORK_DIR}/act" \
@@ -95,7 +95,7 @@ fi
 # 3. Allocator (multi-choice knapsack over per-layer formats)
 # -----------------------------------------------------------------------
 echo "[pipeline] [3/4] running allocator at target=${TARGET_BITS} bpp ..."
-python3 -m quantization.prismquant.allocator \
+python3 -m quantization.prismaquant.allocator \
   --probe "${PROBE_PATH}" \
   --costs "${COST_PATH}" \
   --target-bits "$TARGET_BITS" \
@@ -110,7 +110,7 @@ python3 -m quantization.prismquant.allocator \
 # 4. Native compressed-tensors export
 # -----------------------------------------------------------------------
 echo "[pipeline] [4/4] exporting to compressed-tensors ..."
-python3 -m quantization.prismquant.export_native_compressed \
+python3 -m quantization.prismaquant.export_native_compressed \
   --model "$MODEL_PATH" \
   --layer-config "${WORK_DIR}/artifacts/layer_config.json" \
   --output "${WORK_DIR}/exported" \
@@ -121,7 +121,7 @@ python3 -m quantization.prismquant.export_native_compressed \
 echo
 echo "[pipeline] done."
 echo "  Artifact: ${WORK_DIR}/exported"
-echo "  Validate: python3 -m quantization.prismquant.validate_native_export \\"
+echo "  Validate: python3 -m quantization.prismaquant.validate_native_export \\"
 echo "              --model ${WORK_DIR}/exported"
 echo "  Serve:    vllm serve ${WORK_DIR}/exported \\"
 echo "              --quantization compressed-tensors --trust-remote-code"

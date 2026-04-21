@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""export_native_compressed.py — materialize a PrismQuant recipe as a
+"""export_native_compressed.py — materialize a PrismaQuant recipe as a
 standard `compressed-tensors` checkpoint that vLLM serves natively.
 
 This is the unified export path. Decoder layers are streamed from
@@ -1954,7 +1954,7 @@ def validate_mtp_assignment_coverage(src_model: str,
     exported without any allocator coverage for `mtp.*`.
 
     Passing raw MTP weights through silently produces a checkpoint that
-    looks complete but violates PrismQuant's intended contract: MTP must
+    looks complete but violates PrismaQuant's intended contract: MTP must
     participate in the same probe/cost/allocation loop as the body. This
     exact state was observed on Qwen3.5-122B where the body artifacts on
     disk were generated without merged MTP probe/cost results.

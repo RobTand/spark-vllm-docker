@@ -3,13 +3,13 @@ import unittest
 import torch
 import torch.nn as nn
 
-from quantization.prismquant import format_registry as fr
-from quantization.prismquant.allocator import build_candidates
-from quantization.prismquant.calibrate_allocator import install_activation_hooks, select_targets
-from quantization.prismquant.sensitivity_probe import discover_moe_structure
+from quantization.prismaquant import format_registry as fr
+from quantization.prismaquant.allocator import build_candidates
+from quantization.prismaquant.calibrate_allocator import install_activation_hooks, select_targets
+from quantization.prismaquant.sensitivity_probe import discover_moe_structure
 
 
-class TestPrismQuantFormatRegistry(unittest.TestCase):
+class TestPrismaQuantFormatRegistry(unittest.TestCase):
     def test_block_formats_have_expected_shape_aware_bits(self):
         shape = (128, 128)
         self.assertAlmostEqual(fr.get_format("NVFP4").effective_bits_for_shape(shape), 4.5)
@@ -38,7 +38,7 @@ class TestPrismQuantFormatRegistry(unittest.TestCase):
             self.assertTrue(torch.equal(x, y), msg=fmt)
 
 
-class TestPrismQuantAllocatorMath(unittest.TestCase):
+class TestPrismaQuantAllocatorMath(unittest.TestCase):
     def test_build_candidates_uses_shape_aware_bits(self):
         # Predicted Δloss = 0.5 · h_trace · weight_mse  (closed-form
         # diagonal-Fisher term; see allocator.py module docstring eq. 3).

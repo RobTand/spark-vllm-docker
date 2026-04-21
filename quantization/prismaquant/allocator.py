@@ -174,7 +174,7 @@ def promote_fused(assignment: dict[str, str],
     belong to the same fused group. The profile default-derives its
     groups from vLLM's `packed_modules_mapping`, so arch-specific
     knowledge about fused tensors lives in one place (vLLM's model
-    class) rather than in PrismQuant's allocator.
+    class) rather than in PrismaQuant's allocator.
 
     Raises `AssertionError` if the post-promotion assignment still has
     a fused group with inconsistent formats — that's a bug (either in

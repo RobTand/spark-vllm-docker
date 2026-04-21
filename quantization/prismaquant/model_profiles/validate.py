@@ -4,14 +4,14 @@ ModelProfile against an actual checkpoint.
 
 Usage:
 
-    python -m prismquant.model_profiles.validate \\
+    python -m prismaquant.model_profiles.validate \\
         --model /path/to/Model
-    python -m prismquant.model_profiles.validate \\
+    python -m prismaquant.model_profiles.validate \\
         --profile MyCustomProfile \\
         --model /path/to/Model
 
 Without `--profile`, the validator auto-detects using the registry.
-With `--profile`, it imports that class name from `prismquant.model_profiles`
+With `--profile`, it imports that class name from `prismaquant.model_profiles`
 or any module importable via `$PYTHONPATH`.
 
 Checks performed:
@@ -95,7 +95,7 @@ def _get_profile(profile_arg: str | None, model_path: str):
         source = f"auto-detected"
     else:
         # Try to import by class path first (`pkg.module:Cls` or
-        # `pkg.module.Cls`), else from prismquant.model_profiles by
+        # `pkg.module.Cls`), else from prismaquant.model_profiles by
         # bare class name.
         if ":" in profile_arg:
             modname, clsname = profile_arg.split(":", 1)
@@ -113,8 +113,8 @@ def _get_profile(profile_arg: str | None, model_path: str):
                     cls = candidate
                     break
             if cls is None:
-                # Also try prismquant.model_profiles namespace.
-                mod = importlib.import_module("prismquant.model_profiles")
+                # Also try prismaquant.model_profiles namespace.
+                mod = importlib.import_module("prismaquant.model_profiles")
                 cls = getattr(mod, profile_arg, None)
             if cls is None:
                 raise SystemExit(

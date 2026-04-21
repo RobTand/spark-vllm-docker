@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""calibrate_allocator.py — empirical calibration for PrismQuant frontier points.
+"""calibrate_allocator.py — empirical calibration for PrismaQuant frontier points.
 
 Given:
   - sensitivity probe pickle
@@ -7,7 +7,7 @@ Given:
   - a target set of average-bit budgets
 
 This script:
-  1. Rebuilds PrismQuant assignments for each target
+  1. Rebuilds PrismaQuant assignments for each target
   2. Applies the chosen native formats in-memory to a real model
   3. Measures actual KL against the BF16 reference logits on a small
      calibration corpus
@@ -39,8 +39,8 @@ from quantization.build_rtn_cache import (
     load_wikitext_calibration,
     stage_multimodal,
 )
-from quantization.prismquant import format_registry as fr
-from quantization.prismquant.allocator import (
+from quantization.prismaquant import format_registry as fr
+from quantization.prismaquant.allocator import (
     aggregate_moe_candidates,
     build_candidates,
     compute_achieved,

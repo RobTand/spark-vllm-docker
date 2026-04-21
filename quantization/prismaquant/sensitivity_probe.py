@@ -132,7 +132,7 @@ def stage_text_only(model_path: str) -> str:
             a.replace("ForConditionalGeneration", "ForCausalLM") for a in archs
         ]
 
-    staged = Path(tempfile.mkdtemp(prefix="prismquant_stage_"))
+    staged = Path(tempfile.mkdtemp(prefix="prismaquant_stage_"))
     skip = {"config.json", "preprocessor_config.json",
             "video_preprocessor_config.json", "processor_config.json"}
     for p in src.iterdir():
@@ -281,9 +281,9 @@ def _packed_experts_param_names(module: nn.Module) -> list[str]:
     return sorted(names)
 
 
-_PRISMQUANT_PATCH_SENTINEL = "_prismquant_packed_expert_patch"
-_PRISMQUANT_CHANNEL_SENTINEL = "_prismquant_packed_expert_channel_patch"
-_PRISMQUANT_FULL_SENTINEL = "_prismquant_packed_expert_full_patch"
+_PRISMAQUANT_PATCH_SENTINEL = "_prismaquant_packed_expert_patch"
+_PRISMAQUANT_CHANNEL_SENTINEL = "_prismaquant_packed_expert_channel_patch"
+_PRISMAQUANT_FULL_SENTINEL = "_prismaquant_packed_expert_full_patch"
 
 
 def install_packed_expert_hooks(
@@ -334,11 +334,11 @@ def install_packed_expert_hooks(
         # patched_forward's closure already binds the original dict by
         # reference. Easiest: store the live accumulator on the module
         # and have patched_forward read it indirectly each call.
-        if hasattr(module, _PRISMQUANT_PATCH_SENTINEL):
+        if hasattr(module, _PRISMAQUANT_PATCH_SENTINEL):
             # Update the live accumulator binding for this module's patch.
-            setattr(module, _PRISMQUANT_PATCH_SENTINEL, accumulator)
-            setattr(module, _PRISMQUANT_CHANNEL_SENTINEL, channel_accumulator)
-            setattr(module, _PRISMQUANT_FULL_SENTINEL, full_accumulator)
+            setattr(module, _PRISMAQUANT_PATCH_SENTINEL, accumulator)
+            setattr(module, _PRISMAQUANT_CHANNEL_SENTINEL, channel_accumulator)
+            setattr(module, _PRISMAQUANT_FULL_SENTINEL, full_accumulator)
             # Still report metadata so callers can refresh their stats dict.
             for pn in param_names:
                 p_existing = module._parameters.get(pn)
@@ -431,15 +431,15 @@ def install_packed_expert_hooks(
         # to install_packed_expert_hooks can re-bind them (per-shard) by
         # just updating these attributes. patched_forward reads them
         # indirectly each invocation via getattr.
-        setattr(mod_ref, _PRISMQUANT_PATCH_SENTINEL, accumulator)
-        setattr(mod_ref, _PRISMQUANT_CHANNEL_SENTINEL, channel_accumulator)
-        setattr(mod_ref, _PRISMQUANT_FULL_SENTINEL, full_accumulator)
+        setattr(mod_ref, _PRISMAQUANT_PATCH_SENTINEL, accumulator)
+        setattr(mod_ref, _PRISMAQUANT_CHANNEL_SENTINEL, channel_accumulator)
+        setattr(mod_ref, _PRISMAQUANT_FULL_SENTINEL, full_accumulator)
 
         def patched_forward(*args, _ns=ns, _full=full_names, _orig=original_forward,
                             _mod=mod_ref, **kwargs):
-            acc = getattr(_mod, _PRISMQUANT_PATCH_SENTINEL, None)
-            ch_acc = getattr(_mod, _PRISMQUANT_CHANNEL_SENTINEL, None)
-            fu_acc = getattr(_mod, _PRISMQUANT_FULL_SENTINEL, None)
+            acc = getattr(_mod, _PRISMAQUANT_PATCH_SENTINEL, None)
+            ch_acc = getattr(_mod, _PRISMAQUANT_CHANNEL_SENTINEL, None)
+            fu_acc = getattr(_mod, _PRISMAQUANT_FULL_SENTINEL, None)
             if acc is None:
                 # Should not happen, but degrade gracefully.
                 return _orig(*args, **kwargs)

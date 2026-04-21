@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 
-from quantization.prismquant.tiny_bakeoff import build_bakeoff_commands
+from quantization.prismaquant.tiny_bakeoff import build_bakeoff_commands
 
 
 class TestTinyBakeoff(unittest.TestCase):
@@ -42,8 +42,8 @@ class TestTinyBakeoff(unittest.TestCase):
         self.assertEqual(len(cmds), 18)
         first_target = sorted(paths_by_target)[0]
         first_paths = paths_by_target[first_target]
-        self.assertIn("quantization.prismquant.calibrate_allocator", cmds[2])
-        self.assertIn("quantization.prismquant.quadratic_refine_allocator", cmds[3])
+        self.assertIn("quantization.prismaquant.calibrate_allocator", cmds[2])
+        self.assertIn("quantization.prismaquant.quadratic_refine_allocator", cmds[3])
         self.assertIn("--calibration", cmds[3])
         self.assertIn(str(first_paths["calibration"]), cmds[3])
         self.assertIn("--unit-scope", cmds[0])
@@ -55,14 +55,14 @@ class TestTinyBakeoff(unittest.TestCase):
         self.assertIn("--groupwise-rounds", cmds[0])
         self.assertIn("--gptq-topk", cmds[0])
         self.assertIn("--gptq-damping", cmds[0])
-        self.assertIn("quantization.prismquant.oracle_search", cmds[4])
+        self.assertIn("quantization.prismaquant.oracle_search", cmds[4])
         self.assertIn("--oracle", cmds[-1])
         self.assertTrue(str(first_paths["oracle"]).endswith("oracle.json"))
 
     def test_build_bakeoff_commands_without_oracle(self):
         _paths, cmds = build_bakeoff_commands(self._args(skip_oracle=True))
         self.assertEqual(len(cmds), 15)
-        self.assertNotIn("quantization.prismquant.oracle_search", " ".join(" ".join(c) for c in cmds))
+        self.assertNotIn("quantization.prismaquant.oracle_search", " ".join(" ".join(c) for c in cmds))
         self.assertNotIn("--oracle", cmds[-1])
 
 

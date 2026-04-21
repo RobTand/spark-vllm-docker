@@ -1,16 +1,16 @@
 """vLLM model-registry introspection.
 
 vLLM already encodes most of the architecture-specific knowledge
-PrismQuant needs — fused-sibling structure (`packed_modules_mapping`)
+PrismaQuant needs — fused-sibling structure (`packed_modules_mapping`)
 and HF→vLLM name remaps (`hf_to_vllm_mapper`) — as class attributes
-on its model classes. A PrismQuant profile that points at the right
+on its model classes. A PrismaQuant profile that points at the right
 vLLM class therefore gets correct `fused_sibling_group()` and
 `to_vllm_internal_name()` for free, with no hand-coded patterns to
 drift when vLLM evolves.
 
 This module is the adapter. `vllm_class_for_architecture(arch_name)`
 looks up the class, and the helpers below convert its class-level
-metadata into PrismQuant's expected return shapes.
+metadata into PrismaQuant's expected return shapes.
 
 If vLLM isn't importable (CPU-only dev machine, etc.), everything
 here degrades gracefully — the helpers return None and profiles fall

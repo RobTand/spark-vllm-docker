@@ -1,4 +1,4 @@
-"""Architecture profile — PrismQuant's adapter layer between a model
+"""Architecture profile — PrismaQuant's adapter layer between a model
 family's checkpoint conventions and the format-agnostic core pipeline.
 
 Each profile captures three kinds of knowledge:
@@ -31,7 +31,7 @@ import torch.nn as nn
 
 
 class ModelProfile(ABC):
-    """Base class for all PrismQuant architecture profiles.
+    """Base class for all PrismaQuant architecture profiles.
 
     Where possible, default implementations auto-derive their return
     values from the vLLM model class registered for this architecture
@@ -65,7 +65,7 @@ class ModelProfile(ABC):
 
     def vllm_architecture_class(self) -> str | None:
         """Return the HF `architectures[0]` string whose vLLM class
-        PrismQuant should read `packed_modules_mapping` and
+        PrismaQuant should read `packed_modules_mapping` and
         `hf_to_vllm_mapper` from. Profiles that don't have a vLLM
         counterpart (dev-only architectures) can return None and
         override the dependent methods manually."""
@@ -136,7 +136,7 @@ class ModelProfile(ABC):
     # ------------------------------------------------------------
     def has_mtp(self) -> bool:
         """True if this architecture has Multi-Token-Prediction heads
-        in its checkpoint (`mtp.*` tensors) that PrismQuant can probe
+        in its checkpoint (`mtp.*` tensors) that PrismaQuant can probe
         and quantize."""
         return False
 
@@ -188,7 +188,7 @@ class ModelProfile(ABC):
         (specifically its `orig_to_new_prefix` dict). Matches vLLM's
         own weight-loader remap, so the allocator's config_groups
         targets and the runtime scheme-dispatch names stay in sync
-        without PrismQuant duplicating the mapping.
+        without PrismaQuant duplicating the mapping.
 
         Profiles override when: (a) there's no vLLM class for this
         arch, (b) the vLLM mapper is regex/substring-based (we only

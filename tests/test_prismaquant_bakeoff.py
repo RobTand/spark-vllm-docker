@@ -3,7 +3,7 @@ import os
 import tempfile
 import unittest
 
-from quantization.prismquant.bakeoff import (
+from quantization.prismaquant.bakeoff import (
     _decision,
     _load_calibration_point,
     _load_oracle_best,

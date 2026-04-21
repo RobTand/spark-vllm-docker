@@ -8,7 +8,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from quantization.prismquant.incremental_probe import (
+from quantization.prismaquant.incremental_probe import (
     GlobalPrecompute,
     _compute_precompute_key,
     _load_precompute_cache,
@@ -18,7 +18,7 @@ from quantization.prismquant.incremental_probe import (
     merge_probe_pickles,
     probe_shard_is_reusable,
 )
-from quantization.prismquant.mtp_module import _load_into_mtp
+from quantization.prismaquant.mtp_module import _load_into_mtp
 
 
 class TestIncrementalProbe(unittest.TestCase):
@@ -428,7 +428,7 @@ class TestMoEPairPromotion(unittest.TestCase):
     selection."""
 
     def test_mixed_pair_is_promoted(self):
-        from quantization.prismquant.allocator import promote_moe_pair
+        from quantization.prismaquant.allocator import promote_moe_pair
         assign = {
             "model.layers.46.mlp.experts.gate_up_proj": "NVFP4",
             "model.layers.46.mlp.experts.down_proj": "BF16",
@@ -439,7 +439,7 @@ class TestMoEPairPromotion(unittest.TestCase):
         self.assertEqual(out["model.layers.46.mlp.experts.down_proj"], "NVFP4")
 
     def test_matched_pair_is_stable(self):
-        from quantization.prismquant.allocator import promote_moe_pair
+        from quantization.prismaquant.allocator import promote_moe_pair
         assign = {
             "model.layers.5.mlp.experts.gate_up_proj": "MXFP8",
             "model.layers.5.mlp.experts.down_proj": "MXFP8",
@@ -449,7 +449,7 @@ class TestMoEPairPromotion(unittest.TestCase):
         self.assertEqual(out, assign)
 
     def test_unrelated_names_untouched(self):
-        from quantization.prismquant.allocator import promote_moe_pair
+        from quantization.prismaquant.allocator import promote_moe_pair
         assign = {
             "model.layers.0.self_attn.q_proj": "NVFP4",
             "model.layers.0.mlp.experts.gate_up_proj": "NVFP4",

@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from quantization.prismquant.incremental_measure_quant_cost import (
+from quantization.prismaquant.incremental_measure_quant_cost import (
     cost_shard_is_reusable,
     merge_cost_pickles,
 )

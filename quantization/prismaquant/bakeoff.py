@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""bakeoff.py — decide whether a PrismQuant change is worth keeping.
+"""bakeoff.py — decide whether a PrismaQuant change is worth keeping.
 
 This script compares a candidate run against:
   - the additive baseline calibration

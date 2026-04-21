@@ -5,7 +5,7 @@ Covers:
   - Qwen3_5MoeForCausalLM (text-only MoE)
   - Qwen3_5MoeTextModel  (headless)
 
-The two naming conventions PrismQuant must juggle:
+The two naming conventions PrismaQuant must juggle:
 
   | where                    | body                                         |
   |--------------------------|----------------------------------------------|
@@ -195,7 +195,7 @@ class Qwen3_5Profile(ModelProfile):
            scheme dispatch, so it does NOT affect target matching
            — we need the literal `mtp.*` prefix in config_groups.
 
-        2. Text-only recipe form: PrismQuant's allocator emits body
+        2. Text-only recipe form: PrismaQuant's allocator emits body
            entries as `model.layers.X.*` (from the staged text-only
            probe), but vLLM's mapper only has a `model.language_model.`
            -> `language_model.model.` prefix. We rewrite the

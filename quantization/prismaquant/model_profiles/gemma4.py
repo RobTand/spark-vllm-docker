@@ -8,7 +8,7 @@ Almost entirely vLLM-metadata-derived — Gemma 4 has a clean
 `packed_modules_mapping` (`qkv_proj`, `gate_up_proj`) and a standard
 `hf_to_vllm_mapper` that matches Qwen3.5/3.6's body-prefix convention.
 No MTP heads (not in vLLM's speculative registry at this vLLM version),
-so PrismQuant doesn't need a custom MTP forward builder.
+so PrismaQuant doesn't need a custom MTP forward builder.
 
 Source passthrough prefixes cover the three modality towers (vision,
 audio, and their embedding projectors) — these pass through as BF16

@@ -13,8 +13,8 @@ from pathlib import Path
 
 import torch
 
-from quantization.prismquant.allocator import promote_fused
-from quantization.prismquant.export_native_compressed import (
+from quantization.prismaquant.allocator import promote_fused
+from quantization.prismaquant.export_native_compressed import (
     DEFAULT_INPUT_GLOBAL_SCALE,
     FLOAT_TO_E2M1,
     FP8_E4M3_MAX,
@@ -37,7 +37,7 @@ from quantization.prismquant.export_native_compressed import (
     quantize_dequantize_nvfp4,
     quantize_dequantize_nvfp4_packed,
 )
-from quantization.prismquant.model_profiles.qwen3_5 import Qwen3_5Profile
+from quantization.prismaquant.model_profiles.qwen3_5 import Qwen3_5Profile
 
 
 class _IdentityProfile:
@@ -322,7 +322,7 @@ class TestFusedSiblingJointGlobalScale(unittest.TestCase):
     scale on disk is correct under vLLM's fused-loader rules)."""
 
     def test_fused_dense_group_self_attn(self):
-        from quantization.prismquant.export_native_compressed import _fused_dense_group
+        from quantization.prismaquant.export_native_compressed import _fused_dense_group
         g = _fused_dense_group("model.layers.5.self_attn.q_proj")
         self.assertIsNotNone(g)
         pre, members = g
@@ -330,20 +330,20 @@ class TestFusedSiblingJointGlobalScale(unittest.TestCase):
         self.assertIn("k_proj", members)
 
     def test_fused_dense_group_mlp_gate_up(self):
-        from quantization.prismquant.export_native_compressed import _fused_dense_group
+        from quantization.prismaquant.export_native_compressed import _fused_dense_group
         g = _fused_dense_group("model.layers.0.mlp.shared_expert.up_proj")
         self.assertIsNotNone(g)
         self.assertEqual(set(g[1]), {"gate_proj", "up_proj"})
 
     def test_fused_dense_group_qwen36_linear_attn(self):
-        from quantization.prismquant.export_native_compressed import _fused_dense_group
+        from quantization.prismaquant.export_native_compressed import _fused_dense_group
         for sib in ("in_proj_qkv", "in_proj_z"):
             g = _fused_dense_group(f"model.layers.7.linear_attn.{sib}")
             self.assertIsNotNone(g, f"missing fused-group pattern for {sib}")
             self.assertEqual(set(g[1]), {"in_proj_qkv", "in_proj_z"})
 
     def test_compute_nvfp4_joint_global_picks_max(self):
-        from quantization.prismquant.export_native_compressed import (
+        from quantization.prismaquant.export_native_compressed import (
             _compute_nvfp4_joint_global, compute_nvfp4_global_real,
         )
 
@@ -547,7 +547,7 @@ class TestDeltaNetFusedSiblingJointScale(unittest.TestCase):
 
         # The shared scale must equal the max of the per-sibling
         # natural scales (commit e2e0091 regression).
-        from quantization.prismquant.export_native_compressed import (
+        from quantization.prismaquant.export_native_compressed import (
             compute_nvfp4_global_real,
         )
         nat_qkv = compute_nvfp4_global_real(
@@ -673,7 +673,7 @@ class TestNvfp4InputGlobalScale(unittest.TestCase):
 
     def test_max_abs_scales_to_fp4_range(self):
         import torch
-        from quantization.prismquant.export_native_compressed import (
+        from quantization.prismaquant.export_native_compressed import (
             compute_nvfp4_input_global_scale, _FP4_E2M1_MAX,
         )
         acts = torch.tensor([0.0, 1.5, -3.0, 2.0])
@@ -683,7 +683,7 @@ class TestNvfp4InputGlobalScale(unittest.TestCase):
 
     def test_degenerate_all_zero_falls_back(self):
         import torch
-        from quantization.prismquant.export_native_compressed import (
+        from quantization.prismaquant.export_native_compressed import (
             compute_nvfp4_input_global_scale, DEFAULT_INPUT_GLOBAL_SCALE,
         )
         acts = torch.zeros(100)
@@ -692,7 +692,7 @@ class TestNvfp4InputGlobalScale(unittest.TestCase):
 
     def test_quantize_2d_reads_override(self):
         import torch
-        from quantization.prismquant.export_native_compressed import _quantize_2d
+        from quantization.prismaquant.export_native_compressed import _quantize_2d
         weight = torch.randn(32, 32)
         out = _quantize_2d(weight, "NVFP4",
                            input_global_scale_override=2.5)
@@ -701,7 +701,7 @@ class TestNvfp4InputGlobalScale(unittest.TestCase):
 
     def test_quantize_2d_uses_global_cache_when_named(self):
         import torch
-        import quantization.prismquant.export_native_compressed as m
+        import quantization.prismaquant.export_native_compressed as m
         weight = torch.randn(32, 32)
         # Save/restore the module-level cache
         saved = m._INPUT_GLOBAL_SCALES

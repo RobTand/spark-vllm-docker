@@ -2,7 +2,7 @@ import unittest
 
 import torch
 
-from quantization.prismquant.layer_streaming import LayerCache
+from quantization.prismaquant.layer_streaming import LayerCache
 
 
 class TestLayerCache(unittest.TestCase):

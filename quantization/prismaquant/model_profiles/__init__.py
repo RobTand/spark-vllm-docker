@@ -1,4 +1,4 @@
-"""PrismQuant model profiles — architecture-specific adapters.
+"""PrismaQuant model profiles — architecture-specific adapters.
 
 Exports:
   - ModelProfile: abstract base class

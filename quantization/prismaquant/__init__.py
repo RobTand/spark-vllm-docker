@@ -1,4 +1,4 @@
-"""PrismQuant: mixed-native quantization policy engine for LLMs.
+"""PrismaQuant: mixed-native quantization policy engine for LLMs.
 
 Canonical pipeline:
     1. sensitivity_probe.py         measure per-Linear Fisher sensitivity

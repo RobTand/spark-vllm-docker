@@ -1,14 +1,14 @@
 import unittest
 
-from quantization.prismquant.allocator import Candidate
-from quantization.prismquant.interaction_refine import (
+from quantization.prismaquant.allocator import Candidate
+from quantization.prismaquant.interaction_refine import (
     build_refinement_units,
     expand_unit_assignment,
     neighborhood_options,
     select_critical_units,
     sparse_local_refine,
 )
-from quantization.prismquant.local_reconstruct import expand_live_target_layers
+from quantization.prismaquant.local_reconstruct import expand_live_target_layers
 
 
 class TestInteractionRefine(unittest.TestCase):

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""incremental_probe.py — PrismQuant sensitivity probe, streamed shard-by-shard.
+"""incremental_probe.py — PrismaQuant sensitivity probe, streamed shard-by-shard.
 
 This is the unified probe path. There is no separate "whole model fits in
 RAM" branch: the model is always loaded via the layer-streaming primitives

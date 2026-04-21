@@ -20,7 +20,7 @@ sys.modules["vllm.model_executor.layers.fused_moe.fused_moe_method_base"] = fmb
 sys.modules["vllm.model_executor.layers.fused_moe.config"] = cfg
 sys.modules["vllm.model_executor.utils"] = utils
 
-from quantization.prismquant_pkg.prismquant import prismquant_moe
+from quantization.prismaquant_pkg.prismaquant import prismaquant_moe
 
 
 class _DummyLayer:
@@ -29,22 +29,22 @@ class _DummyLayer:
 
 def _make_layer(grouped_bits: bool = True):
     layer = _DummyLayer()
-    layer.prismquant_num_experts = 3
-    layer.prismquant_hidden_size = 4
-    layer.prismquant_intermediate_size = 3
-    layer.prismquant_group_size_h = 2
-    layer.prismquant_group_size_i = 1
+    layer.prismaquant_num_experts = 3
+    layer.prismaquant_hidden_size = 4
+    layer.prismaquant_intermediate_size = 3
+    layer.prismaquant_group_size_h = 2
+    layer.prismaquant_group_size_i = 1
     device = "cpu"
 
     # Expert 0/1 share a quantization signature, expert 2 differs when
     # grouped_bits=False so we can verify bucketing behavior.
     e2_bits = 4 if grouped_bits else 5
-    layer.prismquant_w13_table = [
+    layer.prismaquant_w13_table = [
         (0, 2, 2, 2, 4, 4, 3, 4),
         (4, 2, 6, 2, 4, 4, 3, 4),
         (8, 2, 10, 2, e2_bits, e2_bits, 3, 4),
     ]
-    layer.prismquant_w2_table = [
+    layer.prismaquant_w2_table = [
         (0, 2, 4, 4, 3),
         (2, 2, 4, 4, 3),
         (4, 2, e2_bits, 4, 3),
@@ -65,7 +65,7 @@ def _make_layer(grouped_bits: bool = True):
         torch.ones(3, 4, 3, dtype=torch.bfloat16, device=device),
         requires_grad=False,
     )
-    prismquant_moe._build_expert_groups(layer)
+    prismaquant_moe._build_expert_groups(layer)
     return layer
 
 
@@ -79,8 +79,8 @@ def _fake_fused_linear(x, packed, scales, n_bits, out_features, in_features, gro
 
 def _legacy_apply(layer, x, topk_weights, topk_ids):
     x_f32 = x.float()
-    out = torch.zeros(x.shape[0], layer.prismquant_hidden_size, dtype=x.dtype)
-    for eidx in range(layer.prismquant_num_experts):
+    out = torch.zeros(x.shape[0], layer.prismaquant_hidden_size, dtype=x.dtype)
+    for eidx in range(layer.prismaquant_num_experts):
         mask = topk_ids.eq(eidx)
         expert_weights = (topk_weights * mask.to(topk_weights.dtype)).sum(dim=1)
         active = torch.nonzero(expert_weights.ne(0), as_tuple=False).flatten()
@@ -89,7 +89,7 @@ def _legacy_apply(layer, x, topk_weights, topk_ids):
         xa = x_f32.index_select(0, active)
         ew = expert_weights.index_select(0, active).unsqueeze(1)
 
-        g_off, g_sz, u_off, u_sz, g_bits, u_bits, out_f, in_f = layer.prismquant_w13_table[eidx]
+        g_off, g_sz, u_off, u_sz, g_bits, u_bits, out_f, in_f = layer.prismaquant_w13_table[eidx]
         gate = _fake_fused_linear(
             xa,
             layer.w13_weight_packed[g_off:g_off + g_sz + 4],
@@ -97,7 +97,7 @@ def _legacy_apply(layer, x, topk_weights, topk_ids):
             g_bits,
             out_f,
             in_f,
-            group_size=layer.prismquant_group_size_h,
+            group_size=layer.prismaquant_group_size_h,
         )
         up = _fake_fused_linear(
             xa,
@@ -106,11 +106,11 @@ def _legacy_apply(layer, x, topk_weights, topk_ids):
             u_bits,
             out_f,
             in_f,
-            group_size=layer.prismquant_group_size_h,
+            group_size=layer.prismaquant_group_size_h,
         )
         h = F.silu(gate) * up
 
-        d_off, d_sz, d_bits, d_out, d_in = layer.prismquant_w2_table[eidx]
+        d_off, d_sz, d_bits, d_out, d_in = layer.prismaquant_w2_table[eidx]
         down = _fake_fused_linear(
             h.float(),
             layer.w2_weight_packed[d_off:d_off + d_sz + 4],
@@ -118,7 +118,7 @@ def _legacy_apply(layer, x, topk_weights, topk_ids):
             d_bits,
             d_out,
             d_in,
-            group_size=layer.prismquant_group_size_i,
+            group_size=layer.prismaquant_group_size_i,
         )
         out.index_add_(0, active, ew.to(x.dtype) * down.to(x.dtype))
     return out
@@ -127,18 +127,18 @@ def _legacy_apply(layer, x, topk_weights, topk_ids):
 class TestDynaquantMoEGrouped(unittest.TestCase):
     def test_build_expert_groups_buckets_by_quant_signature(self):
         layer = _make_layer(grouped_bits=False)
-        groups = layer.prismquant_expert_groups
+        groups = layer.prismaquant_expert_groups
         self.assertEqual(len(groups), 2)
         self.assertEqual(groups[0]["experts"], (0, 1))
         self.assertEqual(groups[1]["experts"], (2,))
 
     def test_grouped_eager_matches_legacy(self):
         layer = _make_layer(grouped_bits=True)
-        method = prismquant_moe.PrismQuantFusedMoEMethod.__new__(
-            prismquant_moe.PrismQuantFusedMoEMethod
+        method = prismaquant_moe.PrismaQuantFusedMoEMethod.__new__(
+            prismaquant_moe.PrismaQuantFusedMoEMethod
         )
-        original = prismquant_moe._get_fused_linear
-        prismquant_moe._get_fused_linear = lambda: _fake_fused_linear
+        original = prismaquant_moe._get_fused_linear
+        prismaquant_moe._get_fused_linear = lambda: _fake_fused_linear
         try:
             x = torch.tensor(
                 [
@@ -159,7 +159,7 @@ class TestDynaquantMoEGrouped(unittest.TestCase):
             want = _legacy_apply(layer, x, topk_weights, topk_ids)
             self.assertTrue(torch.allclose(got, want))
         finally:
-            prismquant_moe._get_fused_linear = original
+            prismaquant_moe._get_fused_linear = original
 
 
 if __name__ == "__main__":
