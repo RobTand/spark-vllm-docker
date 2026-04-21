@@ -2113,6 +2113,17 @@ def main():
         for k in list(src_extra.keys()):
             if k in tensors or k in mtp_tensors:
                 del src_extra[k]
+
+        # Phase 1 visual-encoder quant: when the allocator's recipe
+        # assigns a non-BF16 format to a visual Linear, run its 2D
+        # weight through `_quantize_2d` before emit. BF16 entries and
+        # non-Linear tensors (norms, conv1d, biases, buffers) pass
+        # through unchanged. See allocator's `--visual-format` docstring
+        # for why this is a uniform override rather than a per-Linear
+        # decision — text-only probe never exercises the visual tower.
+        src_extra = _apply_visual_recipe_quant(
+            src_extra, assignment, device=device)
+
         tensors.update(mtp_tensors)
         tensors.update(src_extra)
         print(f"[export-stream] merged {len(src_extra)} source-passthrough + "
@@ -2336,6 +2347,83 @@ def _load_source_passthrough(src_model: str,
             for k in sf.keys():
                 if any(k.startswith(p) for p in prefix_filters):
                     out[k] = sf.get_tensor(k)
+    return out
+
+
+_VISUAL_KEY_RE = re.compile(r"^(?:model\.)?visual\.")
+
+
+def _apply_visual_recipe_quant(
+    src_extra: dict[str, torch.Tensor],
+    assignment: dict[str, str],
+    *,
+    device: torch.device = torch.device("cpu"),
+) -> dict[str, torch.Tensor]:
+    """Rewrite visual-encoder `.weight` entries in `src_extra` under the
+    recipe's per-Linear format assignment.
+
+    The allocator's `--visual-format` flag stamps every visual Linear
+    with a uniform format (`BF16` | `NVFP4` | `MXFP8`). For BF16 we do
+    nothing — the passthrough tensor is already in the right dtype
+    (typically bf16 in the source). For NVFP4 / MXFP8 we route the
+    rank-2 weight through `_quantize_2d` and replace the single
+    `<name>.weight` key with the compressed-tensors tensor set
+    (`<name>.weight_packed`, `<name>.weight_scale`,
+    `<name>.weight_global_scale`, `<name>.input_global_scale` for NVFP4;
+    `<name>.weight`, `<name>.weight_scale` for MXFP8).
+
+    Non-Linear tensors (norms, conv1d, biases, buffers) and visual
+    keys WITHOUT a recipe entry are passed through unchanged —
+    consistent with the Phase 1 uniform-override contract: only
+    Linears discovered by `discover_visual_linears_from_source` end up
+    with a recipe entry, and that helper rejects anything that isn't
+    rank-2.
+
+    `device` is the compute device for quant arithmetic; outputs are
+    moved to CPU before storage so they're ready for the sharded
+    safetensors writer.
+    """
+    out: dict[str, torch.Tensor] = {}
+    touched = 0
+    for key, tensor in src_extra.items():
+        if not key.endswith(".weight"):
+            out[key] = tensor
+            continue
+        if not _VISUAL_KEY_RE.match(key):
+            out[key] = tensor
+            continue
+        base = key[:-len(".weight")]
+        fmt = assignment.get(base)
+        if fmt is None or fmt == "BF16":
+            out[key] = tensor
+            continue
+        if tensor.ndim != 2:
+            # Non-2D visual weights aren't Linear modules — skip them.
+            out[key] = tensor
+            continue
+        weight = tensor.to(device=device, dtype=torch.float32)
+        try:
+            compressed = _quantize_2d(
+                weight, fmt,
+                nvfp4_global_real_override=None,
+                linear_name=base,
+            )
+        except Exception as e:
+            # Fail-safe: fall back to passthrough on any arithmetic
+            # error. Better to land a BF16 visual Linear than crash
+            # the whole export — the rest of the body/MTP are already
+            # materialized.
+            print(f"[export-stream] WARN visual quant failed for {base} "
+                  f"({fmt}): {e}; falling back to BF16 passthrough",
+                  flush=True)
+            out[key] = tensor
+            continue
+        for suffix, t in compressed.items():
+            out[f"{base}.{suffix}"] = t.cpu()
+        touched += 1
+    if touched:
+        print(f"[export-stream] quantized {touched} visual Linear(s) "
+              f"from recipe", flush=True)
     return out
 
 

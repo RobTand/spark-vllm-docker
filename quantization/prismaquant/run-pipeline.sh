@@ -7,7 +7,13 @@
 #   WORK_DIR=./dq-runs/qwen36 \
 #   FORMATS=NVFP4,MXFP8_E4M3,BF16 \
 #   TARGET_BITS=4.75 \
+#   VISUAL_FORMAT=BF16 \
 #   ./quantization/prismaquant/run-pipeline.sh
+#
+# VISUAL_FORMAT (BF16 | NVFP4 | MXFP8) applies to visual-encoder Linears
+# on multimodal models. Default BF16 leaves the visual tower at
+# passthrough — the Phase 1 override only activates when a non-BF16
+# value is supplied.
 #
 # Memory note: probe + cost peak around 90 GB on a 35B model under
 # BF16 calibration. The watchdog in incremental_measure_quant_cost
@@ -35,6 +41,13 @@ set -euo pipefail
 : "${DEVICE:=cuda}"
 : "${EXPORT_DEVICE:=cuda}"   # CUDA ~10× faster than CPU on NVFP4 packing
 : "${TARGET_PROFILE:=vllm_qwen3_5_packed_moe}"
+# Visual encoder format (Phase 1): uniform override for all visual Linears
+# (`model.visual.blocks.*`). Text-only probe cannot inform per-Linear
+# sensitivity, so the allocator forces a single format uniformly. BF16 is
+# safe and matches pre-Phase-1 passthrough; NVFP4 / MXFP8 shrink the tower
+# on disk at export time via the existing RTN math. Ignored for non-
+# multimodal checkpoints (no visual Linears → override is a no-op).
+: "${VISUAL_FORMAT:=BF16}"
 
 PROBE_PATH="${WORK_DIR}/artifacts/probe.pkl"
 COST_PATH="${WORK_DIR}/artifacts/cost.pkl"
@@ -46,6 +59,7 @@ echo "  MODEL_PATH=$MODEL_PATH"
 echo "  WORK_DIR=$WORK_DIR"
 echo "  FORMATS=$FORMATS  TARGET_BITS=$TARGET_BITS"
 echo "  NSAMPLES=$NSAMPLES SEQLEN=$SEQLEN LAYERS_PER_SHARD=$LAYERS_PER_SHARD"
+echo "  VISUAL_FORMAT=$VISUAL_FORMAT"
 echo
 
 # -----------------------------------------------------------------------
@@ -102,6 +116,7 @@ python3 -m quantization.prismaquant.allocator \
   --formats "$FORMATS" \
   --target-profile "$TARGET_PROFILE" \
   --pareto-targets "$PARETO_TARGETS" \
+  --visual-format "$VISUAL_FORMAT" \
   --layer-config "${WORK_DIR}/artifacts/layer_config.json" \
   --pareto-csv "${WORK_DIR}/artifacts/pareto.csv" \
   2>&1 | tee "${WORK_DIR}/logs/allocator.log"

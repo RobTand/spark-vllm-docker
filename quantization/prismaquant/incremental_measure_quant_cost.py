@@ -709,11 +709,18 @@ def main():
                     probe_path=args.probe,
                 )
             else:
-                # visual blocks: text-only staging strips them; emit an
-                # empty pickle slot so the merged output mirrors the
-                # probe shard layout.
+                # visual blocks: text-only staging strips them, so we
+                # emit an empty pickle slot to mirror the probe's shard
+                # layout. The allocator does NOT consume a visual cost
+                # entry — Phase 1 visual-encoder support forces all
+                # visual Linears to one uniform format via the
+                # allocator's `--visual-format` override, bypassing the
+                # per-Linear cost/DP decision that text-only calibration
+                # couldn't inform anyway. Phase 2 (multimodal Fisher)
+                # will replace this skip with real measurements.
                 print(f"[incremental-cost] skip shard {shard_idx} ({kind}): "
-                      f"not supported in streaming path", flush=True)
+                      f"visual handled by allocator's --visual-format "
+                      f"override, not per-Linear cost DP", flush=True)
                 _write_empty_cost_shard(
                     str(shard_path), shard_kind=kind, specs=specs,
                     model_name=args.model, probe_path=args.probe,

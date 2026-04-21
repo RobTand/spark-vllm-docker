@@ -743,6 +743,147 @@ def filter_candidates_for_profile(
 
 
 # ---------------------------------------------------------------------------
+# Visual encoder override
+# ---------------------------------------------------------------------------
+# Phase 1 visual-encoder support: the probe's text-only calibration does not
+# exercise the visual tower, so per-Linear Fisher gradients for
+# `model.visual.blocks.*` Linears are zero — the knapsack DP has no
+# sensitivity signal to allocate on. Rather than let every visual Linear
+# default to the cheapest format or go through stale passthrough, we accept
+# a single uniform target format (`BF16`, `NVFP4`, or `MXFP8`) and assign
+# every visual Linear to it. BF16 (the default) reproduces the previous
+# passthrough behavior; NVFP4/MXFP8 shrink the tower to quantized storage
+# using the same RTN math the body gets.
+#
+# Phase 2 (tracked separately) will replace this override with a real
+# multimodal Fisher: load images + text, run full forward through the
+# visual encoder → projector → body LM, capture per-Linear empirical Fisher
+# gradients, and feed those into the allocator's closed-form Δloss. That
+# requires a multimodal dataset loader, multimodal tokenizer wiring, and a
+# probe path that doesn't strip the visual tower — none of which ship in
+# Phase 1.
+_VISUAL_PREFIX_RE = re.compile(r"^(?:model\.)?visual\.")
+
+
+def _is_visual_linear(name: str) -> bool:
+    """True when `name` refers to a Linear inside the visual encoder.
+
+    Matches both the raw HF checkpoint form (`model.visual.blocks.*`) and
+    the post-remap form (`visual.blocks.*`) so the override behaves the
+    same regardless of which side of `profile.live_to_recipe_name` the
+    allocator's stats dictionary landed on.
+    """
+    return bool(_VISUAL_PREFIX_RE.match(name))
+
+
+def apply_visual_format_override(
+    assignment: dict[str, str],
+    visual_format: str,
+) -> dict[str, str]:
+    """Force every visual-encoder Linear in `assignment` to `visual_format`.
+
+    Called after the knapsack DP + fused-sibling promotion so the override
+    wins even if the solver would have picked a different format per
+    per-Linear sensitivity noise (which is meaningless for visual Linears
+    under text-only calibration — see module comment above).
+
+    `visual_format="BF16"` is a no-op when a visual Linear already has no
+    allocator entry (the export's existing passthrough keeps it at BF16);
+    we still write `BF16` into the returned assignment so the layer_config
+    round-trip is explicit and downstream tooling (export, validate) has a
+    uniform record of the decision.
+    """
+    out = dict(assignment)
+    for name in list(out.keys()):
+        if _is_visual_linear(name):
+            out[name] = visual_format
+    return out
+
+
+def discover_visual_linears_from_source(model_path: str) -> list[str]:
+    """Scan the source safetensors index for `model.visual.blocks.*.weight`
+    entries with rank-2 shapes — these are the Linear modules the visual
+    encoder exposes.
+
+    Returned names are the basename (`.weight` stripped) so they slot
+    directly into the allocator's assignment dictionary and the exporter's
+    quantize-by-recipe dispatch.
+
+    The probe's text-only staging strips the visual tower, so visual
+    Linears never appear in the probe or cost pickles. This helper lets
+    the allocator emit a layer_config entry for them anyway when
+    `--visual-format` is non-BF16 — the exporter can then quantize each
+    of them uniformly under the requested format. Without this scan, the
+    allocator has no way to enumerate visual Linear names (there is no
+    in-memory visual module at allocation time).
+    """
+    src = Path(model_path)
+    idx_path = src / "model.safetensors.index.json"
+    candidates: list[tuple[str, tuple[int, ...]]] = []
+    if idx_path.exists():
+        with open(idx_path) as f:
+            wm = json.load(f).get("weight_map", {})
+        # Index file carries only names, not shapes. We need to open each
+        # referenced shard once to read rank.
+        from collections import defaultdict as _dd
+        by_shard: dict[str, list[str]] = _dd(list)
+        for key, shard in wm.items():
+            if not key.endswith(".weight"):
+                continue
+            if not _VISUAL_PREFIX_RE.match(key):
+                continue
+            by_shard[shard].append(key)
+        try:
+            from safetensors import safe_open
+        except ImportError:
+            return []
+        for shard, keys in by_shard.items():
+            shard_path = src / shard
+            if not shard_path.exists():
+                continue
+            with safe_open(str(shard_path), framework="pt") as sf:
+                for k in keys:
+                    try:
+                        shape = tuple(sf.get_slice(k).get_shape())
+                    except Exception:
+                        continue
+                    candidates.append((k, shape))
+    else:
+        # No index file — scan every safetensors shard directly. Used for
+        # small, single-file checkpoints.
+        try:
+            from safetensors import safe_open
+        except ImportError:
+            return []
+        import os as _os
+        if not src.exists():
+            return []
+        for f in sorted(_os.listdir(src)):
+            if not f.endswith(".safetensors"):
+                continue
+            with safe_open(str(src / f), framework="pt") as sf:
+                for k in sf.keys():
+                    if not k.endswith(".weight"):
+                        continue
+                    if not _VISUAL_PREFIX_RE.match(k):
+                        continue
+                    try:
+                        shape = tuple(sf.get_slice(k).get_shape())
+                    except Exception:
+                        continue
+                    candidates.append((k, shape))
+
+    # Only rank-2 weights are Linear-like; conv1d / norms / biases are
+    # kept at BF16 passthrough regardless of --visual-format.
+    out: list[str] = []
+    for name, shape in candidates:
+        if len(shape) != 2:
+            continue
+        out.append(name[:-len(".weight")] if name.endswith(".weight") else name)
+    return sorted(set(out))
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main():
@@ -795,6 +936,20 @@ def main():
                          "achieved budget over the requested target after "
                          "fused-sibling promotion. The DP is re-run with a "
                          "tightened target until overshoot is within tol.")
+    ap.add_argument("--visual-format",
+                    choices=["BF16", "NVFP4", "MXFP8"],
+                    default="BF16",
+                    help="Uniform format for all visual-encoder Linears "
+                         "(`model.visual.blocks.*`). Phase 1 override: the "
+                         "text-only probe does not exercise the visual "
+                         "tower, so per-Linear Fisher is zero and the "
+                         "knapsack DP has no signal. Default BF16 matches "
+                         "the previous passthrough behavior; NVFP4 / MXFP8 "
+                         "uniformly quantize every visual Linear via the "
+                         "existing RTN math at export time. Phase 2 "
+                         "(multimodal Fisher with image calibration data) "
+                         "will replace this override with per-Linear "
+                         "sensitivity-driven allocation.")
     args = ap.parse_args()
 
     if args.threads > 0:
@@ -992,9 +1147,38 @@ def main():
     else:
         assignment_expanded = assignment
 
+    # Inject visual-encoder Linears under the uniform --visual-format
+    # override. Visual Linears never appear in stats/costs (text-only
+    # probe strips the visual tower), so we scan the source checkpoint
+    # here and append synthetic entries to the expanded assignment. The
+    # exporter then quantizes them via its normal _quantize_2d path.
+    # We always write an explicit recipe entry so downstream tooling has
+    # a deterministic record of the decision, even for the BF16 default.
+    visual_format = args.visual_format
+    if probe_model_path:
+        visual_names = discover_visual_linears_from_source(probe_model_path)
+    else:
+        visual_names = []
+    if visual_names:
+        for vname in visual_names:
+            assignment_expanded[vname] = visual_format
+        print(f"[alloc] --visual-format={visual_format}: assigned "
+              f"{len(visual_names)} visual Linears uniformly "
+              f"(source={probe_model_path})", flush=True)
+    elif visual_format != "BF16":
+        print(f"[alloc] --visual-format={visual_format}: no visual "
+              f"Linears found in source checkpoint — override is a no-op",
+              flush=True)
+
     layer_cfg = {}
     for name, fmt in assignment_expanded.items():
-        layer_cfg[name] = format_specs[fmt].autoround_config()
+        if fmt in format_specs:
+            layer_cfg[name] = format_specs[fmt].autoround_config()
+        else:
+            # Visual format outside the body's format set (e.g., user
+            # passed --formats NVFP4,BF16 plus --visual-format MXFP8).
+            # Resolve from the global registry.
+            layer_cfg[name] = fr.get_format(fmt).autoround_config()
 
     out = Path(args.layer_config)
     out.parent.mkdir(parents=True, exist_ok=True)
