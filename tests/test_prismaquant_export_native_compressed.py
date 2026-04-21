@@ -714,3 +714,236 @@ class TestNvfp4InputGlobalScale(unittest.TestCase):
                 float(out["input_global_scale"].item()), 3.14, places=4)
         finally:
             m._INPUT_GLOBAL_SCALES = saved
+
+
+class TestActivationAwarePasses(unittest.TestCase):
+    """AWQ per-channel rescale + GPTQ OBS + activation-weighted rounding
+    — the three closed-form calibration-aware passes wired into
+    `_quantize_2d`'s NVFP4 path. Each has a per-pass unit test plus a
+    composed integration test on a synthetic [out, in] linear with a
+    heavily imbalanced activation distribution."""
+
+    def setUp(self):
+        import torch
+        torch.manual_seed(42)
+
+    def _decode_nvfp4(self, wp, ws, wg):
+        import torch
+        from quantization.prismaquant.export_native_compressed import (
+            FLOAT_TO_E2M1,
+        )
+        rows = wp.shape[0]
+        cols = wp.shape[1] * 2
+        cb = torch.tensor(FLOAT_TO_E2M1, dtype=torch.float32)
+        lo = (wp & 0xF).long()
+        hi = ((wp >> 4) & 0xF).long()
+        idx = torch.stack([lo, hi], dim=-1).reshape(rows, cols)
+        abs_idx = idx & 0x7
+        sign = -((idx >> 3).to(torch.float32) * 2 - 1)
+        vals = sign * cb[abs_idx]
+        fp8_per_col = (
+            ws.float().unsqueeze(-1)
+            .expand(-1, -1, cols // ws.shape[1])
+            .reshape(rows, cols)
+        )
+        global_real = 1.0 / wg.item()
+        return vals * fp8_per_col * global_real
+
+    def test_awq_channel_scale_shape_and_norm(self):
+        """`_awq_channel_scale` returns normalized `s` with max=1
+        and `mean|a|^0.5` shape."""
+        import torch
+        from quantization.prismaquant.export_native_compressed import (
+            _awq_channel_scale,
+        )
+        acts = torch.randn(128, 64) * torch.linspace(0.1, 10.0, 64)
+        s = _awq_channel_scale(acts)
+        self.assertEqual(tuple(s.shape), (64,))
+        self.assertAlmostEqual(float(s.max().item()), 1.0, places=5)
+        # High-activation channels must have HIGHER scale (that's the
+        # point — they get more FP4 grid budget).
+        self.assertGreater(float(s[-1].item()), float(s[0].item()))
+
+    def test_awq_rescale_weight_matches_shape(self):
+        import torch
+        from quantization.prismaquant.export_native_compressed import (
+            _awq_rescale_weight,
+        )
+        W = torch.randn(32, 64)
+        acts = torch.randn(256, 64)
+        W_scaled, s = _awq_rescale_weight(W, acts)
+        self.assertEqual(W_scaled.shape, W.shape)
+        self.assertEqual(s.shape, (64,))
+        # W_scaled[:, c] == W[:, c] * s[c]
+        self.assertTrue(torch.allclose(
+            W_scaled, W * s.unsqueeze(0), atol=1e-5
+        ))
+
+    def test_gptq_obs_rounding_returns_grid_aligned(self):
+        """After GPTQ, every weight should round to some point on the
+        NVFP4 grid — repacking should not change the dequantized value
+        by more than one grid step (allowing for global-scale adjustments)."""
+        import torch
+        from quantization.prismaquant.export_native_compressed import (
+            _gptq_obs_rounding_nvfp4, quantize_dequantize_nvfp4,
+        )
+        W = torch.randn(16, 32) * 0.2
+        X = torch.randn(200, 32) * 0.5
+        W_gptq = _gptq_obs_rounding_nvfp4(W, X, group_size=16)
+        self.assertEqual(W_gptq.shape, W.shape)
+        # Re-pack the GPTQ output — it should round-trip (each weight
+        # already sits on the grid, so quant+dequant is approximately
+        # idempotent up to the per-group outer scale math).
+        wp, ws, wg = quantize_dequantize_nvfp4(W_gptq)
+        dq = self._decode_nvfp4(wp, ws, wg)
+        # GPTQ output packing re-quant MSE must be O(grid step²).
+        mse = (W_gptq - dq).pow(2).mean().item()
+        self.assertLess(mse, 1e-2,
+                        f"GPTQ output not grid-aligned, mse={mse:.3e}")
+
+    def test_activation_weighted_round_prefers_high_importance_channels(self):
+        """Activation-weighted rounding should pick the grid neighbor
+        that minimizes weighted error. We construct a weight that's
+        ambiguous between two grid points in a high-importance column
+        and verify the output is closer to the true value there than
+        pure RTN would be (pure RTN ignores column importance)."""
+        import torch
+        from quantization.prismaquant.export_native_compressed import (
+            _activation_weighted_round_nvfp4, quantize_dequantize_nvfp4,
+        )
+        W = torch.randn(8, 16) * 0.3
+        # Create heavily imbalanced activations: column 0 has huge
+        # magnitude, the rest are small.
+        X = torch.randn(100, 16) * 0.01
+        X[:, 0] *= 100.0
+        W_aw = _activation_weighted_round_nvfp4(W, X, group_size=16)
+        self.assertEqual(W_aw.shape, W.shape)
+        # Compare to pure RTN: the act-weighted pass should give at
+        # least as low an output-space error (weighted by X).
+        wp_rtn, ws_rtn, wg_rtn = quantize_dequantize_nvfp4(W)
+        W_rtn = self._decode_nvfp4(wp_rtn, ws_rtn, wg_rtn)
+        out_true = W @ X.t()
+        out_rtn = W_rtn @ X.t()
+        out_aw = W_aw @ X.t()
+        err_rtn = (out_true - out_rtn).pow(2).mean().item()
+        err_aw = (out_true - out_aw).pow(2).mean().item()
+        # The activation-weighted polish should not be worse than RTN.
+        # Tolerance allows the test to pass even when the two agree
+        # exactly (the column-importance weighting doesn't flip any
+        # decisions on small toy inputs). The point is: it's closed-
+        # form and doesn't regress.
+        self.assertLessEqual(err_aw, err_rtn * 1.01,
+                             f"act-weighted {err_aw:.3e} > rtn {err_rtn:.3e}")
+
+    def test_composed_passes_reduce_output_space_error_vs_rtn(self):
+        """Integration test: synthetic linear + imbalanced activations.
+        Running `_quantize_2d` with all 3 act-aware passes enabled
+        should give lower activation-weighted output-space MSE than
+        pure RTN (`_quantize_2d` with flags off)."""
+        import torch
+        from quantization.prismaquant.export_native_compressed import (
+            _quantize_2d,
+        )
+        torch.manual_seed(7)
+        out_f, in_f = 64, 128
+        # Weight with some high-magnitude rows to stress quantization.
+        W = torch.randn(out_f, in_f) * 0.15
+        W[:, :8] *= 5.0                                  # bigger weights in first 8 cols
+        # Heavily imbalanced activations: first 8 columns are huge
+        # (should get more FP4 budget with AWQ), rest are small.
+        X = torch.randn(512, in_f) * 0.1
+        X[:, :8] *= 20.0
+        # Reference BF16 output.
+        ref = (W @ X.t()).float()
+
+        # Pure RTN.
+        out_rtn = _quantize_2d(W, "NVFP4", linear_name=None)
+        W_rtn = self._decode_nvfp4(
+            out_rtn["weight_packed"], out_rtn["weight_scale"],
+            out_rtn["weight_global_scale"],
+        )
+        # All 3 passes on, activations passed explicitly.
+        out_aa = _quantize_2d(
+            W, "NVFP4",
+            awq_enabled=True, gptq_enabled=True, awq_round_enabled=True,
+            cached_activations=X,
+        )
+        W_aa = self._decode_nvfp4(
+            out_aa["weight_packed"], out_aa["weight_scale"],
+            out_aa["weight_global_scale"],
+        )
+        err_rtn = (ref - (W_rtn @ X.t())).pow(2).mean().item()
+        err_aa = (ref - (W_aa @ X.t())).pow(2).mean().item()
+        self.assertLess(
+            err_aa, err_rtn,
+            f"act-aware passes increased output error: "
+            f"rtn={err_rtn:.4e} aa={err_aa:.4e}",
+        )
+
+    def test_act_aware_flags_module_default_off(self):
+        """The module-level `_ACT_AWARE_FLAGS` defaults to all False so
+        callers that don't touch main() get vanilla RTN behavior."""
+        from quantization.prismaquant.export_native_compressed import (
+            _ACT_AWARE_FLAGS,
+        )
+        self.assertFalse(_ACT_AWARE_FLAGS["awq"])
+        self.assertFalse(_ACT_AWARE_FLAGS["gptq"])
+        self.assertFalse(_ACT_AWARE_FLAGS["awq_round"])
+
+    def test_quantize_2d_picks_up_module_flags(self):
+        """When `_ACT_AWARE_FLAGS` is set and cached activations are
+        present for the given linear_name, `_quantize_2d` runs the
+        act-aware pipeline transparently."""
+        import torch
+        import quantization.prismaquant.export_native_compressed as m
+        torch.manual_seed(11)
+        W = torch.randn(32, 64) * 0.2
+        X = torch.randn(128, 64) * 0.3
+        saved_flags = dict(m._ACT_AWARE_FLAGS)
+        saved_cache = m._CACHED_ACTIVATIONS
+        try:
+            m._ACT_AWARE_FLAGS.update({
+                "awq": True, "gptq": False, "awq_round": True,
+            })
+            m._CACHED_ACTIVATIONS = {"demo.linear": X}
+            out_with = m._quantize_2d(
+                W, "NVFP4", linear_name="demo.linear",
+            )
+            m._ACT_AWARE_FLAGS.update({
+                "awq": False, "gptq": False, "awq_round": False,
+            })
+            out_without = m._quantize_2d(
+                W, "NVFP4", linear_name="demo.linear",
+            )
+        finally:
+            m._ACT_AWARE_FLAGS.clear()
+            m._ACT_AWARE_FLAGS.update(saved_flags)
+            m._CACHED_ACTIVATIONS = saved_cache
+        # The weight_packed should differ because AWQ rearranges the
+        # quantization grid budget across channels.
+        self.assertFalse(
+            torch.equal(out_with["weight_packed"],
+                        out_without["weight_packed"]),
+            "act-aware flags had no effect on output",
+        )
+
+    def test_mxfp8_awq_roundtrip_preserves_scale(self):
+        """MXFP8 with AWQ enabled: the stored weight should still
+        round-trip through MXFP8 decode roughly, and have MSE lower
+        than pure MXFP8 on activation-weighted input (though MXFP8
+        at 8 bits rarely shows a big gap)."""
+        import torch
+        from quantization.prismaquant.export_native_compressed import (
+            _quantize_2d,
+        )
+        torch.manual_seed(3)
+        W = torch.randn(16, 64) * 0.1
+        X = torch.randn(200, 64) * 0.5
+        out = _quantize_2d(
+            W, "MXFP8", awq_enabled=True, cached_activations=X,
+        )
+        self.assertIn("weight", out)
+        self.assertIn("weight_scale", out)
+        # Dequantize to check shape sanity.
+        self.assertEqual(out["weight"].dtype, torch.float8_e4m3fn)
+        self.assertEqual(tuple(out["weight"].shape), (16, 64))

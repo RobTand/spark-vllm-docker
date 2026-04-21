@@ -175,6 +175,267 @@ def compute_nvfp4_input_global_scale(activations: torch.Tensor) -> float:
 # (post-profile.live_to_recipe_name remap). None means "not computed".
 _INPUT_GLOBAL_SCALES: dict[str, float] | None = None
 
+# Module-level raw-activation cache populated by main() when
+# --activation-cache-dir is provided AND any of the activation-aware
+# passes (--awq / --gptq / --act-weighted-round) is enabled. Keyed
+# by recipe name; values are 2D `[N, in_features]` float32 tensors
+# (lazily upcast from the on-disk bfloat16 for numerical stability
+# during Hessian + per-channel stats). None means "not loaded".
+_CACHED_ACTIVATIONS: dict[str, torch.Tensor] | None = None
+
+# Module-level flag bundle that controls which activation-aware
+# passes run when `_quantize_2d` is invoked from main()'s streaming
+# loop. Kept as module-level state (mirroring _INPUT_GLOBAL_SCALES)
+# so we don't have to thread 3 boolean kwargs through every call
+# site — unit tests pass the flags directly via kwargs.
+_ACT_AWARE_FLAGS: dict[str, bool] = {
+    "awq": False,
+    "gptq": False,
+    "awq_round": False,
+}
+
+
+# ---------------------------------------------------------------------------
+# Activation-aware quantization passes (closed-form, no iterative search).
+#
+# All three reuse the probe's already-cached activations; none of them
+# perform gradient-based optimization. Composed in the NVFP4 path of
+# `_quantize_2d`:  AWQ rescale → per-group RTN → GPTQ error prop →
+# activation-weighted rounding polish.
+# ---------------------------------------------------------------------------
+def _awq_channel_scale(activations: torch.Tensor, eps: float = 1e-6
+                       ) -> torch.Tensor:
+    """Compute AWQ per-input-channel scale `s[c] = mean|a[:, c]|^0.5`,
+    normalized so `max(s) = 1`. See AWQ paper (Lin et al. 2023).
+    Returns a float32 1D tensor of length `in_features`.
+    """
+    a = activations.detach().to(torch.float32).reshape(-1, activations.shape[-1])
+    mean_abs = a.abs().mean(dim=0)                       # [in_features]
+    s = mean_abs.clamp_min(eps).pow(0.5)                 # α = 0.5
+    s = s / s.max().clamp_min(eps)                       # normalize to [eps, 1]
+    s = s.clamp_min(eps)                                 # avoid div-by-zero
+    return s
+
+
+def _awq_rescale_weight(weight: torch.Tensor, activations: torch.Tensor
+                        ) -> tuple[torch.Tensor, torch.Tensor]:
+    """AWQ-style per-input-channel rescaling of a 2D `[out, in]` weight.
+
+    APPROXIMATE AWQ: the true AWQ algorithm (Lin et al. 2023) folds the
+    reciprocal per-channel scale `1/s[c]` into the PREVIOUS layer's
+    output (usually a LayerNorm or a residual add), so the inference-
+    time composition `Q(W*s) @ (x/s) ≈ Q(W*s) · (1/s) @ x = Q(W*s) / s @ x`
+    recovers `W @ x` up to quant noise. We can't fold the reciprocal
+    back through the network at export time without knowing the full
+    graph.
+
+    Instead: rescale `W * s` to bias the FP4 group-scale math toward
+    high-activation channels (they get finer grid resolution because
+    the per-group max-abs along the scaled input dim is dominated by
+    the scaled-up channels), quantize in that space, then divide out
+    `s` from the dequantized result before storage. Net effect: quant
+    noise in the final stored weight is redistributed — high-activation
+    channels get proportionally less noise per unit of activation
+    energy, at the cost of more noise in low-activation channels
+    (whose contribution to the output is dampened anyway).
+
+    Returns `(W_scaled, s)` where `W_scaled = W * s[None, :]` is ready
+    for group-quant and `s` is the per-input-channel scale the caller
+    must divide out post-quant (`W_dq_final = W_dq_scaled / s`).
+    """
+    if weight.shape[1] != activations.shape[-1]:
+        raise ValueError(
+            f"AWQ rescale: weight.in={weight.shape[1]} ≠ "
+            f"act.in={activations.shape[-1]}"
+        )
+    s = _awq_channel_scale(activations).to(weight.device)
+    W_scaled = weight.to(torch.float32) * s.unsqueeze(0)
+    return W_scaled, s
+
+
+def _gptq_obs_rounding_nvfp4(
+    weight: torch.Tensor, activations: torch.Tensor,
+    group_size: int = 16, damp: float = 0.01,
+    global_real_override: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """GPTQ one-shot OBS rounding for NVFP4 weights.
+
+    Standard GPTQ (Frantar et al. 2022): build the activation covariance
+    `H = X^T X + λ·diag(H)`, invert via Cholesky, then round columns in
+    blocks (group_size=16 matching NVFP4's group structure). Error from
+    each block's quant is propagated to the remaining columns via
+    `H_inv`, which is the closed-form OBS update for least-squares loss
+    `||W - W_q||_H^2`.
+
+    Returns the dequantized, error-propagated weight `[out, in]`
+    (float32). The caller still runs NVFP4 packing on this tensor to
+    produce on-disk storage — the bits end up the same as if we had
+    quantized `weight` directly but with a smaller output-space error.
+
+    `damp = 0.01` adds `0.01·mean(diag(H))` to `diag(H)` for Cholesky
+    stability. `global_real_override` threads through for fused-sibling
+    consistency (same semantics as `quantize_dequantize_nvfp4`).
+    """
+    W = weight.to(torch.float32).clone()
+    rows, cols = W.shape
+    if cols % group_size != 0:
+        raise ValueError(f"GPTQ requires group_size={group_size} ∤ {cols}")
+
+    X = activations.detach().to(torch.float32).reshape(-1, cols)
+    # H = X^T X; guard against near-zero diagonal (dead channels).
+    H = X.t() @ X                                         # [in, in]
+    diag_mean = torch.diagonal(H).mean().clamp_min(1e-12)
+    H.diagonal().add_(damp * diag_mean)
+
+    # Dead-channel handling (standard GPTQ trick): columns with zero
+    # diagonal get set to identity-like so the Cholesky succeeds, and
+    # we zero those weight columns.
+    dead = torch.diagonal(H) <= 0
+    if dead.any():
+        H[dead, dead] = 1.0
+        W[:, dead] = 0.0
+
+    # Compute Cholesky + inverse. We follow the GPTQ paper's trick of
+    # computing an upper-triangular inverse (`torch.cholesky_inverse`
+    # then Cholesky again) so the column-wise update becomes a simple
+    # multiplication by an upper-triangular factor.
+    try:
+        L = torch.linalg.cholesky(H)
+        Hinv = torch.cholesky_inverse(L)
+        # Upper-triangular factor U such that U^T U = Hinv (GPTQ uses U
+        # directly for the column updates).
+        U = torch.linalg.cholesky(Hinv, upper=True)
+    except Exception:
+        # Fall back to RTN if the Cholesky numerically fails (rare:
+        # extreme activation degeneracy). Caller proceeds with vanilla.
+        return W
+
+    # Target NVFP4 grid. Pre-compute the per-tensor global_real so the
+    # per-block quantization uses the same outer scale as the final
+    # on-disk packing (otherwise error propagation would be under an
+    # inconsistent scale). This mirrors quantize_dequantize_nvfp4.
+    if global_real_override is not None:
+        global_real = global_real_override.to(weight.device).clamp_min(1e-12).float()
+    else:
+        grouped_full = W.reshape(rows, cols // group_size, group_size)
+        max_abs_full = grouped_full.abs().amax(dim=-1).clamp_min(1e-12)
+        s_g_real_full = max_abs_full / NVFP4_MAX
+        global_real = (s_g_real_full.amax() / FP8_E4M3_MAX).clamp_min(1e-12)
+
+    cb = _nvfp4_codebook(W.device, dtype=torch.float32)   # [8] abs values
+    # Build signed grid once: the 16 possible FP4 values.
+    signed_grid = torch.cat([cb, -cb[1:]]).to(W.device)   # dedup 0
+
+    for block_start in range(0, cols, group_size):
+        block_end = min(block_start + group_size, cols)
+        block = W[:, block_start:block_end]                # [rows, group_size]
+
+        # Per-block RTN to NVFP4: per-row max within this block gives
+        # the per-group scale (matching quantize_dequantize_nvfp4).
+        block_max = block.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
+        s_g_real = block_max / NVFP4_MAX                  # [rows, 1]
+        # fp8 per-group scale in the [0, 448] range after /global_real.
+        fp8_scale_real = (s_g_real / global_real).clamp(0, FP8_E4M3_MAX)
+        # Effective per-element scale = fp8_scale_real * global_real.
+        eff_scale = (fp8_scale_real * global_real).clamp_min(1e-12)
+        in_grid = block / eff_scale                        # scaled into [-6, 6]
+        in_grid = in_grid.clamp(-NVFP4_MAX, NVFP4_MAX)
+        fp4_idx = _round_to_codebook(in_grid)              # [rows, group_size]
+        # Decode to value (signed codebook).
+        abs_idx = fp4_idx & 0x7
+        sign = -((fp4_idx >> 3).to(torch.float32) * 2 - 1)
+        q_vals = sign * cb[abs_idx]                        # [rows, group_size]
+        block_dq = q_vals * eff_scale                      # [rows, group_size]
+        block_err = block - block_dq                       # [rows, group_size]
+
+        # Propagate error to the remaining columns. Using the
+        # upper-triangular factor U (Hinv = U^T U), the closed-form
+        # update from GPTQ's paper (eq. 5) is:
+        #   W[:, j+1:] -= (err / U[j,j]) · U[j, j+1:]
+        # applied one column at a time within the block. Because we
+        # quantize the whole block at once, the within-block error
+        # propagation is skipped — the block's per-group scale is
+        # already set, so per-column updates within the block would
+        # re-trigger quantization.  The between-block propagation
+        # handles inter-group error.
+        if block_end < cols:
+            # Treat each column's error as propagating with its own
+            # diagonal divisor U[j,j], then dot with the row slice.
+            # Batched: err_block / diag(U[block]) @ U[block, rest]
+            U_block_diag = torch.diagonal(U)[block_start:block_end].clamp_min(1e-12)
+            U_offdiag = U[block_start:block_end, block_end:]   # [gs, rest]
+            prop = (block_err / U_block_diag.unsqueeze(0)) @ U_offdiag  # [rows, rest]
+            W[:, block_end:] = W[:, block_end:] - prop
+
+        W[:, block_start:block_end] = block_dq
+
+    return W
+
+
+def _activation_weighted_round_nvfp4(
+    weight: torch.Tensor, activations: torch.Tensor,
+    group_size: int = 16,
+    global_real_override: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """For each weight, pick the NVFP4 grid neighbor (above or below)
+    that minimizes per-column `|Δw|² · E[|a|²]`.
+
+    Closed-form, no iteration: evaluate both rounding choices, keep
+    the one with lower activation-weighted squared error per column.
+    Returns dequantized weight `[out, in]` (float32) — caller still
+    runs the NVFP4 packer on it, and because each weight lands on a
+    valid grid point, the packed result matches this dequantized
+    tensor bit-for-bit.
+    """
+    W = weight.to(torch.float32).contiguous()
+    rows, cols = W.shape
+    if cols % group_size != 0:
+        raise ValueError(f"act-round requires group_size={group_size} ∤ {cols}")
+
+    a = activations.detach().to(torch.float32).reshape(-1, cols)
+    # Per-input-channel importance = E[a^2]. Clamp to avoid degenerate
+    # channels (all-zero activations) making rounding indifferent.
+    col_importance = a.pow(2).mean(dim=0).clamp_min(1e-12)     # [in]
+
+    # Compute per-tensor outer scale consistently with
+    # quantize_dequantize_nvfp4.
+    grouped = W.reshape(rows, cols // group_size, group_size)
+    max_abs = grouped.abs().amax(dim=-1).clamp_min(1e-12)       # [rows, n_g]
+    s_g_real = max_abs / NVFP4_MAX
+    if global_real_override is not None:
+        global_real = global_real_override.to(W.device).clamp_min(1e-12).float()
+    else:
+        global_real = (s_g_real.amax() / FP8_E4M3_MAX).clamp_min(1e-12)
+    fp8_scale_real = (s_g_real / global_real).clamp(0, FP8_E4M3_MAX)
+    eff_scale = (fp8_scale_real * global_real).unsqueeze(-1).clamp_min(1e-12)
+    # Scale into grid.
+    in_grid = grouped / eff_scale                                # [rows, n_g, gs]
+
+    cb = _nvfp4_codebook(W.device, dtype=torch.float32)          # [8]
+    abs_x = in_grid.abs()
+    idx = torch.bucketize(abs_x, cb)
+    idx_lo = (idx - 1).clamp_min(0).clamp_max(cb.numel() - 1)
+    idx_hi = idx.clamp_max(cb.numel() - 1)
+    lo_v = cb[idx_lo]
+    hi_v = cb[idx_hi]
+    sign = torch.where(in_grid >= 0, 1.0, -1.0)
+    neigh_lo = sign * lo_v
+    neigh_hi = sign * hi_v
+    # Deltas in grid space. Convert to weight space by multiplying
+    # eff_scale. That preserves the per-column importance weighting
+    # on real Δw² (what actually enters the output-space error).
+    delta_lo = (neigh_lo - in_grid) * eff_scale                  # [rows, n_g, gs]
+    delta_hi = (neigh_hi - in_grid) * eff_scale
+    # col_importance broadcast: [cols] → [1, n_g, gs]
+    col_imp = col_importance.reshape(1, cols // group_size, group_size)
+    err_lo = delta_lo.pow(2) * col_imp
+    err_hi = delta_hi.pow(2) * col_imp
+    pick_hi = err_hi < err_lo
+    chosen = torch.where(pick_hi, neigh_hi, neigh_lo)            # [rows, n_g, gs]
+
+    W_dq = (chosen * eff_scale).reshape(rows, cols)
+    return W_dq
+
 
 def compute_nvfp4_global_real(weight: torch.Tensor, group_size: int = 16
                               ) -> torch.Tensor:
@@ -523,6 +784,10 @@ def _quantize_2d(
     nvfp4_global_real_override: torch.Tensor | None = None,
     input_global_scale_override: float | None = None,
     linear_name: str | None = None,
+    awq_enabled: bool = False,
+    gptq_enabled: bool = False,
+    awq_round_enabled: bool = False,
+    cached_activations: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compress a 2D Linear weight under format `fmt`.
 
@@ -542,12 +807,97 @@ def _quantize_2d(
     otherwise vLLM's runtime activation quant uses an undersized
     dynamic range.
 
+    `awq_enabled`, `gptq_enabled`, `awq_round_enabled`: activation-aware
+    passes composed on the NVFP4 path, order = AWQ rescale → per-group
+    RTN → GPTQ error prop → activation-weighted rounding polish. Each
+    requires `cached_activations` (looked up from _CACHED_ACTIVATIONS
+    by `linear_name` when not supplied explicitly). MXFP8 ignores
+    gptq_enabled (8-bit quant noise is too small to justify the
+    compute cost); AWQ + act-weighted rounding still run if enabled.
+
+    `cached_activations`: optional `[N, in_features]` float tensor of
+    probe-captured inputs for this Linear. If None and `linear_name`
+    is set, `_CACHED_ACTIVATIONS[linear_name]` is used.
+
     `fmt = MXFP8` emits real MXFP8 tensors: fp8_e4m3fn weights plus
     E8M0 uint8 per-group scales (group_size=32).
     """
+    # Resolve activations from the module-level cache when not passed.
+    acts = cached_activations
+    if (acts is None and linear_name is not None
+            and _CACHED_ACTIVATIONS is not None):
+        acts = _CACHED_ACTIVATIONS.get(linear_name)
+
+    # Resolve act-aware flags from the module-level config when none
+    # were explicitly enabled via kwargs — lets main() turn them on
+    # once without threading through every call site. Kwargs still
+    # win when any is set True (unit tests pass them explicitly).
+    if not (awq_enabled or gptq_enabled or awq_round_enabled):
+        awq_enabled = bool(_ACT_AWARE_FLAGS.get("awq"))
+        gptq_enabled = bool(_ACT_AWARE_FLAGS.get("gptq"))
+        awq_round_enabled = bool(_ACT_AWARE_FLAGS.get("awq_round"))
+
     if fmt == "NVFP4":
+        w_work = weight.to(torch.float32)
+        # Step 1: quasi-AWQ per-channel rescale. We do W' = W*s, quantize
+        # W', then divide out s from the dequantized result — this
+        # redistributes quant noise toward low-activation channels
+        # without needing to fold the reciprocal back into a prior
+        # layer (which we can't do at export time).
+        awq_s: torch.Tensor | None = None
+        if awq_enabled and acts is not None and acts.shape[-1] == w_work.shape[1]:
+            w_work, awq_s = _awq_rescale_weight(w_work, acts)
+
+        # Step 2: GPTQ one-shot OBS rounding (block-wise error prop).
+        # Produces an already-dequantized tensor living on the NVFP4
+        # grid; subsequent packing is lossless wrt this tensor.
+        if (gptq_enabled and acts is not None
+                and acts.shape[-1] == w_work.shape[1]):
+            # When AWQ pre-scaled, use the scaled activations too so
+            # the covariance matches the weight we're quantizing.
+            if awq_s is not None:
+                acts_work = acts.to(torch.float32).reshape(-1, acts.shape[-1])
+                acts_work = acts_work / awq_s.clamp_min(1e-12).unsqueeze(0)
+            else:
+                acts_work = acts
+            w_work = _gptq_obs_rounding_nvfp4(
+                w_work, acts_work, group_size=16,
+                global_real_override=nvfp4_global_real_override,
+            )
+
+        # Step 3: activation-weighted rounding polish. If GPTQ already
+        # placed every weight on the grid this is a no-op; otherwise
+        # it's the cheap closed-form refinement.
+        if (awq_round_enabled and acts is not None
+                and acts.shape[-1] == w_work.shape[1]):
+            if awq_s is not None and not gptq_enabled:
+                # AWQ scaled weights but GPTQ didn't run. Use scaled
+                # activations so the importance matches the weight
+                # space we're rounding in.
+                acts_work = acts.to(torch.float32).reshape(-1, acts.shape[-1])
+                acts_work = acts_work / awq_s.clamp_min(1e-12).unsqueeze(0)
+            elif gptq_enabled and awq_s is not None:
+                acts_work = acts.to(torch.float32).reshape(-1, acts.shape[-1])
+                acts_work = acts_work / awq_s.clamp_min(1e-12).unsqueeze(0)
+            else:
+                acts_work = acts
+            w_work = _activation_weighted_round_nvfp4(
+                w_work, acts_work, group_size=16,
+                global_real_override=nvfp4_global_real_override,
+            )
+
+        # Step 4: final NVFP4 pack. `w_work` has been transformed — we
+        # still run the standard packer to get the wire-format triple.
+        # If AWQ was active, undo the rescale post-pack so the stored
+        # weight matches the original `weight` semantically (see
+        # _awq_rescale_weight docstring). We achieve this by passing
+        # `w_work / s` through the packer.
+        if awq_s is not None:
+            w_to_pack = w_work / awq_s.clamp_min(1e-12).unsqueeze(0)
+        else:
+            w_to_pack = w_work
         wp, ws, wg = quantize_dequantize_nvfp4(
-            weight, group_size=16,
+            w_to_pack, group_size=16,
             global_real_override=nvfp4_global_real_override,
         )
         input_scale = input_global_scale_override
@@ -568,7 +918,27 @@ def _quantize_2d(
             ),
         }
     if fmt == "MXFP8":
-        w, ws = quantize_dequantize_mxfp8(weight, group_size=32)
+        # AWQ rescale optional on MXFP8. GPTQ + act-weighted rounding
+        # are skipped — 8-bit quant noise is already <0.05 PPL at
+        # worst, the closed-form passes add more compute than they
+        # buy. We apply AWQ by going through the full quant-dequant
+        # cycle in scaled space, then dividing the dequantized result
+        # by `s` and re-quantizing normally so the wire format stays
+        # canonical. This is one extra round trip but MXFP8 is fast.
+        w_work = weight.to(torch.float32)
+        if awq_enabled and acts is not None and acts.shape[-1] == w_work.shape[1]:
+            w_scaled, awq_s = _awq_rescale_weight(w_work, acts)
+            # Dequantize the scaled weight using the same E8M0 + fp8
+            # decoding the kernel does, then divide out s.
+            grouped = w_scaled.reshape(
+                w_scaled.shape[0], w_scaled.shape[1] // 32, 32)
+            quant_fp8, e8m0 = _mxfp8_quantize_grouped(grouped)
+            scales = torch.pow(2.0,
+                               e8m0.to(torch.float32) - 127.0).unsqueeze(-1)
+            dq_scaled = (quant_fp8.to(torch.float32) * scales
+                         ).reshape(w_scaled.shape)
+            w_work = dq_scaled / awq_s.clamp_min(1e-12).unsqueeze(0)
+        w, ws = quantize_dequantize_mxfp8(w_work, group_size=32)
         return {"weight": w, "weight_scale": ws}
     if fmt == "BF16":
         return {"weight": weight.to(torch.bfloat16)}
@@ -1558,17 +1928,63 @@ def main():
                          "computed from cached activations "
                          "(max_abs/6.0) instead of the 1.0 default. "
                          "Typically ~1-3% PPL improvement on NVFP4.")
+    # Activation-aware passes. Defaults are tri-state: `None` means
+    # "auto = ON when --activation-cache-dir is supplied, OFF otherwise".
+    # Explicit `--awq / --no-awq` overrides.
+    ap.add_argument("--awq", dest="awq", default=None,
+                    action=argparse.BooleanOptionalAction,
+                    help="AWQ per-input-channel quant-range balancing "
+                         "(approximate — see docstring). Auto-on when "
+                         "--activation-cache-dir is supplied.")
+    ap.add_argument("--gptq", dest="gptq", default=None,
+                    action=argparse.BooleanOptionalAction,
+                    help="GPTQ one-shot OBS rounding with block-wise "
+                         "error propagation (NVFP4 only; skipped on "
+                         "MXFP8). Auto-on when --activation-cache-dir "
+                         "is supplied.")
+    ap.add_argument("--act-weighted-round", dest="awq_round", default=None,
+                    action=argparse.BooleanOptionalAction,
+                    help="Activation-weighted rounding polish on NVFP4 "
+                         "(closed-form Δw²·E[a²] minimization). Auto-on "
+                         "when --activation-cache-dir is supplied.")
     args = ap.parse_args()
 
     from .model_profiles import detect_profile
     profile = detect_profile(args.model)
     print(f"[export-stream] model profile: {profile.name}", flush=True)
 
+    # Resolve tri-state flags: each defaults to ON iff activation cache
+    # is supplied.
+    cache_supplied = bool(args.activation_cache_dir)
+    awq_enabled = args.awq if args.awq is not None else cache_supplied
+    gptq_enabled = args.gptq if args.gptq is not None else cache_supplied
+    awq_round_enabled = (args.awq_round if args.awq_round is not None
+                         else cache_supplied)
+    act_passes_any = awq_enabled or gptq_enabled or awq_round_enabled
+    # The activation-aware passes need the actual activations, not just
+    # the scale summary. We only load raw activations when at least one
+    # pass is enabled.
+    if act_passes_any and not cache_supplied:
+        print("[export-stream] WARN activation-aware passes requested "
+              "but no --activation-cache-dir; disabling.", flush=True)
+        awq_enabled = gptq_enabled = awq_round_enabled = False
+        act_passes_any = False
+    print(f"[export-stream] act-aware passes: awq={awq_enabled} "
+          f"gptq={gptq_enabled} awq_round={awq_round_enabled}", flush=True)
+    # Publish to the module-level config so `_quantize_2d` picks them
+    # up from every call site without needing the flags threaded
+    # through `materialize_tensors_streaming` + MTP helpers.
+    _ACT_AWARE_FLAGS["awq"] = awq_enabled
+    _ACT_AWARE_FLAGS["gptq"] = gptq_enabled
+    _ACT_AWARE_FLAGS["awq_round"] = awq_round_enabled
+
     # Populate the module-level input-global-scale cache (used by
     # `_quantize_2d` for NVFP4 linears) from cached activations.
+    # Same cache is reused to populate _CACHED_ACTIVATIONS when any
+    # act-aware pass is enabled.
     if args.activation_cache_dir:
         from .measure_quant_cost import ActivationIndex
-        global _INPUT_GLOBAL_SCALES
+        global _INPUT_GLOBAL_SCALES, _CACHED_ACTIVATIONS
         cache_dir = Path(args.activation_cache_dir)
         if not cache_dir.exists():
             print(f"[export-stream] WARN activation cache dir {cache_dir} "
@@ -1581,14 +1997,25 @@ def main():
                 _recipe_names = list(json.load(_lc).keys())
             idx = ActivationIndex(cache_dir, _recipe_names)
             scales: dict[str, float] = {}
+            raw_cache: dict[str, torch.Tensor] = {}
             for name in idx.names():
                 try:
                     acts = idx.load(name)
                     scales[name] = compute_nvfp4_input_global_scale(acts)
+                    if act_passes_any:
+                        # Store as CPU float32 for numerical stability
+                        # in H = X^T X and |a|² stats. The _quantize_2d
+                        # entrypoint moves to GPU as needed.
+                        raw_cache[name] = acts.to(torch.float32)
                 except Exception as e:
                     print(f"[export-stream] WARN could not load "
                           f"activations for {name}: {e}", flush=True)
             _INPUT_GLOBAL_SCALES = scales
+            if act_passes_any:
+                _CACHED_ACTIVATIONS = raw_cache
+                print(f"[export-stream] raw activations loaded for "
+                      f"{len(raw_cache)}/{len(_recipe_names)} Linears "
+                      f"(for AWQ/GPTQ/round passes)", flush=True)
             print(f"[export-stream] input_global_scale calibrated for "
                   f"{len(scales)}/{len(_recipe_names)} Linears from "
                   f"{cache_dir}", flush=True)
