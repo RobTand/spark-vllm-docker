@@ -115,6 +115,7 @@ python3 -m quantization.prismquant.export_native_compressed \
   --layer-config "${WORK_DIR}/artifacts/layer_config.json" \
   --output "${WORK_DIR}/exported" \
   --device "$EXPORT_DEVICE" \
+  --activation-cache-dir "${WORK_DIR}/act" \
   2>&1 | tee "${WORK_DIR}/logs/export.log"
 
 echo

@@ -662,3 +662,55 @@ class TestComputeExtraIgnorePerExpertSiblings(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestNvfp4InputGlobalScale(unittest.TestCase):
+    """Per-layer input_global_scale calibration from cached activations.
+    
+    `compute_nvfp4_input_global_scale(activations)` returns FP4_MAX/max_abs
+    so scaled activations fit [-6, 6]. Zero/negative max-abs falls back to
+    the default."""
+
+    def test_max_abs_scales_to_fp4_range(self):
+        import torch
+        from quantization.prismquant.export_native_compressed import (
+            compute_nvfp4_input_global_scale, _FP4_E2M1_MAX,
+        )
+        acts = torch.tensor([0.0, 1.5, -3.0, 2.0])
+        s = compute_nvfp4_input_global_scale(acts)
+        # max_abs=3.0, scale=6/3=2.0 → scaled activations in [-6, 6]
+        self.assertAlmostEqual(s, _FP4_E2M1_MAX / 3.0, places=5)
+
+    def test_degenerate_all_zero_falls_back(self):
+        import torch
+        from quantization.prismquant.export_native_compressed import (
+            compute_nvfp4_input_global_scale, DEFAULT_INPUT_GLOBAL_SCALE,
+        )
+        acts = torch.zeros(100)
+        s = compute_nvfp4_input_global_scale(acts)
+        self.assertEqual(s, DEFAULT_INPUT_GLOBAL_SCALE)
+
+    def test_quantize_2d_reads_override(self):
+        import torch
+        from quantization.prismquant.export_native_compressed import _quantize_2d
+        weight = torch.randn(32, 32)
+        out = _quantize_2d(weight, "NVFP4",
+                           input_global_scale_override=2.5)
+        self.assertAlmostEqual(
+            float(out["input_global_scale"].item()), 2.5, places=4)
+
+    def test_quantize_2d_uses_global_cache_when_named(self):
+        import torch
+        import quantization.prismquant.export_native_compressed as m
+        weight = torch.randn(32, 32)
+        # Save/restore the module-level cache
+        saved = m._INPUT_GLOBAL_SCALES
+        try:
+            m._INPUT_GLOBAL_SCALES = {"foo.bar.q_proj": 3.14}
+            out = _quantize_2d = m._quantize_2d(
+                weight, "NVFP4", linear_name="foo.bar.q_proj"
+            )
+            self.assertAlmostEqual(
+                float(out["input_global_scale"].item()), 3.14, places=4)
+        finally:
+            m._INPUT_GLOBAL_SCALES = saved
