@@ -119,11 +119,15 @@ class TestSyntheticMultimodalCalibration(unittest.TestCase):
     shape triples without needing a real processor."""
 
     def test_synthetic_returns_n_triples_with_pixel_and_ids(self):
-        triples = _synthetic_multimodal_calibration_samples(
+        samples = _synthetic_multimodal_calibration_samples(
             processor=None, n_samples=4, max_text_len=16,
         )
-        self.assertEqual(len(triples), 4)
-        for pixel_values, input_ids, labels in triples:
+        self.assertEqual(len(samples), 4)
+        for sample in samples:
+            self.assertIsInstance(sample, dict)
+            pixel_values = sample["pixel_values"]
+            input_ids = sample["input_ids"]
+            labels = sample["labels"]
             self.assertEqual(pixel_values.dim(), 4)
             self.assertEqual(pixel_values.shape[0], 1)   # batch
             self.assertEqual(pixel_values.shape[1], 3)   # RGB
@@ -197,6 +201,10 @@ class TestVisualCostShardBasic(unittest.TestCase):
             td = Path(td)
             out = td / "cost_shard.pkl"
             act_cache = mock.Mock()
+            # New signature: returns `mm_ctx` (StreamingContext or None).
+            # For an empty probe_stats shard, the function short-circuits
+            # before building any context — so mm_ctx stays None. What
+            # we care about is that an empty pickle was emitted.
             result = _run_visual_cost_shard(
                 model_path=str(td),
                 linear_include=r"^model\.visual\.",
@@ -211,8 +219,11 @@ class TestVisualCostShardBasic(unittest.TestCase):
                 output_path=str(out),
                 model_name=str(td),
                 probe_path="probe.pkl",
+                mm_ctx=None,
+                mm_offload_folder=str(td / "offload"),
             )
-            self.assertTrue(result)
+            # Empty-shard short-circuit never builds a context.
+            self.assertIsNone(result)
             self.assertTrue(out.exists())
             with open(out, "rb") as f:
                 data = pickle.load(f)
@@ -222,8 +233,8 @@ class TestVisualCostShardBasic(unittest.TestCase):
             self.assertEqual(data["formats"], ["BF16", "NVFP4"])
 
     def test_visual_shard_writes_empty_pickle_on_load_oom(self):
-        """When AutoModelForCausalLM.from_pretrained raises CUDA OOM, we
-        fall back to an empty pickle instead of raising — 122B-scale
+        """When the multimodal streaming context build raises CUDA OOM,
+        we fall back to an empty pickle instead of raising — 122B-scale
         behavior."""
         from quantization.prismaquant.incremental_measure_quant_cost import (
             _run_visual_cost_shard,
@@ -243,13 +254,15 @@ class TestVisualCostShardBasic(unittest.TestCase):
             probe_stats = {
                 "model.visual.blocks.0.attn.qkv": {"n_params": 100},
             }
-            # Patch from_pretrained to raise a plain RuntimeError with
-            # "out of memory" in the message — the guard should catch
-            # that as an OOM proxy and fall back gracefully.
+            # Patch the streaming-context builder to raise a plain
+            # RuntimeError with "out of memory" in the message — the
+            # guard should catch that as an OOM proxy and fall back
+            # gracefully with an empty pickle.
             with mock.patch(
-                    "transformers.AutoModelForCausalLM.from_pretrained",
+                    "quantization.prismaquant.incremental_measure_quant_cost."
+                    "_build_streaming_context",
                     side_effect=RuntimeError("CUDA out of memory")):
-                ok = _run_visual_cost_shard(
+                result = _run_visual_cost_shard(
                     model_path=str(td),
                     linear_include=r"^model\.visual\.",
                     probe_stats=probe_stats,
@@ -263,10 +276,12 @@ class TestVisualCostShardBasic(unittest.TestCase):
                     output_path=str(out),
                     model_name=str(td),
                     probe_path="probe.pkl",
+                    mm_ctx=None,
+                    mm_offload_folder=str(td / "offload"),
                 )
-            # OOM path returns False but writes an empty pickle so the
-            # merge layout stays consistent.
-            self.assertFalse(ok)
+            # OOM path returns None (no context built) but writes an
+            # empty pickle so the merge layout stays consistent.
+            self.assertIsNone(result)
             self.assertTrue(out.exists())
             with open(out, "rb") as f:
                 data = pickle.load(f)
